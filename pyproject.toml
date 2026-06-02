@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hornlab-metal-bem"
+version = "0.1.0"
+description = "Apple Metal accelerated acoustic BEM solver for waveguide and loudspeaker meshes"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "bempp-cl",
+    "gmsh",
+    "meshio",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+validation = ["bempp-cl", "gmsh", "meshio"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: validation tests that run a real BEM solve",
+]
+
+[tool.setuptools.package-data]
+hornlab_solver = [
+    "metal/HornlabSolverMetal.jl",
+    "metal/HornlabSolverMetalNative.swift",
+    "metal/native_helper/Package.swift",
+    "metal/native_helper/Sources/HornlabSolverMetalNative/main.swift",
+    "metal/Project.toml",
+]
