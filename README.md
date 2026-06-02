@@ -13,13 +13,14 @@ This repository packages the fastest currently validated HornLab solver path:
 
 The current public Python package still imports as `hornlab_solver` during the
 first extraction pass. That keeps the proven HornLab implementation and tests
-intact while this repository is prepared for Boundary Lab integration.
+intact while this repository is prepared for standalone and downstream
+application integration.
 
 ## Status
 
 This is an Apple Silicon/macOS solver backend. It is intended to replace or
-augment Boundary Lab's local BEM backend on Apple Silicon, not the NVIDIA CUDA
-backend on Windows.
+augment local acoustic BEM backends on Apple Silicon, not NVIDIA CUDA backends
+on Windows.
 
 Current caveat: the fast path still uses `bempp-cl` scaffolding for mesh/grid
 and function-space construction. The expensive solve path is native Metal, but
@@ -61,19 +62,17 @@ swift build -c release --package-path hornlab_solver/metal/native_helper
 python -m pytest tests/test_config.py tests/test_metal_runtime.py tests/test_metal_native.py -q
 ```
 
-## Boundary Lab Integration Target
+## Integration Target
 
-The planned Boundary Lab adapter should implement Boundary Lab's
-`SolverBackend` / `SolverSession` protocol and translate Boundary Lab
-`SimulationConfig` into `SolveConfig`.
+Downstream adapters should translate their application-level simulation config
+into `SolveConfig` and call the package through a small backend/session layer.
 
 Recommended backend id: `hornlab_metal`.
 
 ## Roadmap
 
 1. Keep this extraction buildable with the current `hornlab_solver` import.
-2. Add a Boundary Lab backend adapter package/module.
+2. Add backend adapter package/modules where downstream applications need them.
 3. Replace `bempp-cl` mesh/function-space scaffolding with a pure loader.
 4. Move `bempp-cl` into validation extras only.
 5. Rename the import namespace only after adapters and tests are stable.
-
