@@ -6,8 +6,6 @@ from dataclasses import dataclass
 from .config import SolveConfig
 from .metal.native import MetalNativeRuntimeConfig, discover_native_runtime
 
-BEMPP_BACKENDS = frozenset({"opencl", "numba"})
-
 
 class AssemblyBackendUnavailable(RuntimeError):
     """Raised when a requested experimental backend cannot be used."""
@@ -47,12 +45,7 @@ def discover_metal_backend(
     *,
     native_executable: str | None = None,
 ) -> MetalBackendStatus:
-    """Discover prerequisites for experimental packaged Metal helpers.
-
-    Production routing remains conservative: ``resolve_assembly_backend`` still
-    maps every ``metal`` request to the Bempp/OpenCL fallback or raises in
-    strict mode.
-    """
+    """Discover prerequisites for packaged Metal helpers."""
 
     native_status = discover_native_runtime(
         MetalNativeRuntimeConfig(swift_executable=native_executable)
@@ -79,49 +72,26 @@ def discover_metal_backend(
 
 
 def resolve_assembly_backend(config: SolveConfig) -> AssemblyBackendResolution:
-    """Resolve ``SolveConfig.assembly_backend`` to a current Bempp backend.
-
-    ``metal`` is accepted as an experimental, discoverable request, but it must
-    not reach Bempp's ``device_interface`` until a real Metal adapter exists.
-    """
+    """Resolve ``SolveConfig.assembly_backend`` to the native Metal backend."""
 
     requested = config.assembly_backend
-    if requested == "auto":
-        return AssemblyBackendResolution(
-            requested_backend=requested,
-            effective_backend="opencl",
-            fallback_used=False,
-            reason="auto selects the production OpenCL Bempp backend",
-        )
-
-    if requested in BEMPP_BACKENDS:
-        return AssemblyBackendResolution(
-            requested_backend=requested,
-            effective_backend=requested,
-            fallback_used=False,
-        )
-
     if requested != "metal":
-        raise ValueError(
-            "assembly_backend must be one of: auto, opencl, numba, metal"
-        )
+        raise ValueError("assembly_backend must be 'metal'")
 
     status = discover_metal_backend()
-    reason = status.reason
     if not config.experimental_metal_backend:
-        reason = "Metal backend requested without experimental_metal_backend=True."
-    elif status.available:
-        # Future promotion point: return effective_backend="metal" once the
-        # packaged adapter owns assembly/field evaluation.
-        reason = "Metal backend is discovered but not wired into production."
-
-    if config.metal_backend_fallback == "error":
-        raise AssemblyBackendUnavailable(reason or "Metal backend is unavailable.")
+        raise AssemblyBackendUnavailable(
+            "Metal backend requires experimental_metal_backend=True."
+        )
+    if not status.available:
+        raise AssemblyBackendUnavailable(
+            status.reason or "Metal backend is unavailable."
+        )
 
     return AssemblyBackendResolution(
         requested_backend=requested,
-        effective_backend="opencl",
-        fallback_used=True,
-        reason=reason,
+        effective_backend="metal",
+        fallback_used=False,
+        reason=status.reason,
         metal_status=status,
     )

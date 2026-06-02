@@ -15,7 +15,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
-validation = ["bempp-cl", "gmsh", "meshio"]
 
 [tool.pytest.ini_options]
 markers = [

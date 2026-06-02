@@ -1,127 +1,118 @@
-"""Unit tests for hornlab_solver.bie — air_density and surface_pressure_avg.
-
-Tests that require bempp-cl are marked with pytest.mark.slow and skip if
-bempp is unavailable. Pure-logic tests use mocks.
-"""
+"""Unit tests for pure acoustic helpers in hornlab_solver.bie."""
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
-import pytest
 
 from hornlab_solver.config import SolveConfig, VelocityMode
 
 
 # ---------------------------------------------------------------------------
-# air_density passed into Neumann data
+# air_density passed into native Neumann coefficients
 # ---------------------------------------------------------------------------
-
-def _captured_coefficients():
-    """Return a mock bempp_api whose GridFunction captures coefficients."""
-    captured = {}
-
-    def fake_grid_function(space, coefficients=None):
-        gf = MagicMock()
-        # Store a copy so we can inspect after the call
-        captured["coefficients"] = coefficients.copy() if coefficients is not None else None
-        gf.coefficients = captured["coefficients"]
-        return gf
-
-    return fake_grid_function, captured
 
 
 class TestAirDensityInNeumann:
 
     def test_default_air_density_in_coefficients(self):
-        fake_gf, captured = _captured_coefficients()
-        with patch("bempp_cl.api.GridFunction", fake_gf):
-            from hornlab_solver.bie import _build_neumann_data
+        from hornlab_solver.bie import _build_driver_neumann_coeffs
 
-            dp0_space = MagicMock()
-            dp0_space.global_dof_count = 4
+        dp0_space = SimpleNamespace(global_dof_count=4)
 
-            tags = np.array([1, 2, 2, 1], dtype=np.int32)
-            omega = 2 * np.pi * 1000.0
-            config = SolveConfig(velocity_sources={2: 1.0})
+        tags = np.array([1, 2, 2, 1], dtype=np.int32)
+        omega = 2 * np.pi * 1000.0
+        config = SolveConfig(velocity_sources={2: 1.0})
 
-            _build_neumann_data(dp0_space, tags, omega, config, "single")
+        coeffs = _build_driver_neumann_coeffs(
+            dp0_space,
+            tags,
+            omega,
+            config,
+            np.complex64,
+        )
 
-            v_n = 1.0 / (1j * omega)
-            expected_coeff = 1j * 1.2041 * omega * v_n
+        v_n = 1.0 / (1j * omega)
+        expected_coeff = 1j * 1.2041 * omega * v_n
 
-            coeffs = captured["coefficients"]
-            source_dofs = np.where(tags == 2)[0]
-            for dof in source_dofs:
-                np.testing.assert_allclose(coeffs[dof], expected_coeff, rtol=1e-6)
+        source_dofs = np.where(tags == 2)[0]
+        for dof in source_dofs:
+            np.testing.assert_allclose(coeffs[dof], expected_coeff, rtol=1e-6)
 
     def test_custom_air_density_propagates(self):
-        fake_gf, captured = _captured_coefficients()
-        with patch("bempp_cl.api.GridFunction", fake_gf):
-            from hornlab_solver.bie import _build_neumann_data
+        from hornlab_solver.bie import _build_driver_neumann_coeffs
 
-            dp0_space = MagicMock()
-            dp0_space.global_dof_count = 4
+        dp0_space = SimpleNamespace(global_dof_count=4)
 
-            tags = np.array([1, 2, 2, 1], dtype=np.int32)
-            omega = 2 * np.pi * 500.0
-            custom_rho = 1.18
-            config = SolveConfig(
-                velocity_sources={2: 1.0},
-                air_density=custom_rho,
-            )
+        tags = np.array([1, 2, 2, 1], dtype=np.int32)
+        omega = 2 * np.pi * 500.0
+        custom_rho = 1.18
+        config = SolveConfig(
+            velocity_sources={2: 1.0},
+            air_density=custom_rho,
+        )
 
-            _build_neumann_data(dp0_space, tags, omega, config, "double")
+        coeffs = _build_driver_neumann_coeffs(
+            dp0_space,
+            tags,
+            omega,
+            config,
+            np.complex128,
+        )
 
-            v_n = 1.0 / (1j * omega)
-            expected_coeff = 1j * custom_rho * omega * v_n
+        v_n = 1.0 / (1j * omega)
+        expected_coeff = 1j * custom_rho * omega * v_n
 
-            coeffs = captured["coefficients"]
-            source_dofs = np.where(tags == 2)[0]
-            for dof in source_dofs:
-                np.testing.assert_allclose(coeffs[dof], expected_coeff, rtol=1e-6)
+        source_dofs = np.where(tags == 2)[0]
+        for dof in source_dofs:
+            np.testing.assert_allclose(coeffs[dof], expected_coeff, rtol=1e-6)
 
     def test_velocity_mode_velocity_uses_weight_directly(self):
-        fake_gf, captured = _captured_coefficients()
-        with patch("bempp_cl.api.GridFunction", fake_gf):
-            from hornlab_solver.bie import _build_neumann_data
+        from hornlab_solver.bie import _build_driver_neumann_coeffs
 
-            dp0_space = MagicMock()
-            dp0_space.global_dof_count = 3
+        dp0_space = SimpleNamespace(global_dof_count=3)
 
-            tags = np.array([2, 2, 1], dtype=np.int32)
-            omega = 2 * np.pi * 2000.0
-            config = SolveConfig(
-                velocity_sources={2: 0.5},
-                velocity_mode=VelocityMode.VELOCITY,
-                air_density=1.2041,
-            )
+        tags = np.array([2, 2, 1], dtype=np.int32)
+        omega = 2 * np.pi * 2000.0
+        config = SolveConfig(
+            velocity_sources={2: 0.5},
+            velocity_mode=VelocityMode.VELOCITY,
+            air_density=1.2041,
+        )
 
-            _build_neumann_data(dp0_space, tags, omega, config, "single")
+        coeffs = _build_driver_neumann_coeffs(
+            dp0_space,
+            tags,
+            omega,
+            config,
+            np.complex64,
+        )
 
-            expected_coeff = 1j * 1.2041 * omega * 0.5
-            coeffs = captured["coefficients"]
+        expected_coeff = 1j * 1.2041 * omega * 0.5
 
-            np.testing.assert_allclose(coeffs[0], expected_coeff, rtol=1e-6)
-            np.testing.assert_allclose(coeffs[1], expected_coeff, rtol=1e-6)
-            assert coeffs[2] == 0.0
+        np.testing.assert_allclose(coeffs[0], expected_coeff, rtol=1e-6)
+        np.testing.assert_allclose(coeffs[1], expected_coeff, rtol=1e-6)
+        assert coeffs[2] == 0.0
 
     def test_zero_omega_acceleration_gives_zero(self):
-        fake_gf, captured = _captured_coefficients()
-        with patch("bempp_cl.api.GridFunction", fake_gf):
-            from hornlab_solver.bie import _build_neumann_data
+        from hornlab_solver.bie import _build_driver_neumann_coeffs
 
-            dp0_space = MagicMock()
-            dp0_space.global_dof_count = 2
+        dp0_space = SimpleNamespace(global_dof_count=2)
 
-            tags = np.array([2, 2], dtype=np.int32)
-            config = SolveConfig(velocity_sources={2: 1.0})
+        tags = np.array([2, 2], dtype=np.int32)
+        config = SolveConfig(velocity_sources={2: 1.0})
 
-            _build_neumann_data(dp0_space, tags, 0.0, config, "single")
+        coeffs = _build_driver_neumann_coeffs(
+            dp0_space,
+            tags,
+            0.0,
+            config,
+            np.complex64,
+        )
 
-            coeffs = captured["coefficients"]
-            assert coeffs[0] == 0.0
-            assert coeffs[1] == 0.0
+        assert coeffs[0] == 0.0
+        assert coeffs[1] == 0.0
 
 
 # ---------------------------------------------------------------------------

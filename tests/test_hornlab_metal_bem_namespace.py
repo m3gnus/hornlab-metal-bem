@@ -25,10 +25,9 @@ def test_hornlab_metal_bem_solve_defaults_to_pure_native_dispatch(monkeypatch):
     sentinel = object()
     calls = {}
 
-    def fake_load_mesh(mesh, *, scale, grid_backend):
+    def fake_load_mesh(mesh, *, scale):
         calls["mesh"] = mesh
         calls["scale"] = scale
-        calls["grid_backend"] = grid_backend
         return loaded
 
     monkeypatch.setattr("hornlab_solver.load_mesh", fake_load_mesh)
@@ -45,7 +44,6 @@ def test_hornlab_metal_bem_solve_defaults_to_pure_native_dispatch(monkeypatch):
     assert calls == {
         "mesh": "waveguide.msh",
         "scale": 1.0,
-        "grid_backend": "pure",
     }
 
 

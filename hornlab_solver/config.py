@@ -26,8 +26,8 @@ class VelocityMode(Enum):
     ACCELERATION = "acceleration"
 
 
-AssemblyBackend = Literal["opencl", "numba", "auto", "metal"]
-MetalBackendFallback = Literal["opencl", "error"]
+AssemblyBackend = Literal["metal"]
+MetalBackendFallback = Literal["error"]
 NativeSymmetryPlane = Literal["yz", "xz", "yz+xz"]
 MetalNativeAssemblyMode = Literal["corrected", "optimized"]
 
@@ -94,10 +94,9 @@ class SolveConfig:
     # Performance
     workers: int = 1
     precision: Literal["single", "double"] = "single"
-    assembly_backend: AssemblyBackend = "opencl"
-    opencl_device: Literal["cpu", "gpu"] = "cpu"
-    experimental_metal_backend: bool = False
-    metal_backend_fallback: MetalBackendFallback = "opencl"
+    assembly_backend: AssemblyBackend = "metal"
+    experimental_metal_backend: bool = True
+    metal_backend_fallback: MetalBackendFallback = "error"
     native_symmetry_plane: NativeSymmetryPlane | None = None
     metal_native_assembly_mode: MetalNativeAssemblyMode = "corrected"
     metal_native_threads_per_group: int | None = None
@@ -122,12 +121,10 @@ class SolveConfig:
     on_frequency_result: Callable[[int, float, dict], bool] | None = None
 
     def __post_init__(self) -> None:
-        if self.assembly_backend not in {"opencl", "numba", "auto", "metal"}:
-            raise ValueError(
-                "assembly_backend must be one of: auto, opencl, numba, metal"
-            )
-        if self.metal_backend_fallback not in {"opencl", "error"}:
-            raise ValueError("metal_backend_fallback must be 'opencl' or 'error'")
+        if self.assembly_backend != "metal":
+            raise ValueError("assembly_backend must be 'metal'")
+        if self.metal_backend_fallback != "error":
+            raise ValueError("metal_backend_fallback must be 'error'")
         if self.native_symmetry_plane not in {None, "yz", "xz", "yz+xz"}:
             raise ValueError(
                 "native_symmetry_plane must be None, 'yz', 'xz', or 'yz+xz'"

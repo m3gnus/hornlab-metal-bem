@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -43,16 +42,12 @@ class MeshError(Exception):
     pass
 
 
-GridBackend = Literal["pure", "bempp"]
-
-
 def load_mesh(
     path: str | Path,
     scale: float = 1.0,
     validate: bool = True,
     merge_tol: float = 1e-9,
     repair_normals: bool = False,
-    grid_backend: GridBackend = "pure",
 ) -> LoadedMesh:
     """Load a .msh file into a lightweight grid with physical group tags.
 
@@ -63,13 +58,9 @@ def load_mesh(
     triangle winding. Set ``repair_normals=True`` only for explicit
     compatibility with arbitrary external meshes that may use inward winding.
 
-    ``grid_backend="pure"`` returns a NumPy-only grid suitable for the native
-    Metal path. ``grid_backend="bempp"`` is available for validation and the
-    legacy Bempp/OpenCL fallback path.
+    The returned grid is a NumPy-only object shaped like the metadata consumed
+    by the native Metal path.
     """
-    if grid_backend not in {"pure", "bempp"}:
-        raise ValueError("grid_backend must be 'pure' or 'bempp'")
-
     try:
         import meshio
     except ImportError as exc:  # pragma: no cover - environment dependent.
@@ -118,17 +109,7 @@ def load_mesh(
         )
         _validate_physical_groups(phys_tags)
 
-    if grid_backend == "bempp":
-        try:
-            import bempp_cl.api as bempp_api
-        except ImportError as exc:  # pragma: no cover - environment dependent.
-            raise MeshError(
-                "bempp-cl is required for grid_backend='bempp'. Install the "
-                "validation extra to use the Bempp/OpenCL path."
-            ) from exc
-        grid = bempp_api.Grid(verts.T, triangles.T.astype(np.int32), phys_tags)
-    else:
-        grid = make_pure_grid(verts, triangles)
+    grid = make_pure_grid(verts, triangles)
 
     info = MeshInfo(
         n_vertices=len(verts),
@@ -183,31 +164,6 @@ def make_pure_function_spaces(
         global_dof_count=int(elements.shape[1]),
     )
     return p1, dp0
-
-
-def to_bempp_loaded_mesh(mesh: LoadedMesh) -> LoadedMesh:
-    """Return a Bempp-backed view of ``mesh`` for validation/fallback paths."""
-    try:
-        import bempp_cl.api as bempp_api
-    except ImportError as exc:  # pragma: no cover - environment dependent.
-        raise MeshError(
-            "bempp-cl is required for the Bempp/OpenCL fallback path. Install "
-            "the validation extra or use metal_backend_fallback='error'."
-        ) from exc
-
-    module_name = type(mesh.grid).__module__
-    if module_name.startswith("bempp_cl."):
-        return mesh
-
-    if not hasattr(mesh.grid, "vertices") or not hasattr(mesh.grid, "elements"):
-        raise MeshError("Cannot convert mesh grid without vertices/elements")
-
-    grid = bempp_api.Grid(
-        np.asarray(mesh.grid.vertices, dtype=np.float64),
-        np.asarray(mesh.grid.elements, dtype=np.int32),
-        mesh.physical_tags,
-    )
-    return LoadedMesh(grid=grid, physical_tags=mesh.physical_tags, info=mesh.info)
 
 
 def _triangle_areas(

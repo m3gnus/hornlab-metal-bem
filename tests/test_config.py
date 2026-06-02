@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import pytest
 
-import hornlab_solver
 from hornlab_solver.backends import (
     AssemblyBackendUnavailable,
     discover_metal_backend,
@@ -44,12 +43,11 @@ def test_solve_config_on_frequency_result_defaults_none():
     assert cfg.on_frequency_result is None
 
 
-def test_solve_config_default_backend_stays_opencl_cpu():
+def test_solve_config_default_backend_is_native_metal():
     cfg = SolveConfig()
-    assert cfg.assembly_backend == "opencl"
-    assert cfg.opencl_device == "cpu"
-    assert cfg.experimental_metal_backend is False
-    assert cfg.metal_backend_fallback == "opencl"
+    assert cfg.assembly_backend == "metal"
+    assert cfg.experimental_metal_backend is True
+    assert cfg.metal_backend_fallback == "error"
     assert cfg.native_symmetry_plane is None
     assert cfg.metal_native_assembly_mode == "corrected"
     assert cfg.metal_native_threads_per_group is None
@@ -64,9 +62,19 @@ def test_solve_config_rejects_unknown_backend():
         SolveConfig(assembly_backend="cuda")  # type: ignore[arg-type]
 
 
+def test_solve_config_rejects_removed_opencl_backend():
+    with pytest.raises(ValueError, match="assembly_backend"):
+        SolveConfig(assembly_backend="opencl")  # type: ignore[arg-type]
+
+
 def test_solve_config_rejects_unknown_metal_fallback():
     with pytest.raises(ValueError, match="metal_backend_fallback"):
         SolveConfig(metal_backend_fallback="numba")  # type: ignore[arg-type]
+
+
+def test_solve_config_rejects_removed_opencl_fallback():
+    with pytest.raises(ValueError, match="metal_backend_fallback"):
+        SolveConfig(metal_backend_fallback="opencl")  # type: ignore[arg-type]
 
 
 def test_solve_config_rejects_unknown_native_symmetry_plane():
@@ -137,28 +145,15 @@ def test_solve_config_rejects_nonpositive_per_kernel_native_threadgroup_override
         SolveConfig(**{field_name: 0})
 
 
-def test_auto_backend_resolves_to_opencl():
-    resolution = resolve_assembly_backend(SolveConfig(assembly_backend="auto"))
-    assert resolution.effective_backend == "opencl"
-    assert resolution.fallback_used is False
+def test_resolve_backend_raises_when_native_unavailable(monkeypatch):
+    class Status:
+        available = False
+        reason = "native unavailable"
 
+    monkeypatch.setattr(backends, "discover_metal_backend", lambda: Status())
 
-def test_metal_backend_falls_back_to_opencl_by_default():
-    resolution = resolve_assembly_backend(SolveConfig(assembly_backend="metal"))
-    assert resolution.requested_backend == "metal"
-    assert resolution.effective_backend == "opencl"
-    assert resolution.fallback_used is True
-    assert "experimental_metal_backend" in str(resolution.reason)
-
-
-def test_metal_backend_strict_mode_raises_until_packaged():
-    cfg = SolveConfig(
-        assembly_backend="metal",
-        experimental_metal_backend=True,
-        metal_backend_fallback="error",
-    )
-    with pytest.raises(AssemblyBackendUnavailable):
-        resolve_assembly_backend(cfg)
+    with pytest.raises(AssemblyBackendUnavailable, match="native unavailable"):
+        resolve_assembly_backend(SolveConfig())
 
 
 def test_metal_discovery_reports_native_helper(monkeypatch):
@@ -178,20 +173,18 @@ def test_metal_discovery_reports_native_helper(monkeypatch):
     assert status.reason is None
 
 
-def test_metal_strict_mode_still_raises_when_native_discovered(monkeypatch):
+def test_resolve_backend_returns_metal_when_native_discovered(monkeypatch):
     class Status:
         available = True
         reason = None
 
     monkeypatch.setattr(backends, "discover_metal_backend", lambda: Status())
-    cfg = SolveConfig(
-        assembly_backend="metal",
-        experimental_metal_backend=True,
-        metal_backend_fallback="error",
-    )
 
-    with pytest.raises(AssemblyBackendUnavailable, match="not wired"):
-        resolve_assembly_backend(cfg)
+    resolution = resolve_assembly_backend(SolveConfig())
+
+    assert resolution.requested_backend == "metal"
+    assert resolution.effective_backend == "metal"
+    assert resolution.fallback_used is False
 
 
 def test_explicit_experimental_metal_request_routes_to_native_sweep():
@@ -203,18 +196,8 @@ def test_explicit_experimental_metal_request_routes_to_native_sweep():
     assert should_route_native_metal(cfg) is True
 
 
-def test_explicit_experimental_metal_request_loads_pure_with_opencl_fallback():
-    cfg = SolveConfig(
-        assembly_backend="metal",
-        experimental_metal_backend=True,
-        metal_backend_fallback="opencl",
-    )
-
-    assert hornlab_solver.should_load_pure_grid(cfg) is True
-
-
 def test_native_symmetry_requires_native_metal_route():
-    cfg = SolveConfig(native_symmetry_plane="yz")
+    cfg = SolveConfig(native_symmetry_plane="yz", experimental_metal_backend=False)
 
     with pytest.raises(AssemblyBackendUnavailable, match="native_symmetry_plane"):
         should_route_native_metal(cfg)
@@ -224,7 +207,6 @@ def test_native_metal_sweep_rejects_unsupported_formulation_in_strict_mode():
     cfg = SolveConfig(
         assembly_backend="metal",
         experimental_metal_backend=True,
-        metal_backend_fallback="error",
         formulation=BIEFormulation.BURTON_MILLER,
     )
 

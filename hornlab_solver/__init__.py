@@ -27,7 +27,6 @@ from .config import (
     SolveConfig,
     VelocityMode,
 )
-from .device import OpenCLError, configure_opencl
 from .metal import DenseBieSystem, MetalBemBackend, MetalBemContext
 from .mesh import (
     LoadedMesh,
@@ -36,7 +35,6 @@ from .mesh import (
     PureGrid,
     load_mesh,
     make_pure_function_spaces,
-    to_bempp_loaded_mesh,
 )
 from .observation import ObservationFrame, infer_frame
 from .result import MeshInfo, SolveResult
@@ -57,10 +55,7 @@ __all__ = [
     "MeshInfo",
     "MeshError",
     "make_pure_function_spaces",
-    "to_bempp_loaded_mesh",
     "ObservationFrame",
-    "OpenCLError",
-    "configure_opencl",
     "AssemblyBackendResolution",
     "AssemblyBackendUnavailable",
     "MetalBackendStatus",
@@ -88,15 +83,7 @@ def _resolve_mesh(mesh, config: SolveConfig) -> LoadedMesh:
     """Accept str, Path, or LoadedMesh."""
     if isinstance(mesh, LoadedMesh):
         return mesh
-    grid_backend = "pure" if should_load_pure_grid(config) else "bempp"
-    return load_mesh(mesh, scale=config.mesh_scale, grid_backend=grid_backend)
-
-
-def should_load_pure_grid(config: SolveConfig) -> bool:
-    return (
-        config.assembly_backend == "metal"
-        and config.experimental_metal_backend
-    )
+    return load_mesh(mesh, scale=config.mesh_scale)
 
 
 def _resolve_frame(loaded: LoadedMesh, config: SolveConfig) -> ObservationFrame:
@@ -146,8 +133,6 @@ def solve(
     from .sweep import (
         _build_frequency_grid,
         run_sweep_native_metal,
-        run_sweep_parallel,
-        run_sweep_serial,
         should_route_native_metal,
     )
 
@@ -159,21 +144,14 @@ def solve(
     if workers == 0:
         workers = _detect_worker_count()
 
-    if should_load_pure_grid(config):
-        if workers not in (0, 1):
-            logger.warning(
-                "Native Metal sweeps use one resident validation session; "
-                "ignoring workers=%s.",
-                workers,
-            )
-        return run_sweep_native_metal(loaded, frequencies, frame, config)
-    if should_route_native_metal(config):
-        return run_sweep_native_metal(loaded, frequencies, frame, config)
-
-    if workers <= 1:
-        return run_sweep_serial(loaded, frequencies, frame, config)
-    else:
-        return run_sweep_parallel(loaded, frequencies, frame, config, workers)
+    if workers not in (0, 1):
+        logger.warning(
+            "Native Metal sweeps use one resident validation session; "
+            "ignoring workers=%s.",
+            workers,
+        )
+    should_route_native_metal(config)
+    return run_sweep_native_metal(loaded, frequencies, frame, config)
 
 
 def solve_frequencies(
@@ -190,14 +168,11 @@ def solve_frequencies(
     if config is None:
         config = SolveConfig()
 
-    from .sweep import run_sweep_native_metal, run_sweep_serial, should_route_native_metal
+    from .sweep import run_sweep_native_metal, should_route_native_metal
 
     loaded = _resolve_mesh(mesh, config)
     frame = _resolve_frame(loaded, config)
     freqs = np.asarray(frequencies_hz, dtype=np.float64)
 
-    if should_load_pure_grid(config) or should_route_native_metal(config):
-        return run_sweep_native_metal(loaded, freqs, frame, config)
-
-    # Always serial for caller-ordered frequencies (order matters)
-    return run_sweep_serial(loaded, freqs, frame, config)
+    should_route_native_metal(config)
+    return run_sweep_native_metal(loaded, freqs, frame, config)
