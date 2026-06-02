@@ -36,6 +36,7 @@ from .mesh import (
     PureGrid,
     load_mesh,
     make_pure_function_spaces,
+    to_bempp_loaded_mesh,
 )
 from .observation import ObservationFrame, infer_frame
 from .result import MeshInfo, SolveResult
@@ -56,6 +57,7 @@ __all__ = [
     "MeshInfo",
     "MeshError",
     "make_pure_function_spaces",
+    "to_bempp_loaded_mesh",
     "ObservationFrame",
     "OpenCLError",
     "configure_opencl",
@@ -94,7 +96,6 @@ def should_load_pure_grid(config: SolveConfig) -> bool:
     return (
         config.assembly_backend == "metal"
         and config.experimental_metal_backend
-        and config.metal_backend_fallback == "error"
     )
 
 
@@ -158,13 +159,15 @@ def solve(
     if workers == 0:
         workers = _detect_worker_count()
 
-    if should_route_native_metal(config):
+    if should_load_pure_grid(config):
         if workers not in (0, 1):
             logger.warning(
                 "Native Metal sweeps use one resident validation session; "
                 "ignoring workers=%s.",
                 workers,
             )
+        return run_sweep_native_metal(loaded, frequencies, frame, config)
+    if should_route_native_metal(config):
         return run_sweep_native_metal(loaded, frequencies, frame, config)
 
     if workers <= 1:
@@ -193,7 +196,7 @@ def solve_frequencies(
     frame = _resolve_frame(loaded, config)
     freqs = np.asarray(frequencies_hz, dtype=np.float64)
 
-    if should_route_native_metal(config):
+    if should_load_pure_grid(config) or should_route_native_metal(config):
         return run_sweep_native_metal(loaded, freqs, frame, config)
 
     # Always serial for caller-ordered frequencies (order matters)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import pytest
 
+import hornlab_solver
 from hornlab_solver.backends import (
     AssemblyBackendUnavailable,
     discover_metal_backend,
@@ -200,6 +201,16 @@ def test_explicit_experimental_metal_request_routes_to_native_sweep():
     )
 
     assert should_route_native_metal(cfg) is True
+
+
+def test_explicit_experimental_metal_request_loads_pure_with_opencl_fallback():
+    cfg = SolveConfig(
+        assembly_backend="metal",
+        experimental_metal_backend=True,
+        metal_backend_fallback="opencl",
+    )
+
+    assert hornlab_solver.should_load_pure_grid(cfg) is True
 
 
 def test_native_symmetry_requires_native_metal_route():

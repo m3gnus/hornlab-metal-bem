@@ -24,7 +24,7 @@ from .bie import (
     solve_single_frequency,
 )
 from .config import BIEFormulation, SolveConfig
-from .mesh import LoadedMesh, make_pure_function_spaces
+from .mesh import LoadedMesh, make_pure_function_spaces, to_bempp_loaded_mesh
 from .observation import ObservationFrame, build_observation_points
 from .result import SolveResult
 
@@ -312,7 +312,7 @@ def run_sweep_native_metal(
     from the assembled non-Hermitian system.
     """
     if not should_route_native_metal(config):
-        return run_sweep_serial(mesh, frequencies, frame, config)
+        return _run_bempp_fallback(mesh, frequencies, frame, config)
 
     try:
         from .metal.geometry import build_metal_geometry_buffers
@@ -326,7 +326,7 @@ def run_sweep_native_metal(
             "Native Metal helper could not be imported: %s; falling back to Bempp/OpenCL.",
             exc,
         )
-        return run_sweep_serial(mesh, frequencies, frame, config)
+        return _run_bempp_fallback(mesh, frequencies, frame, config)
 
     runtime = discover_native_runtime(run_smoke_test=True)
     if not runtime.available:
@@ -337,7 +337,7 @@ def run_sweep_native_metal(
             "Native Metal helper unavailable: %s; falling back to Bempp/OpenCL.",
             reason,
         )
-        return run_sweep_serial(mesh, frequencies, frame, config)
+        return _run_bempp_fallback(mesh, frequencies, frame, config)
 
     t_total = time.time()
     obs_points, angles_deg = build_observation_points(frame, config.observation)
@@ -730,6 +730,15 @@ def run_sweep_native_metal(
         solver_log=solver_log,
         surface_pressure_avg=sp_avg if sp_avg else None,
     )
+
+
+def _run_bempp_fallback(
+    mesh: LoadedMesh,
+    frequencies: NDArray[np.float64],
+    frame: ObservationFrame,
+    config: SolveConfig,
+) -> SolveResult:
+    return run_sweep_serial(to_bempp_loaded_mesh(mesh), frequencies, frame, config)
 
 
 def run_sweep_parallel(
