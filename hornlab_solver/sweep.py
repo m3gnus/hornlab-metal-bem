@@ -24,7 +24,7 @@ from .bie import (
     solve_single_frequency,
 )
 from .config import BIEFormulation, SolveConfig
-from .mesh import LoadedMesh
+from .mesh import LoadedMesh, make_pure_function_spaces
 from .observation import ObservationFrame, build_observation_points
 from .result import SolveResult
 
@@ -341,7 +341,7 @@ def run_sweep_native_metal(
 
     t_total = time.time()
     obs_points, angles_deg = build_observation_points(frame, config.observation)
-    p1_space, dp0_space = _setup_function_spaces(mesh.grid)
+    p1_space, dp0_space = make_pure_function_spaces(mesh.grid)
     geometry_buffers = build_metal_geometry_buffers(
         mesh.grid,
         mesh.physical_tags,

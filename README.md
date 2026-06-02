@@ -11,10 +11,8 @@ This repository packages the fastest currently validated HornLab solver path:
 - resident observation buffer reuse
 - stable default Metal dispatch at 64 threads per threadgroup
 
-The current public Python package still imports as `hornlab_solver` during the
-first extraction pass. That keeps the proven HornLab implementation and tests
-intact while this repository is prepared for standalone and downstream
-application integration.
+The package keeps the proven `hornlab_solver` import for compatibility and also
+exports the forward-looking `hornlab_metal_bem` namespace for new integrations.
 
 ## Status
 
@@ -22,26 +20,25 @@ This is an Apple Silicon/macOS solver backend. It is intended to replace or
 augment local acoustic BEM backends on Apple Silicon, not NVIDIA CUDA backends
 on Windows.
 
-Current caveat: the fast path still uses `bempp-cl` scaffolding for mesh/grid
-and function-space construction. The expensive solve path is native Metal, but
-the next packaging milestone is a pure mesh/function-space loader so `bempp-cl`
-can become a validation-only optional dependency.
+The solver uses a NumPy-only mesh/grid/function-space loader and does not
+depend on `bempp-cl`. There is no OpenCL/Bempp fallback path in this package.
 
 ## Fastest Validated Path
 
-Use:
+Use the Bempp-free public Metal namespace:
+
+```python
+from hornlab_metal_bem import native_config, solve
+
+config = native_config()
+
+result = solve("waveguide.msh", config)
+```
+
+The compatibility namespace remains available for existing HornLab callers:
 
 ```python
 from hornlab_solver import SolveConfig, solve
-
-config = SolveConfig(
-    assembly_backend="metal",
-    experimental_metal_backend=True,
-    metal_backend_fallback="error",
-    metal_native_assembly_mode="corrected",
-)
-
-result = solve("waveguide.msh", config)
 ```
 
 Recent ASRO2 corrected-quarter benchmark from HornLab:
@@ -59,12 +56,22 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e ".[dev]"
 swift build -c release --package-path hornlab_solver/metal/native_helper
-python -m pytest tests/test_config.py tests/test_metal_session.py tests/test_metal_native.py -q
+python -m pytest tests/test_config.py tests/test_metal_native.py -q
 ```
 
-## Integration Target
+## Boundary Lab Backend
 
-Downstream adapters should translate their application-level simulation config
-into `SolveConfig` and call the package through a small backend/session layer.
+The package exposes a Boundary Lab solver backend/session implementation and
+translates Boundary Lab `SolveRequest` and `SimulationConfig` objects into the
+native Metal solve configuration.
 
-Recommended backend id: `hornlab_metal`.
+Backend id: `hornlab_metal`.
+
+```python
+from hornlab_metal_bem.boundary_lab import create_backend
+
+backend = create_backend()
+session = backend.create_session(solve_request)
+for result in session.solve_stream():
+    ...
+```

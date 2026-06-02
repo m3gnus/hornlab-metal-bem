@@ -29,7 +29,14 @@ from .config import (
 )
 from .device import OpenCLError, configure_opencl
 from .metal import DenseBieSystem, MetalBemBackend, MetalBemContext
-from .mesh import LoadedMesh, MeshError, load_mesh
+from .mesh import (
+    LoadedMesh,
+    MeshError,
+    PureFunctionSpace,
+    PureGrid,
+    load_mesh,
+    make_pure_function_spaces,
+)
 from .observation import ObservationFrame, infer_frame
 from .result import MeshInfo, SolveResult
 
@@ -44,8 +51,11 @@ __all__ = [
     "LinearSolver",
     "VelocityMode",
     "LoadedMesh",
+    "PureGrid",
+    "PureFunctionSpace",
     "MeshInfo",
     "MeshError",
+    "make_pure_function_spaces",
     "ObservationFrame",
     "OpenCLError",
     "configure_opencl",
@@ -72,11 +82,20 @@ def _detect_worker_count() -> int:
     return max(1, count)
 
 
-def _resolve_mesh(mesh, scale: float = 1.0) -> LoadedMesh:
+def _resolve_mesh(mesh, config: SolveConfig) -> LoadedMesh:
     """Accept str, Path, or LoadedMesh."""
     if isinstance(mesh, LoadedMesh):
         return mesh
-    return load_mesh(mesh, scale=scale)
+    grid_backend = "pure" if should_load_pure_grid(config) else "bempp"
+    return load_mesh(mesh, scale=config.mesh_scale, grid_backend=grid_backend)
+
+
+def should_load_pure_grid(config: SolveConfig) -> bool:
+    return (
+        config.assembly_backend == "metal"
+        and config.experimental_metal_backend
+        and config.metal_backend_fallback == "error"
+    )
 
 
 def _resolve_frame(loaded: LoadedMesh, config: SolveConfig) -> ObservationFrame:
@@ -123,9 +142,6 @@ def solve(
     if config is None:
         config = SolveConfig()
 
-    loaded = _resolve_mesh(mesh, scale=config.mesh_scale)
-    frame = _resolve_frame(loaded, config)
-
     from .sweep import (
         _build_frequency_grid,
         run_sweep_native_metal,
@@ -134,6 +150,8 @@ def solve(
         should_route_native_metal,
     )
 
+    loaded = _resolve_mesh(mesh, config)
+    frame = _resolve_frame(loaded, config)
     frequencies = _build_frequency_grid(config)
 
     workers = config.workers
@@ -169,11 +187,10 @@ def solve_frequencies(
     if config is None:
         config = SolveConfig()
 
-    loaded = _resolve_mesh(mesh, scale=config.mesh_scale)
-    frame = _resolve_frame(loaded, config)
-
     from .sweep import run_sweep_native_metal, run_sweep_serial, should_route_native_metal
 
+    loaded = _resolve_mesh(mesh, config)
+    frame = _resolve_frame(loaded, config)
     freqs = np.asarray(frequencies_hz, dtype=np.float64)
 
     if should_route_native_metal(config):
