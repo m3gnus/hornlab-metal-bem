@@ -26,9 +26,7 @@ markers = [
 
 [tool.setuptools.package-data]
 hornlab_solver = [
-    "metal/HornlabSolverMetal.jl",
     "metal/HornlabSolverMetalNative.swift",
     "metal/native_helper/Package.swift",
     "metal/native_helper/Sources/HornlabSolverMetalNative/main.swift",
-    "metal/Project.toml",
 ]

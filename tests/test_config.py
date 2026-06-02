@@ -160,30 +160,21 @@ def test_metal_backend_strict_mode_raises_until_packaged():
         resolve_assembly_backend(cfg)
 
 
-def test_metal_discovery_can_report_native_without_julia(monkeypatch):
+def test_metal_discovery_reports_native_helper(monkeypatch):
     class NativeStatus:
         is_apple_silicon = True
         swift_path = "/usr/bin/swift"
         helper_assets_present = True
         unavailable_reasons = ()
 
-    class JuliaStatus:
-        is_apple_silicon = True
-        julia_path = None
-        backend_assets_present = True
-        unavailable_reasons = ("Julia executable not found via PATH.",)
-
     monkeypatch.setattr(backends, "discover_native_runtime", lambda config: NativeStatus())
-    monkeypatch.setattr(backends, "discover_runtime", lambda config: JuliaStatus())
 
     status = discover_metal_backend()
 
     assert status.available is True
     assert status.native_executable == "/usr/bin/swift"
-    assert status.julia_executable is None
     assert status.native_helper_available is True
-    assert status.julia_bridge_available is False
-    assert "julia:" in str(status.reason)
+    assert status.reason is None
 
 
 def test_metal_strict_mode_still_raises_when_native_discovered(monkeypatch):

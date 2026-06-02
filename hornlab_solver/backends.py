@@ -5,7 +5,6 @@ from dataclasses import dataclass
 
 from .config import SolveConfig
 from .metal.native import MetalNativeRuntimeConfig, discover_native_runtime
-from .metal.runtime import MetalRuntimeConfig, discover_runtime
 
 BEMPP_BACKENDS = frozenset({"opencl", "numba"})
 
@@ -16,12 +15,10 @@ class AssemblyBackendUnavailable(RuntimeError):
 
 @dataclass(frozen=True)
 class MetalBackendStatus:
-    """Runtime status for optional Metal validation helpers."""
+    """Runtime status for the optional native Metal helper."""
 
     supported_platform: bool
-    julia_executable: str | None
     native_executable: str | None
-    julia_bridge_available: bool
     native_helper_available: bool
     reason: str | None
 
@@ -32,7 +29,7 @@ class MetalBackendStatus:
     @property
     def packaged_backend_available(self) -> bool:
         """Backward-compatible aggregate asset/runtime availability."""
-        return self.native_helper_available or self.julia_bridge_available
+        return self.native_helper_available
 
 
 @dataclass(frozen=True)
@@ -48,31 +45,20 @@ class AssemblyBackendResolution:
 
 def discover_metal_backend(
     *,
-    julia_executable: str | None = None,
     native_executable: str | None = None,
 ) -> MetalBackendStatus:
     """Discover prerequisites for experimental packaged Metal helpers.
 
-    Discovery can report native Swift or Julia validation helpers as present,
-    but production routing remains conservative: ``resolve_assembly_backend``
-    still maps every ``metal`` request to the Bempp/OpenCL fallback or raises in
+    Production routing remains conservative: ``resolve_assembly_backend`` still
+    maps every ``metal`` request to the Bempp/OpenCL fallback or raises in
     strict mode.
     """
 
-    julia_status = discover_runtime(
-        MetalRuntimeConfig(julia_executable=julia_executable)
-    )
     native_status = discover_native_runtime(
         MetalNativeRuntimeConfig(swift_executable=native_executable)
     )
-    supported_platform = julia_status.is_apple_silicon or native_status.is_apple_silicon
-    julia = julia_status.julia_path
+    supported_platform = native_status.is_apple_silicon
     native = native_status.swift_path
-    julia_available = (
-        julia_status.is_apple_silicon
-        and julia_status.julia_path is not None
-        and julia_status.backend_assets_present
-    )
     native_available = (
         native_status.is_apple_silicon
         and native_status.swift_path is not None
@@ -82,15 +68,11 @@ def discover_metal_backend(
     reasons: list[str] = []
     if native_status.unavailable_reasons:
         reasons.append("native: " + "; ".join(native_status.unavailable_reasons))
-    if julia_status.unavailable_reasons:
-        reasons.append("julia: " + "; ".join(julia_status.unavailable_reasons))
     reason = "; ".join(reasons) if reasons else None
 
     return MetalBackendStatus(
         supported_platform=supported_platform,
-        julia_executable=julia,
         native_executable=native,
-        julia_bridge_available=julia_available,
         native_helper_available=native_available,
         reason=reason,
     )

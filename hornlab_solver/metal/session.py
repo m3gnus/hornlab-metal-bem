@@ -1,9 +1,7 @@
-"""Language-neutral session and IPC contract for experimental Metal backends.
+"""Language-neutral session and IPC contract for native Metal backends.
 
-The module owns the Python-side file contract. It validates packaged runtime
-discovery, writes JSON manifests plus little-endian binary buffers, and can
-invoke the current packaged Julia validation bridge when explicitly used. The
-production solver path does not route through this module yet.
+The module owns the Python-side file contract for JSON manifests plus
+little-endian binary buffers consumed by the Swift/Metal native helper.
 """
 from __future__ import annotations
 
@@ -11,17 +9,12 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 from pathlib import PurePosixPath
-import shutil
-import subprocess
-import tempfile
 from typing import Any
-from uuid import uuid4
 
 import numpy as np
 from numpy.typing import NDArray
 
 from .geometry import MetalGeometryBuffers, build_metal_geometry_buffers
-from .runtime import MetalRuntimeConfig, MetalRuntimeStatus, discover_runtime
 
 
 METAL_STANDARD_SCHEMA = "hornlab.metal.standard.v1"
@@ -284,20 +277,6 @@ class BatchFieldPayload:
 
 
 @dataclass(frozen=True)
-class SessionInfo:
-    """Created-session metadata returned by ``MetalStandardSession``."""
-
-    session_id: str
-    work_dir: Path
-    manifest_path: Path
-    geometry_dir: Path
-    runtime_status: MetalRuntimeStatus
-    schema: str = METAL_STANDARD_SCHEMA
-    index_base: int = INDEX_BASE
-    matrix_layout: str = MATRIX_LAYOUT_ROW_MAJOR_C
-
-
-@dataclass(frozen=True)
 class DenseAssemblyResult:
     """Dense matrix/RHS result descriptor returned by packaged helpers."""
 
@@ -468,349 +447,6 @@ def write_geometry_buffers(
             relative_to=relative_to,
         ),
     }
-
-
-class MetalStandardSession:
-    """Julia validation session shell for standard Neumann Metal assembly.
-
-    New non-Julia work should use ``MetalNativeStandardSession``. This class
-    keeps the original name for compatibility with the first packaged bridge.
-    """
-
-    def __init__(
-        self,
-        info: SessionInfo,
-        geometry_payload: GeometryPayload,
-        *,
-        owns_work_dir: bool,
-    ) -> None:
-        self.info = info
-        self.geometry_payload = geometry_payload
-        self._owns_work_dir = owns_work_dir
-        self._closed = False
-
-    @classmethod
-    def create_session(
-        cls,
-        grid: Any | None = None,
-        physical_tags: Any | None = None,
-        p1_space: Any | None = None,
-        dp0_space: Any | None = None,
-        *,
-        geometry_buffers: MetalGeometryBuffers | None = None,
-        runtime_config: MetalRuntimeConfig | None = None,
-        work_dir: Path | None = None,
-        session_id: str | None = None,
-        keep_artifacts: bool = False,
-        regular_triangle_order: int = 4,
-        duffy_1d_order: int = 4,
-        precision: str = "complex64",
-    ) -> "MetalStandardSession":
-        """Validate packaged runtime discovery and write session artifacts.
-
-        Missing packaged backend assets or a failed Julia/Metal smoke test raise
-        ``AssemblyBackendUnavailable`` before any session directory is created.
-        """
-        status = discover_runtime(runtime_config, run_smoke_test=True)
-        if not status.available:
-            raise _backend_unavailable(
-                "Julia/Metal backend is unavailable for MetalStandardSession: "
-                + "; ".join(status.unavailable_reasons)
-            )
-
-        if geometry_buffers is None:
-            if grid is None or physical_tags is None or p1_space is None:
-                raise ValueError(
-                    "grid, physical_tags, and p1_space are required when "
-                    "geometry_buffers is not provided"
-                )
-            geometry_buffers = build_metal_geometry_buffers(
-                grid,
-                physical_tags,
-                p1_space,
-                dp0_space,
-            )
-
-        session_id = session_id or f"metal-{uuid4().hex[:12]}"
-        owns_work_dir = work_dir is None and not keep_artifacts
-        root = (
-            Path(tempfile.mkdtemp(prefix="hornlab-metal-session-"))
-            if work_dir is None
-            else Path(work_dir)
-        )
-        geometry_dir = root / "geometry"
-        mesh = write_geometry_buffers(
-            geometry_buffers,
-            geometry_dir,
-            relative_to=root,
-        )
-        payload = GeometryPayload(
-            session_id=session_id,
-            mesh=mesh,
-            p1_dof_count=geometry_buffers.p1_dof_count,
-            dp0_dof_count=geometry_buffers.dp0_dof_count,
-            regular_triangle_order=regular_triangle_order,
-            duffy_1d_order=duffy_1d_order,
-            precision=precision,
-        )
-        manifest_path = write_json_manifest(payload, root / "session.json")
-        info = SessionInfo(
-            session_id=session_id,
-            work_dir=root,
-            manifest_path=manifest_path,
-            geometry_dir=geometry_dir,
-            runtime_status=status,
-        )
-        return cls(info, payload, owns_work_dir=owns_work_dir)
-
-    def assemble_standard_neumann(
-        self,
-        frequency_hz: float,
-        k_real: float,
-        neumann_dp0: NDArray[Any],
-        *,
-        operation_id: str | None = None,
-    ) -> DenseAssemblyResult:
-        """Assemble the standard Neumann dense matrix/RHS via packaged Julia."""
-        self._ensure_open()
-        neumann = _require_complex_vector(
-            "neumann_dp0",
-            neumann_dp0,
-            self.geometry_payload.dp0_dof_count,
-        )
-        op_id = operation_id or _operation_id("assembly", frequency_hz)
-        op_dir = self.info.work_dir / op_id
-        inputs_dir = op_dir / "inputs"
-        outputs_dir = op_dir / "outputs"
-
-        neumann_desc = _write_complex_vector(
-            neumann,
-            inputs_dir / "neumann",
-            real_name="neumann_re_f32.bin",
-            imag_name="neumann_im_f32.bin",
-            relative_to=self.info.work_dir,
-        )
-        n = self.geometry_payload.p1_dof_count
-        outputs = {
-            "A_real_f32": BinaryArrayDescriptor(
-                path=(outputs_dir / "A_re_f32.bin").relative_to(
-                    self.info.work_dir
-                ).as_posix(),
-                shape=(n, n),
-                dtype="float32",
-            ),
-            "A_imag_f32": BinaryArrayDescriptor(
-                path=(outputs_dir / "A_im_f32.bin").relative_to(
-                    self.info.work_dir
-                ).as_posix(),
-                shape=(n, n),
-                dtype="float32",
-            ),
-            "rhs_real_f32": BinaryArrayDescriptor(
-                path=(outputs_dir / "rhs_re_f32.bin").relative_to(
-                    self.info.work_dir
-                ).as_posix(),
-                shape=(n,),
-                dtype="float32",
-            ),
-            "rhs_imag_f32": BinaryArrayDescriptor(
-                path=(outputs_dir / "rhs_im_f32.bin").relative_to(
-                    self.info.work_dir
-                ).as_posix(),
-                shape=(n,),
-                dtype="float32",
-            ),
-        }
-        payload = AssemblyPayload(
-            session_id=self.info.session_id,
-            frequency_hz=frequency_hz,
-            k_real_f32=float(np.float32(k_real)),
-            neumann_dp0=neumann_desc,
-            outputs=outputs,
-        )
-        payload_path = write_json_manifest(payload, op_dir / "assembly.json")
-        result_path = op_dir / "assembly-result.json"
-        self._run_backend(
-            "assemble_standard_neumann",
-            payload_path=payload_path,
-            result_path=result_path,
-        )
-        result = read_json_manifest(result_path)
-        return DenseAssemblyResult(
-            session_id=str(result["session_id"]),
-            frequency_hz=float(result["frequency_hz"]),
-            matrix_real_f32=self.info.work_dir / result["matrix_real_f32"],
-            matrix_imag_f32=self.info.work_dir / result["matrix_imag_f32"],
-            rhs_real_f32=self.info.work_dir / result["rhs_real_f32"],
-            rhs_imag_f32=self.info.work_dir / result["rhs_imag_f32"],
-            matrix_shape=tuple(int(v) for v in result["matrix_shape"]),
-            rhs_shape=tuple(int(v) for v in result["rhs_shape"]),
-            matrix_layout=str(result["matrix_layout"]),
-        )
-
-    def evaluate_standard_exterior(
-        self,
-        frequency_hz: float,
-        k_real: float,
-        pressure_p1: NDArray[Any],
-        neumann_dp0: NDArray[Any],
-        observation_points: NDArray[Any],
-        *,
-        batch_id: str = "batch",
-        operation_id: str | None = None,
-    ) -> FieldResult:
-        """Evaluate exterior pressure through the packaged Julia backend."""
-        self._ensure_open()
-        pressure = _require_complex_vector(
-            "pressure_p1",
-            pressure_p1,
-            self.geometry_payload.p1_dof_count,
-        )
-        neumann = _require_complex_vector(
-            "neumann_dp0",
-            neumann_dp0,
-            self.geometry_payload.dp0_dof_count,
-        )
-        points_3xn = _require_observation_points_3xn(observation_points)
-        n_obs = int(points_3xn.shape[1])
-        op_id = operation_id or _operation_id("field", frequency_hz)
-        op_dir = self.info.work_dir / op_id
-        inputs_dir = op_dir / "inputs"
-        outputs_dir = op_dir / "outputs"
-
-        pressure_desc = _write_complex_vector(
-            pressure,
-            inputs_dir / "pressure",
-            real_name="pressure_re_f32.bin",
-            imag_name="pressure_im_f32.bin",
-            relative_to=self.info.work_dir,
-        )
-        neumann_desc = _write_complex_vector(
-            neumann,
-            inputs_dir / "neumann",
-            real_name="neumann_re_f32.bin",
-            imag_name="neumann_im_f32.bin",
-            relative_to=self.info.work_dir,
-        )
-        obs_desc = write_binary_array(
-            points_3xn,
-            inputs_dir / "obs_points_3xn_f32.bin",
-            dtype=np.float32,
-            relative_to=self.info.work_dir,
-        )
-        output = {
-            "pressure_real_f32": BinaryArrayDescriptor(
-                path=(outputs_dir / "obs_pressure_re_f32.bin").relative_to(
-                    self.info.work_dir
-                ).as_posix(),
-                shape=(n_obs,),
-                dtype="float32",
-            ),
-            "pressure_imag_f32": BinaryArrayDescriptor(
-                path=(outputs_dir / "obs_pressure_im_f32.bin").relative_to(
-                    self.info.work_dir
-                ).as_posix(),
-                shape=(n_obs,),
-                dtype="float32",
-            ),
-        }
-        payload = FieldPayload(
-            session_id=self.info.session_id,
-            batch_id=batch_id,
-            frequency_hz=frequency_hz,
-            k_real_f32=float(np.float32(k_real)),
-            pressure_p1=pressure_desc,
-            neumann_dp0=neumann_desc,
-            observation_points=obs_desc,
-            output=output,
-        )
-        payload_path = write_json_manifest(payload, op_dir / "field.json")
-        result_path = op_dir / "field-result.json"
-        self._run_backend(
-            "evaluate_standard_exterior",
-            payload_path=payload_path,
-            result_path=result_path,
-        )
-        result = read_json_manifest(result_path)
-        return FieldResult(
-            session_id=str(result["session_id"]),
-            batch_id=str(result["batch_id"]),
-            frequency_hz=float(result["frequency_hz"]),
-            pressure_real_f32=self.info.work_dir / result["pressure_real_f32"],
-            pressure_imag_f32=self.info.work_dir / result["pressure_imag_f32"],
-            shape=tuple(int(v) for v in result["shape"]),
-        )
-
-    def close(self) -> None:
-        """Release owned temporary artifacts."""
-        if self._closed:
-            return
-        if self._owns_work_dir and self.info.work_dir.exists():
-            shutil.rmtree(self.info.work_dir)
-        self._closed = True
-
-    cleanup = close
-
-    def __enter__(self) -> "MetalStandardSession":
-        self._ensure_open()
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        self.close()
-
-    def _ensure_open(self) -> None:
-        if self._closed:
-            raise RuntimeError("MetalStandardSession is closed")
-
-    def _run_backend(
-        self,
-        op: str,
-        *,
-        payload_path: Path,
-        result_path: Path,
-    ) -> None:
-        status = self.info.runtime_status
-        if not status.available or status.julia_path is None:
-            raise _backend_unavailable(
-                "Julia/Metal backend is unavailable for execution: "
-                + "; ".join(status.unavailable_reasons)
-            )
-        command = [
-            status.julia_path,
-            f"--project={status.backend_dir}",
-            str(status.backend_entrypoint),
-            op,
-            str(self.info.manifest_path),
-            str(payload_path),
-            str(result_path),
-        ]
-        try:
-            result = subprocess.run(
-                command,
-                cwd=status.backend_dir,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        except OSError as exc:
-            raise _backend_unavailable(
-                f"Failed to launch packaged Julia/Metal backend: {exc}"
-            ) from exc
-
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            stdout = result.stdout.strip()
-            message = stderr or stdout or f"Julia exited with {result.returncode}"
-            raise RuntimeError(
-                f"Packaged Julia/Metal backend failed during {op}: {message}"
-            )
-        if not result_path.is_file():
-            raise RuntimeError(
-                f"Packaged Julia/Metal backend did not write {result_path}"
-            )
-
-
-JuliaMetalValidationSession = MetalStandardSession
 
 
 def _manifest_dtype_name(dtype: np.dtype) -> str:
@@ -1320,17 +956,6 @@ def _validate_batch_field_manifest(manifest: dict[str, Any]) -> None:
         case_with_obs = dict(case)
         case_with_obs["observation_points"] = manifest["observation_points"]
         _validate_field_case_manifest(case_with_obs)
-
-
-def _backend_unavailable(message: str) -> Exception:
-    from ..backends import AssemblyBackendUnavailable
-
-    return AssemblyBackendUnavailable(message)
-
-
-def _operation_id(prefix: str, frequency_hz: float) -> str:
-    freq = f"{float(frequency_hz):.6f}".replace(".", "p").replace("-", "m")
-    return f"{prefix}-{freq}-{uuid4().hex[:8]}"
 
 
 def _require_complex_vector(

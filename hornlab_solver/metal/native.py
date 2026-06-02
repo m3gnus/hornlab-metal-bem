@@ -1,4 +1,4 @@
-"""Discovery and execution for the non-Julia native Metal helper."""
+"""Discovery and execution for the native Swift/Metal helper."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -222,7 +222,7 @@ def validate_session_with_native_helper(
 
 
 class MetalNativeStandardSession:
-    """Non-Julia session wrapper for native helper contract validation."""
+    """Session wrapper for native helper contract validation."""
 
     def __init__(
         self,

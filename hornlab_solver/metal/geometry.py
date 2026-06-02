@@ -1,12 +1,11 @@
 """Geometry buffer export for the future Metal backend.
 
 This module is deliberately pure Python/NumPy. It does not import Bempp,
-Julia, or Metal; callers pass Bempp-like objects that already expose the
+Swift, or Metal; callers pass Bempp-like objects that already expose the
 metadata needed by the adapter.
 
-All index arrays at this Python boundary are **zero-based**. A Julia adapter
-may convert them to one-based arrays internally, but production Python code
-must not emit one-based triangle or DOF indices.
+All index arrays at this Python boundary are **zero-based**. Production Python
+code must not emit one-based triangle or DOF indices.
 """
 from __future__ import annotations
 
@@ -37,9 +36,7 @@ class MetalGeometryBuffers:
     - ``triangle_normals_3xm_f32`` has shape ``(3, n_triangles)`` and dtype
       ``float32``.
 
-    Triangle and P1 DOF indices are zero-based at the Python boundary. Future
-    Julia/Metal adapters should convert to one-based indexing internally if
-    they need Julia-native arrays.
+    Triangle and P1 DOF indices are zero-based at the Python boundary.
     """
 
     vertices_3xn_f32: NDArray[np.float32]
