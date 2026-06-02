@@ -59,7 +59,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e ".[dev]"
 swift build -c release --package-path hornlab_solver/metal/native_helper
-python -m pytest tests/test_config.py tests/test_metal_runtime.py tests/test_metal_native.py -q
+python -m pytest tests/test_config.py tests/test_metal_session.py tests/test_metal_native.py -q
 ```
 
 ## Integration Target
@@ -68,11 +68,3 @@ Downstream adapters should translate their application-level simulation config
 into `SolveConfig` and call the package through a small backend/session layer.
 
 Recommended backend id: `hornlab_metal`.
-
-## Roadmap
-
-1. Keep this extraction buildable with the current `hornlab_solver` import.
-2. Add backend adapter package/modules where downstream applications need them.
-3. Replace `bempp-cl` mesh/function-space scaffolding with a pure loader.
-4. Move `bempp-cl` into validation extras only.
-5. Rename the import namespace only after adapters and tests are stable.
