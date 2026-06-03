@@ -222,6 +222,39 @@ def test_native_batch_result_count_validation():
         )
 
 
+def test_native_diagnostics_helpers_preserve_manifest_metadata():
+    batch = native._native_batch_diagnostics(
+        {
+            "implementation": "batch_impl",
+            "session_id": "session",
+            "batch_id": "batch",
+            "wall_seconds": 1.25,
+            "resident_reuse": {"geometry_buffers": True},
+            "cases": [],
+            "ignored_output_path": "outputs/field.bin",
+        }
+    )
+    case = native._native_case_diagnostics(
+        {
+            "case_id": "case-0000",
+            "assembly_implementation": "assembly_impl",
+            "solve_implementation": "solve_impl",
+            "field_implementation": "field_impl",
+            "lapack_info": 0,
+            "duffy_corrections": {"implemented": True},
+            "metal_dispatch": {"matrix": {"threads_per_threadgroup": 64}},
+            "pressure_real_f32": "outputs/pressure_re.bin",
+        },
+        batch_diagnostics=batch,
+    )
+
+    assert case["assembly_implementation"] == "assembly_impl"
+    assert case["duffy_corrections"]["implemented"] is True
+    assert case["batch"]["resident_reuse"]["geometry_buffers"] is True
+    assert "pressure_real_f32" not in case
+    assert "ignored_output_path" not in case["batch"]
+
+
 def test_native_discovery_reports_missing_helper_assets(monkeypatch, tmp_path):
     monkeypatch.setattr(native.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(native.platform, "machine", lambda: "arm64")

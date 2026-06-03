@@ -59,6 +59,7 @@ class SolveConfig:
     # Native Metal controls
     native_symmetry_plane: NativeSymmetryPlane | None = None
     metal_native_assembly_mode: MetalNativeAssemblyMode = "corrected"
+    return_surface_pressure: bool = False
     metal_native_threads_per_group: int | None = None
     metal_native_matrix_threads_per_group: int | None = None
     metal_native_rhs_threads_per_group: int | None = None

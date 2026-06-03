@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from hornlab_metal_bem.boundary_lab import BACKEND_ID, create_backend
+from hornlab_metal_bem.boundary_lab import _frequency_result_from_log_entry
 from hornlab_metal_bem.boundary_lab import solve_config_from_boundary_lab
 
 
@@ -79,3 +80,28 @@ def test_boundary_lab_backend_accepts_solve_request_contract():
     assert solve_config.observation.angle_min_deg == -90.0
     assert solve_config.observation.angle_max_deg == 90.0
     assert solve_config.observation.angle_count == 5
+
+
+def test_boundary_lab_frequency_result_preserves_streamed_complex_pressure():
+    pressure = np.asarray(
+        [
+            [1.0 + 1.0j, 2.0 - 1.0j],
+            [0.5 + 0.25j, 0.25 - 0.5j],
+        ],
+        dtype=np.complex128,
+    )
+    result = _frequency_result_from_log_entry(
+        1000.0,
+        {
+            "observation_planes": ["horizontal", "vertical"],
+            "observation_directivity_db": np.zeros((2, 2), dtype=np.float64),
+            "observation_pressure_complex": pressure,
+            "impedance": 1.0 + 0.5j,
+            "lapack_info": 0,
+            "native_diagnostics": {"assembly_implementation": "test"},
+        },
+    )
+
+    np.testing.assert_allclose(result.observation_pressure_complex, pressure)
+    assert result.native_diagnostics["assembly_implementation"] == "test"
+    assert result.diagnostics.convergence_info == 0

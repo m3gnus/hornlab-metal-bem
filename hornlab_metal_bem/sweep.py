@@ -192,6 +192,16 @@ def _system_field(
     return field_complex.reshape(n_planes, n_angles)
 
 
+def _system_surface_pressure(system) -> NDArray[np.complex128]:
+    if system.pressure_real_f32 is None or system.pressure_imag_f32 is None:
+        raise RuntimeError("native result did not include requested surface pressure")
+    return _read_complex_f32(
+        Path(system.pressure_real_f32),
+        Path(system.pressure_imag_f32),
+        tuple(system.pressure_shape),
+    ).astype(np.complex128)
+
+
 def _directivity_from_pressure(
     pressure: NDArray[np.complex128],
     on_axis_idx: int,
@@ -223,6 +233,8 @@ def _append_system_result(
     pressure_rows: list[NDArray[np.complex128]],
     spl_rows: list[NDArray[np.float64]],
     impedance_rows: list[complex],
+    surface_pressure_rows: list[NDArray[np.complex128]] | None,
+    native_diagnostics_rows: list[dict],
     solver_log: list[dict],
     completed_freqs: list[float],
 ) -> dict:
@@ -238,6 +250,7 @@ def _append_system_result(
 
     pressure = _system_field(system, n_planes, n_angles, field_batch_complex)
     directivity = _directivity_from_pressure(pressure, on_axis_idx)
+    native_diagnostics = dict(getattr(system, "diagnostics", {}) or {})
     log_entry = {
         "frequency_hz": frequency_hz,
         "iterations": None,
@@ -246,13 +259,18 @@ def _append_system_result(
         "assembly_s": float(system.assembly_s),
         "dense_solve_s": float(system.dense_solve_s),
         "field_s": float(system.field_s),
+        "lapack_info": int(system.lapack_info),
         "impedance": impedance,
+        "native_diagnostics": native_diagnostics,
     }
 
     completed_freqs.append(frequency_hz)
     pressure_rows.append(pressure)
     spl_rows.append(directivity)
     impedance_rows.append(impedance)
+    if surface_pressure_rows is not None:
+        surface_pressure_rows.append(_system_surface_pressure(system))
+    native_diagnostics_rows.append(native_diagnostics)
     solver_log.append(log_entry)
     return log_entry
 
@@ -299,6 +317,10 @@ def run_sweep_native_metal(
     pressure_rows: list[NDArray[np.complex128]] = []
     spl_rows: list[NDArray[np.float64]] = []
     impedance_rows: list[complex] = []
+    surface_pressure_rows: list[NDArray[np.complex128]] | None = (
+        [] if config.return_surface_pressure else None
+    )
+    native_diagnostics_rows: list[dict] = []
     solver_log: list[dict] = []
     completed_freqs: list[float] = []
     on_axis_idx = int(np.argmin(np.abs(angles_deg)))
@@ -336,7 +358,7 @@ def run_sweep_native_metal(
                     operation_id="assembly-solve-field-resident-batch",
                     source_tags=source_tags,
                     impedance_source_tag=impedance_source_tag,
-                    write_surface_pressure=False,
+                    write_surface_pressure=config.return_surface_pressure,
                     write_batched_field=True,
                 )
                 field_batch_complex: NDArray[np.complex128] | None = None
@@ -374,6 +396,8 @@ def run_sweep_native_metal(
                         pressure_rows=pressure_rows,
                         spl_rows=spl_rows,
                         impedance_rows=impedance_rows,
+                        surface_pressure_rows=surface_pressure_rows,
+                        native_diagnostics_rows=native_diagnostics_rows,
                         solver_log=solver_log,
                         completed_freqs=completed_freqs,
                     )
@@ -411,7 +435,7 @@ def run_sweep_native_metal(
                         ),
                         source_tags=source_tags,
                         impedance_source_tag=impedance_source_tag,
-                        write_surface_pressure=False,
+                        write_surface_pressure=config.return_surface_pressure,
                     )[0]
                     elapsed = time.time() - t_freq
                     log_entry = _append_system_result(
@@ -431,6 +455,8 @@ def run_sweep_native_metal(
                         pressure_rows=pressure_rows,
                         spl_rows=spl_rows,
                         impedance_rows=impedance_rows,
+                        surface_pressure_rows=surface_pressure_rows,
+                        native_diagnostics_rows=native_diagnostics_rows,
                         solver_log=solver_log,
                         completed_freqs=completed_freqs,
                     )
@@ -439,6 +465,7 @@ def run_sweep_native_metal(
                         config.progress_callback(i, len(frequencies), frequency_hz)
                     callback_entry = {
                         **log_entry,
+                        "observation_pressure_complex": pressure_rows[-1],
                         "observation_directivity_db": spl_rows[-1],
                         "observation_angles_deg": angles_deg,
                         "observation_planes": config.observation.planes,
@@ -472,4 +499,10 @@ def run_sweep_native_metal(
         timings=timings,
         solver_log=solver_log,
         surface_pressure_avg=sp_avg if sp_avg else None,
+        surface_pressure_complex=(
+            np.stack(surface_pressure_rows, axis=0)
+            if surface_pressure_rows is not None
+            else None
+        ),
+        native_diagnostics=native_diagnostics_rows,
     )

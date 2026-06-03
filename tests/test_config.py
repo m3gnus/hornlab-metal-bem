@@ -47,6 +47,7 @@ def test_solve_config_default_native_metal_controls():
     cfg = SolveConfig()
     assert cfg.native_symmetry_plane is None
     assert cfg.metal_native_assembly_mode == "corrected"
+    assert cfg.return_surface_pressure is False
     assert cfg.metal_native_threads_per_group is None
     assert cfg.metal_native_matrix_threads_per_group is None
     assert cfg.metal_native_rhs_threads_per_group is None
@@ -87,6 +88,10 @@ def test_solve_config_accepts_metal_native_assembly_modes():
         .metal_native_assembly_mode
         == "optimized"
     )
+
+
+def test_solve_config_accepts_surface_pressure_output_flag():
+    assert SolveConfig(return_surface_pressure=True).return_surface_pressure is True
 
 
 def test_solve_config_accepts_native_threadgroup_override():

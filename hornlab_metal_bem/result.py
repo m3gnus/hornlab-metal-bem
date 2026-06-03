@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -47,6 +48,13 @@ class SolveResult:
     # Area-weighted average surface pressure per velocity-source tag.
     # tag -> (F,) complex array. Populated when velocity_sources has tags.
     surface_pressure_avg: dict[int, NDArray[np.complex128]] | None = None
+
+    # Optional solved P1 surface pressure, shape (F, n_p1_dofs), populated
+    # when SolveConfig.return_surface_pressure is true.
+    surface_pressure_complex: NDArray[np.complex128] | None = None
+
+    # Native helper per-frequency diagnostics and resident batch metadata.
+    native_diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def spl_norm_db(self) -> NDArray[np.float64]:

@@ -97,4 +97,6 @@ def test_solve_result_directivity_is_primary_normalized_output_name():
 
     assert result.directivity_db is directivity
     assert result.spl_norm_db is directivity
+    assert result.surface_pressure_complex is None
+    assert result.native_diagnostics == []
     assert not hasattr(result, "spl_db")

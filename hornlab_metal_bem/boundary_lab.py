@@ -40,6 +40,8 @@ except Exception:  # pragma: no cover - exercised only outside Boundary Lab.
         horizontal_spl_db: np.ndarray | None = None
         vertical_spl_db: np.ndarray | None = None
         sphere_spl_norm_db: np.ndarray | None = None
+        observation_pressure_complex: np.ndarray | None = None
+        native_diagnostics: dict[str, Any] = field(default_factory=dict)
         timings: FrequencySolveTimings = field(default_factory=FrequencySolveTimings)
         diagnostics: SolverDiagnostics | None = None
 
@@ -524,27 +526,49 @@ def _frequency_result_from_log_entry(frequency_hz: float, entry: dict[str, Any])
     directivity = np.asarray(entry["observation_directivity_db"], dtype=np.float32)
     horizontal = _plane_spl(directivity, planes, "horizontal")
     vertical = _plane_spl(directivity, planes, "vertical")
+    pressure = entry.get("observation_pressure_complex")
+    pressure_complex = (
+        np.asarray(pressure, dtype=np.complex64) if pressure is not None else None
+    )
     impedance = _impedance_array(entry.get("impedance"))
+    native_diagnostics = dict(entry.get("native_diagnostics") or {})
     timings = FrequencySolveTimings(
         assembly_s=float(entry.get("assembly_s", 0.0) or 0.0),
         solve_s=float(entry.get("dense_solve_s", entry.get("solve_s", 0.0)) or 0.0),
         field_s=float(entry.get("field_s", 0.0) or 0.0),
     )
     diagnostics = SolverDiagnostics(
-        convergence_info=None,
+        convergence_info=entry.get("lapack_info"),
         message=str(entry.get("backend", "native_metal")),
     )
-    return FrequencyResult(
-        freq_hz=float(frequency_hz),
-        horizontal_spl_norm_db=horizontal,
-        vertical_spl_norm_db=vertical,
-        impedance=impedance,
-        horizontal_spl_db=None,
-        vertical_spl_db=None,
-        sphere_spl_norm_db=None,
-        timings=timings,
-        diagnostics=diagnostics,
-    )
+    kwargs = {
+        "freq_hz": float(frequency_hz),
+        "horizontal_spl_norm_db": horizontal,
+        "vertical_spl_norm_db": vertical,
+        "impedance": impedance,
+        "horizontal_spl_db": None,
+        "vertical_spl_db": None,
+        "sphere_spl_norm_db": None,
+        "observation_pressure_complex": pressure_complex,
+        "native_diagnostics": native_diagnostics,
+        "timings": timings,
+        "diagnostics": diagnostics,
+    }
+    try:
+        return FrequencyResult(**kwargs)
+    except TypeError:
+        observation_pressure_complex = kwargs.pop("observation_pressure_complex")
+        native_diagnostics = kwargs.pop("native_diagnostics")
+        result = FrequencyResult(**kwargs)
+        for name, value in (
+            ("observation_pressure_complex", observation_pressure_complex),
+            ("native_diagnostics", native_diagnostics),
+        ):
+            try:
+                object.__setattr__(result, name, value)
+            except Exception:
+                pass
+        return result
 
 
 def _plane_spl(spl: np.ndarray, planes: list[str], plane: str) -> np.ndarray:

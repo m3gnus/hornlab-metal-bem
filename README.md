@@ -80,8 +80,10 @@ Common fields:
 - `mesh_scale`
 - `air_density`
 - `native_symmetry_plane`, one of `None`, `"yz"`, `"xz"`, or `"yz+xz"`
+- `return_surface_pressure`, opt-in full solved P1 surface pressure output
 - `progress_callback`
-- `on_frequency_result`, for streaming/early stop
+- `on_frequency_result`, for streaming/early stop; entries include complex
+  observation pressure
 
 The native Metal package supports standard Neumann solves. It does not expose
 legacy OpenCL/Bempp fallback configuration, Burton-Miller, complex-k, or
@@ -130,6 +132,10 @@ Key result fields:
 - `observation_points`: `(P, N, 3)` observation coordinates in metres
 - `observation_planes`: plane names matching axis `P`
 - `surface_pressure_avg`: source-tag keyed average surface pressure arrays
+- `surface_pressure_complex`: optional `(F, n_p1_dofs)` solved surface pressure
+  when `return_surface_pressure=True`
+- `native_diagnostics`: per-frequency native implementation, LAPACK, Duffy,
+  Metal dispatch, symmetry, and resident batch metadata
 - `timings` and `solver_log`: backend timing and diagnostic metadata
 
 `directivity_db` is not absolute SPL. Use `pressure_complex` for absolute

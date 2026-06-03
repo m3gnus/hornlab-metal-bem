@@ -61,15 +61,17 @@ config=None)` share the same execution flow:
 7. The production path uses
    `assemble_solve_evaluate_standard_neumann_batch()` for resident assembly,
    Accelerate dense solve, exterior field evaluation, impedance, and source
-   surface-pressure reductions.
+   surface-pressure reductions. When `return_surface_pressure=True`, it also
+   requests solved P1 surface-pressure output from the helper.
 8. Python reads little-endian float32 real/imag result arrays, reshapes them to
    observation planes and angles, computes normalized directivity, accumulates
-   timing/log metadata, and returns `SolveResult`.
+   timing/log metadata and native diagnostics, and returns `SolveResult`.
 
 When `on_frequency_result` is unset, `sweep.py` sends the full frequency batch
 and may request a single batched field output. When `on_frequency_result` is
 set, it runs one-frequency native batches so streaming callbacks and early stop
-can be honored.
+can be honored. Streaming callback entries include normalized directivity and
+complex observation pressure for the solved frequency.
 
 ## Boundary Lab Adapter
 
@@ -94,8 +96,9 @@ independently. It translates:
 
 `BoundaryLabSession.solve()` delegates to `solve()` or `solve_frequencies()`.
 `solve_stream()` launches a worker thread, uses `on_frequency_result` to publish
-per-frequency `FrequencyResult` objects, and stops when cancellation is
-requested.
+per-frequency `FrequencyResult` objects, attaches complex observation pressure
+and native diagnostics when the Boundary Lab result type permits extension, and
+stops when cancellation is requested.
 
 ## Native Helper Split
 

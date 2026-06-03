@@ -855,6 +855,7 @@ class MetalNativeStandardSession:
             expected_count=int(frequencies.size),
             op="assemble_solve_evaluate_standard_neumann_batch",
         )
+        batch_diagnostics = _native_batch_diagnostics(result)
         solved_fields = []
         for case_result in case_results:
             pressure_real = case_result.get("pressure_real_f32")
@@ -897,6 +898,10 @@ class MetalNativeStandardSession:
                     impedance=_complex_from_manifest(case_result.get("impedance")),
                     surface_pressure_avg=_complex_map_from_manifest(
                         case_result.get("surface_pressure_avg")
+                    ),
+                    diagnostics=_native_case_diagnostics(
+                        case_result,
+                        batch_diagnostics=batch_diagnostics,
                     ),
                 )
             )
@@ -1374,6 +1379,56 @@ def _case_results_from_manifest(
             f"expected {expected_count}"
         )
     return cases
+
+
+def _native_batch_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "implementation",
+        "session_id",
+        "batch_id",
+        "symmetry_plane",
+        "case_count",
+        "assembly_seconds",
+        "regular_assembly_seconds",
+        "dense_solve_seconds",
+        "field_seconds",
+        "resident_context_seconds",
+        "resident_duffy_reduction_plan_seconds",
+        "wall_seconds",
+        "resident_reuse",
+    )
+    return {key: result[key] for key in keys if key in result}
+
+
+def _native_case_diagnostics(
+    case_result: dict[str, Any],
+    *,
+    batch_diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    keys = (
+        "case_id",
+        "implementation",
+        "assembly_implementation",
+        "solve_implementation",
+        "field_implementation",
+        "assembly_mode",
+        "field_mode",
+        "regular_assembly_seconds",
+        "lapack_info",
+        "symmetry_plane",
+        "pressure_shape",
+        "field_shape",
+        "field_row_index",
+        "field_batch_shape",
+        "field_output_layout",
+        "duffy_corrections",
+        "metal_dispatch",
+        "field_metal_dispatch",
+    )
+    diagnostics = {key: case_result[key] for key in keys if key in case_result}
+    if batch_diagnostics:
+        diagnostics["batch"] = dict(batch_diagnostics)
+    return diagnostics
 
 
 def _complex_from_manifest(value: Any) -> complex | None:

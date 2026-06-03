@@ -5,7 +5,7 @@ little-endian binary buffers consumed by the Swift/Metal native helper.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -328,6 +328,7 @@ class DenseSolveFieldResult:
     field_batch_shape: tuple[int, int] | None = None
     impedance: complex | None = None
     surface_pressure_avg: dict[int, complex] | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
     schema: str = METAL_STANDARD_SCHEMA
 
 
