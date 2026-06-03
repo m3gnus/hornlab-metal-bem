@@ -196,6 +196,32 @@ def _read_complex_assembly(assembly):
     return matrix, rhs
 
 
+def test_native_batch_result_count_validation():
+    cases = [{"case_id": "case-0000"}]
+    assert (
+        native._case_results_from_manifest(
+            {"cases": cases},
+            expected_count=1,
+            op="test_batch",
+        )
+        is cases
+    )
+
+    with pytest.raises(RuntimeError, match="result missing cases"):
+        native._case_results_from_manifest(
+            {},
+            expected_count=1,
+            op="test_batch",
+        )
+
+    with pytest.raises(RuntimeError, match="returned 0 case"):
+        native._case_results_from_manifest(
+            {"cases": []},
+            expected_count=1,
+            op="test_batch",
+        )
+
+
 def test_native_discovery_reports_missing_helper_assets(monkeypatch, tmp_path):
     monkeypatch.setattr(native.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(native.platform, "machine", lambda: "arm64")

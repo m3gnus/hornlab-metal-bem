@@ -535,8 +535,13 @@ class MetalNativeStandardSession:
             result_path=result_path,
         )
         result = read_json_manifest(result_path)
+        case_results = _case_results_from_manifest(
+            result,
+            expected_count=int(frequencies.size),
+            op="assemble_standard_neumann_batch",
+        )
         systems = []
-        for case_result in result["cases"]:
+        for case_result in case_results:
             systems.append(
                 DenseAssemblyResult(
                     session_id=str(case_result["session_id"]),
@@ -653,8 +658,13 @@ class MetalNativeStandardSession:
             result_path=result_path,
         )
         result = read_json_manifest(result_path)
+        case_results = _case_results_from_manifest(
+            result,
+            expected_count=int(frequencies.size),
+            op="assemble_solve_standard_neumann_batch",
+        )
         solved = []
-        for case_result in result["cases"]:
+        for case_result in case_results:
             solved.append(
                 DenseSolveResult(
                     session_id=str(case_result["session_id"]),
@@ -840,8 +850,13 @@ class MetalNativeStandardSession:
             result_path=result_path,
         )
         result = read_json_manifest(result_path)
+        case_results = _case_results_from_manifest(
+            result,
+            expected_count=int(frequencies.size),
+            op="assemble_solve_evaluate_standard_neumann_batch",
+        )
         solved_fields = []
-        for case_result in result["cases"]:
+        for case_result in case_results:
             pressure_real = case_result.get("pressure_real_f32")
             pressure_imag = case_result.get("pressure_imag_f32")
             solved_fields.append(
@@ -1126,8 +1141,13 @@ class MetalNativeStandardSession:
             result_path=result_path,
         )
         result = read_json_manifest(result_path)
+        case_results = _case_results_from_manifest(
+            result,
+            expected_count=int(frequencies.size),
+            op="evaluate_standard_exterior_batch",
+        )
         fields = []
-        for case_result in result["cases"]:
+        for case_result in case_results:
             fields.append(
                 FieldResult(
                     session_id=str(case_result["session_id"]),
@@ -1337,6 +1357,23 @@ def _write_complex_vector(
             relative_to=relative_to,
         ),
     }
+
+
+def _case_results_from_manifest(
+    result: dict[str, Any],
+    *,
+    expected_count: int,
+    op: str,
+) -> list[Any]:
+    cases = result.get("cases")
+    if not isinstance(cases, list):
+        raise RuntimeError(f"Swift/Metal native helper {op} result missing cases")
+    if len(cases) != expected_count:
+        raise RuntimeError(
+            f"Swift/Metal native helper {op} returned {len(cases)} case(s), "
+            f"expected {expected_count}"
+        )
+    return cases
 
 
 def _complex_from_manifest(value: Any) -> complex | None:

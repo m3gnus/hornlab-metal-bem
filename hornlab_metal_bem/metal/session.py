@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from .geometry import MetalGeometryBuffers, build_metal_geometry_buffers
+from .geometry import MetalGeometryBuffers
 
 
 METAL_STANDARD_SCHEMA = "hornlab.metal.standard.v1"

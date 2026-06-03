@@ -43,7 +43,6 @@ def _compute_impedance(
     source_tag: int = 2,
 ) -> complex:
     """Throat impedance: ``Z = integral(p dA) / Q_eff``."""
-    elements = np.asarray(grid.elements.T, dtype=np.int32)
     source_mask = physical_tags == source_tag
     source_elems = np.where(source_mask)[0]
 
