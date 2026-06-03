@@ -73,6 +73,7 @@ class SolveConfig:
     velocity_sources: dict[int, float] = field(
         default_factory=lambda: {2: 1.0}
     )
+    velocity_source_callback: Callable[[float], dict[int, complex]] | None = None
     velocity_profile: Literal["piston", "dome", "ring"] = "piston"
 
     # Robin / impedance boundary condition (wall damping).

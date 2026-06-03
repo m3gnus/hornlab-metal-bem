@@ -18,7 +18,13 @@ def _build_driver_neumann_coeffs(
     coeffs = np.zeros(dp0_space.global_dof_count, dtype=dtype)
     air_density = config.air_density
     impedance_tag_set = set(config.impedance_sources.keys())
-    for tag, weight in config.velocity_sources.items():
+    frequency_hz = float(omega) / (2.0 * np.pi) if omega > 0 else 0.0
+    velocity_sources = (
+        config.velocity_source_callback(frequency_hz)
+        if config.velocity_source_callback is not None
+        else config.velocity_sources
+    )
+    for tag, weight in velocity_sources.items():
         if tag in impedance_tag_set:
             continue
         mask = physical_tags == tag

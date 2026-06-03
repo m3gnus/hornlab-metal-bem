@@ -27,3 +27,6 @@ hornlab_solver = [
     "metal/native_helper/Package.swift",
     "metal/native_helper/Sources/HornlabSolverMetalNative/main.swift",
 ]
+
+[tool.setuptools.packages.find]
+include = ["hornlab_solver*", "hornlab_metal_bem*"]
