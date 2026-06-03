@@ -8,5 +8,5 @@ __pycache__/
 build/
 dist/
 *.egg-info/
-hornlab_solver/metal/native_helper/.build/
+hornlab_metal_bem/metal/native_helper/.build/
 runs/
