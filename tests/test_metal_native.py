@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from hornlab_solver.metal import (
+from hornlab_metal_bem.metal import (
     MetalBemBackend,
     MetalBemContext,
     MetalNativeRuntimeConfig,
@@ -15,17 +15,17 @@ from hornlab_solver.metal import (
     discover_native_runtime,
     validate_session_with_native_helper,
 )
-from hornlab_solver.metal.backend import DenseBieSystem
-from hornlab_solver.metal import backend as metal_backend
-from hornlab_solver.metal import native
-from hornlab_solver.metal.geometry import build_metal_geometry_buffers
-from hornlab_solver.metal.geometry import MetalGeometryError
-from hornlab_solver.metal.geometry import validate_native_symmetry_plane
-from hornlab_solver.validation.native_symmetry import orbit_reduce_matrix_rhs
+from hornlab_metal_bem.metal.backend import DenseBieSystem
+from hornlab_metal_bem.metal import backend as metal_backend
+from hornlab_metal_bem.metal import native
+from hornlab_metal_bem.metal.geometry import build_metal_geometry_buffers
+from hornlab_metal_bem.metal.geometry import MetalGeometryError
+from hornlab_metal_bem.metal.geometry import validate_native_symmetry_plane
+from hornlab_metal_bem.validation.native_symmetry import orbit_reduce_matrix_rhs
 
 
 def _write_native_entrypoint(root: Path) -> Path:
-    helper = root / "HornlabSolverMetalNative.swift"
+    helper = root / "HornlabMetalBemNative.swift"
     helper.write_text("// test helper\n", encoding="utf-8")
     return helper
 
@@ -34,7 +34,7 @@ def _write_native_package_binary(root: Path) -> Path:
     package_dir = root / "native_helper"
     (package_dir / ".build" / "release").mkdir(parents=True)
     (package_dir / "Package.swift").write_text("// test package\n", encoding="utf-8")
-    binary = package_dir / ".build" / "release" / "HornlabSolverMetalNative"
+    binary = package_dir / ".build" / "release" / "HornlabMetalBemNative"
     binary.write_text("#!/bin/sh\n", encoding="utf-8")
     return binary
 
@@ -199,7 +199,7 @@ def _read_complex_assembly(assembly):
 def test_native_discovery_reports_missing_helper_assets(monkeypatch, tmp_path):
     monkeypatch.setattr(native.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(native.platform, "machine", lambda: "arm64")
-    monkeypatch.setenv("HORNLAB_SOLVER_SWIFT", "/usr/bin/swift")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_SWIFT", "/usr/bin/swift")
 
     status = discover_native_runtime(MetalNativeRuntimeConfig(backend_dir=tmp_path))
 
@@ -207,8 +207,8 @@ def test_native_discovery_reports_missing_helper_assets(monkeypatch, tmp_path):
     assert status.is_macos is True
     assert status.is_apple_silicon is True
     assert status.swift_path == "/usr/bin/swift"
-    assert status.swift_source == "HORNLAB_SOLVER_SWIFT"
-    assert status.native_entrypoint == tmp_path / "HornlabSolverMetalNative.swift"
+    assert status.swift_source == "HORNLAB_METAL_BEM_SWIFT"
+    assert status.native_entrypoint == tmp_path / "HornlabMetalBemNative.swift"
     assert status.helper_assets_present is False
     assert status.smoke_test_ran is False
     assert any("Swift/Metal helper" in r for r in status.reasons)
@@ -218,7 +218,7 @@ def test_native_discovery_finds_swift_on_path(monkeypatch, tmp_path):
     _write_native_entrypoint(tmp_path)
     monkeypatch.setattr(native.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(native.platform, "machine", lambda: "arm64")
-    monkeypatch.delenv("HORNLAB_SOLVER_SWIFT", raising=False)
+    monkeypatch.delenv("HORNLAB_METAL_BEM_SWIFT", raising=False)
     monkeypatch.setattr(native.shutil, "which", lambda name: "/usr/bin/swift")
 
     status = discover_native_runtime(MetalNativeRuntimeConfig(backend_dir=tmp_path))
@@ -237,7 +237,7 @@ def test_native_discovery_prefers_compiled_package_helper_without_swift(
     binary = _write_native_package_binary(tmp_path)
     monkeypatch.setattr(native.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(native.platform, "machine", lambda: "arm64")
-    monkeypatch.delenv("HORNLAB_SOLVER_SWIFT", raising=False)
+    monkeypatch.delenv("HORNLAB_METAL_BEM_SWIFT", raising=False)
     monkeypatch.setattr(native.shutil, "which", lambda name: None)
 
     calls = []
@@ -369,7 +369,7 @@ def test_validate_session_with_compiled_helper_does_not_require_swift(
 
     monkeypatch.setattr(native.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(native.platform, "machine", lambda: "arm64")
-    monkeypatch.delenv("HORNLAB_SOLVER_SWIFT", raising=False)
+    monkeypatch.delenv("HORNLAB_METAL_BEM_SWIFT", raising=False)
     monkeypatch.setattr(native.shutil, "which", lambda name: None)
 
     calls = []
@@ -733,11 +733,11 @@ def test_native_executable_session_contract_and_tiny_assembly(monkeypatch, tmp_p
             + "; ".join(status.unavailable_reasons)
         )
     for env_name in (
-        "HORNLAB_SOLVER_METAL_NATIVE_THREADS_PER_GROUP",
-        "HORNLAB_SOLVER_METAL_NATIVE_MATRIX_THREADS_PER_GROUP",
-        "HORNLAB_SOLVER_METAL_NATIVE_RHS_THREADS_PER_GROUP",
-        "HORNLAB_SOLVER_METAL_NATIVE_DUFFY_THREADS_PER_GROUP",
-        "HORNLAB_SOLVER_METAL_NATIVE_FIELD_THREADS_PER_GROUP",
+        "HORNLAB_METAL_BEM_NATIVE_THREADS_PER_GROUP",
+        "HORNLAB_METAL_BEM_NATIVE_MATRIX_THREADS_PER_GROUP",
+        "HORNLAB_METAL_BEM_NATIVE_RHS_THREADS_PER_GROUP",
+        "HORNLAB_METAL_BEM_NATIVE_DUFFY_THREADS_PER_GROUP",
+        "HORNLAB_METAL_BEM_NATIVE_FIELD_THREADS_PER_GROUP",
     ):
         monkeypatch.delenv(env_name, raising=False)
 
@@ -820,8 +820,8 @@ def test_native_executable_optimized_matches_reference_on_tiny_mesh(
             + "; ".join(status.unavailable_reasons)
         )
 
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_ASSEMBLY_MODE", "parity")
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_THREADS_PER_GROUP", "32")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "parity")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_THREADS_PER_GROUP", "32")
     with MetalNativeStandardSession.create_session(
         geometry_buffers=_tiny_geometry_buffers(),
         work_dir=tmp_path / "native-parity-session",
@@ -874,9 +874,9 @@ def test_native_executable_block_staged_matches_reference_on_tiny_mesh(
             + "; ".join(status.unavailable_reasons)
         )
 
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_ASSEMBLY_MODE", "parity")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "parity")
     monkeypatch.setenv(
-        "HORNLAB_SOLVER_METAL_NATIVE_REGULAR_ASSEMBLY_IMPL",
+        "HORNLAB_METAL_BEM_NATIVE_REGULAR_ASSEMBLY_IMPL",
         "block_staged",
     )
     with MetalNativeStandardSession.create_session(
@@ -920,12 +920,12 @@ def test_native_executable_corrected_mode_applies_duffy_on_tiny_mesh(
             + "; ".join(status.unavailable_reasons)
         )
 
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_ASSEMBLY_MODE", "corrected")
-    monkeypatch.delenv("HORNLAB_SOLVER_METAL_NATIVE_DUFFY_MODE", raising=False)
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_THREADS_PER_GROUP", "256")
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_MATRIX_THREADS_PER_GROUP", "32")
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_RHS_THREADS_PER_GROUP", "64")
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_DUFFY_THREADS_PER_GROUP", "128")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", raising=False)
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_THREADS_PER_GROUP", "256")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_MATRIX_THREADS_PER_GROUP", "32")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_RHS_THREADS_PER_GROUP", "64")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_THREADS_PER_GROUP", "128")
     with MetalNativeStandardSession.create_session(
         geometry_buffers=_tiny_geometry_buffers(),
         work_dir=tmp_path / "native-corrected-session",
@@ -967,15 +967,15 @@ def test_native_executable_corrected_mode_applies_duffy_on_tiny_mesh(
     assert result["duffy_corrections"]["reduction_seconds"] >= 0.0
     assert result["duffy_corrections"]["metal_dispatch"]["kernel"] == "duffy_delta_blocks"
     assert result["metal_dispatch"]["matrix"]["env"] == (
-        "HORNLAB_SOLVER_METAL_NATIVE_MATRIX_THREADS_PER_GROUP"
+        "HORNLAB_METAL_BEM_NATIVE_MATRIX_THREADS_PER_GROUP"
     )
     assert result["metal_dispatch"]["matrix"]["requested_threads_per_threadgroup"] == 32
     assert result["metal_dispatch"]["rhs"]["env"] == (
-        "HORNLAB_SOLVER_METAL_NATIVE_RHS_THREADS_PER_GROUP"
+        "HORNLAB_METAL_BEM_NATIVE_RHS_THREADS_PER_GROUP"
     )
     assert result["metal_dispatch"]["rhs"]["requested_threads_per_threadgroup"] == 64
     assert result["duffy_corrections"]["metal_dispatch"]["env"] == (
-        "HORNLAB_SOLVER_METAL_NATIVE_DUFFY_THREADS_PER_GROUP"
+        "HORNLAB_METAL_BEM_NATIVE_DUFFY_THREADS_PER_GROUP"
     )
     assert (
         result["duffy_corrections"]["metal_dispatch"][
@@ -1009,8 +1009,8 @@ def test_native_executable_yz_symmetry_matches_even_full_domain_solve(
             + "; ".join(status.unavailable_reasons)
         )
 
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_ASSEMBLY_MODE", "optimized")
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_FIELD_MODE", "optimized")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "optimized")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
     frequency_hz = 100.0
     k_real = 1.8318326
 
@@ -1137,8 +1137,8 @@ def test_native_executable_yz_xz_symmetry_matches_even_full_domain_solve(
             + "; ".join(status.unavailable_reasons)
         )
 
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_ASSEMBLY_MODE", "optimized")
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_FIELD_MODE", "optimized")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "optimized")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
     frequency_hz = 100.0
     k_real = 1.8318326
 
@@ -1304,8 +1304,8 @@ def test_native_executable_corrected_yz_xz_symmetry_applies_image_duffy(
             + "; ".join(status.unavailable_reasons)
         )
 
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_ASSEMBLY_MODE", "corrected")
-    monkeypatch.delenv("HORNLAB_SOLVER_METAL_NATIVE_DUFFY_MODE", raising=False)
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", raising=False)
     frequency_hz = 100.0
     k_real = 1.8318326
 
@@ -1379,8 +1379,8 @@ def test_native_executable_gpu_duffy_matches_cpu_duffy_on_tiny_mesh(
         )
 
     def run_case(name: str, duffy_mode: str):
-        monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_ASSEMBLY_MODE", "corrected")
-        monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_DUFFY_MODE", duffy_mode)
+        monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+        monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", duffy_mode)
         with MetalNativeStandardSession.create_session(
             geometry_buffers=_tiny_geometry_buffers(),
             work_dir=tmp_path / f"native-{name}-duffy-session",
@@ -1421,8 +1421,8 @@ def test_native_executable_resident_batch_matches_single_assembly(
             + "; ".join(status.unavailable_reasons)
         )
 
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_ASSEMBLY_MODE", "corrected")
-    monkeypatch.delenv("HORNLAB_SOLVER_METAL_NATIVE_DUFFY_MODE", raising=False)
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", raising=False)
     neumann = np.array([1.0 + 0.0j, 0.0 + 0.5j], dtype=np.complex64)
     with MetalNativeStandardSession.create_session(
         geometry_buffers=_tiny_geometry_buffers(),
@@ -1487,8 +1487,8 @@ def test_native_executable_resident_assembly_solve_matches_python_solve(
             + "; ".join(status.unavailable_reasons)
         )
 
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_ASSEMBLY_MODE", "corrected")
-    monkeypatch.delenv("HORNLAB_SOLVER_METAL_NATIVE_DUFFY_MODE", raising=False)
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", raising=False)
     neumann = np.array([[1.0 + 0.0j, 0.0 + 0.5j]], dtype=np.complex64)
     frequency_hz = np.array([100.0], dtype=np.float64)
     k_real = np.array([1.8318326], dtype=np.float32)
@@ -1555,12 +1555,12 @@ def test_native_executable_resident_assembly_solve_lu_factor_variant_matches_pyt
             + "; ".join(status.unavailable_reasons)
         )
 
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
     monkeypatch.setenv(
-        "HORNLAB_SOLVER_METAL_NATIVE_DENSE_SOLVE_IMPL",
+        "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_IMPL",
         "cgetrf_cgetrs",
     )
-    monkeypatch.delenv("HORNLAB_SOLVER_METAL_NATIVE_DUFFY_MODE", raising=False)
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", raising=False)
     neumann = np.array([[1.0 + 0.0j, 0.0 + 0.5j]], dtype=np.complex64)
     frequency_hz = np.array([100.0], dtype=np.float64)
     k_real = np.array([1.8318326], dtype=np.float32)
@@ -1624,9 +1624,9 @@ def test_native_executable_resident_assembly_solve_field_matches_split_path(
             + "; ".join(status.unavailable_reasons)
         )
 
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_ASSEMBLY_MODE", "corrected")
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_FIELD_MODE", "optimized")
-    monkeypatch.delenv("HORNLAB_SOLVER_METAL_NATIVE_DUFFY_MODE", raising=False)
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", raising=False)
     neumann = np.array([[1.0 + 0.0j, 0.0 + 0.5j]], dtype=np.complex64)
     frequency_hz = np.array([100.0], dtype=np.float64)
     k_real = np.array([1.8318326], dtype=np.float32)
@@ -1807,9 +1807,9 @@ def test_native_executable_optimized_field_matches_reference_on_tiny_mesh(
             + "; ".join(status.unavailable_reasons)
         )
 
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_FIELD_MODE", "parity")
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_THREADS_PER_GROUP", "32")
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_FIELD_THREADS_PER_GROUP", "64")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "parity")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_THREADS_PER_GROUP", "32")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_THREADS_PER_GROUP", "64")
     with MetalNativeStandardSession.create_session(
         geometry_buffers=_tiny_geometry_buffers(),
         work_dir=tmp_path / "native-field-parity-session",
@@ -1846,7 +1846,7 @@ def test_native_executable_optimized_field_matches_reference_on_tiny_mesh(
     assert result["reference_parity"]["field_relative_l2"] < 1.0e-4
     assert result["reference_parity"]["tolerance"] == 1.0e-4
     assert result["metal_dispatch"]["field"]["env"] == (
-        "HORNLAB_SOLVER_METAL_NATIVE_FIELD_THREADS_PER_GROUP"
+        "HORNLAB_METAL_BEM_NATIVE_FIELD_THREADS_PER_GROUP"
     )
     assert result["metal_dispatch"]["field"]["requested_threads_per_threadgroup"] == 64
     assert result["metal_dispatch"]["field"]["threads_per_threadgroup"] == 64
@@ -1866,7 +1866,7 @@ def test_native_executable_resident_batch_matches_single_field(
             + "; ".join(status.unavailable_reasons)
         )
 
-    monkeypatch.setenv("HORNLAB_SOLVER_METAL_NATIVE_FIELD_MODE", "optimized")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
     pressure = np.array(
         [1.0 + 0.0j, 0.5 + 0.1j, 0.25 + 0.0j, 0.1 - 0.2j],
         dtype=np.complex64,

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from hornlab_solver.metal.geometry import (
+from hornlab_metal_bem.metal.geometry import (
     MetalGeometryError,
     build_metal_geometry_buffers,
 )

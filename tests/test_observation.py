@@ -1,4 +1,4 @@
-"""Unit tests for hornlab_solver.observation — no bempp needed.
+"""Unit tests for hornlab_metal_bem.observation — no bempp needed.
 
 Tests custom_points validation, infer_frame geometry heuristics,
 and observation point construction.
@@ -10,8 +10,8 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from hornlab_solver.config import ObservationConfig
-from hornlab_solver.observation import (
+from hornlab_metal_bem.config import ObservationConfig
+from hornlab_metal_bem.observation import (
     ObservationFrame,
     build_observation_points,
     infer_frame,

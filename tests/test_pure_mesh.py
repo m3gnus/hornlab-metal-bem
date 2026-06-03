@@ -4,9 +4,9 @@ from types import SimpleNamespace
 
 import numpy as np
 
-import hornlab_solver
-from hornlab_solver import sweep
-from hornlab_solver.mesh import make_pure_function_spaces, make_pure_grid
+import hornlab_metal_bem
+from hornlab_metal_bem import sweep
+from hornlab_metal_bem.mesh import make_pure_function_spaces, make_pure_grid
 
 
 def test_pure_grid_exposes_metal_shaped_geometry():
@@ -57,15 +57,15 @@ def test_solve_loads_pure_grid_before_native_dispatch(monkeypatch):
         calls["scale"] = scale
         return loaded
 
-    monkeypatch.setattr(hornlab_solver, "load_mesh", fake_load_mesh)
-    monkeypatch.setattr(hornlab_solver, "_resolve_frame", lambda mesh, config: object())
+    monkeypatch.setattr(hornlab_metal_bem, "load_mesh", fake_load_mesh)
+    monkeypatch.setattr(hornlab_metal_bem, "_resolve_frame", lambda mesh, config: object())
     monkeypatch.setattr(
         sweep,
         "run_sweep_native_metal",
         lambda mesh, frequencies, frame, config: sentinel,
     )
 
-    result = hornlab_solver.solve("waveguide.msh")
+    result = hornlab_metal_bem.solve("waveguide.msh")
 
     assert result is sentinel
     assert calls == {

@@ -1660,7 +1660,7 @@ func applyDuffyCorrections(
     residentContext: ResidentMetalContext? = nil
 ) throws -> (AssemblyArrays, DuffyCorrectionStats) {
     let mode = ProcessInfo.processInfo.environment[
-        "HORNLAB_SOLVER_METAL_NATIVE_DUFFY_MODE"
+        "HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE"
     ] ?? "gpu_blocks"
     if mode == "cpu" {
         return try applyDuffyCorrectionsCPU(to: arrays, geom: geom, neumann: neumann, k: k)
@@ -2739,13 +2739,13 @@ func computeDuffyDeltaBlocksMetal(
     )
 }
 
-let metalThreadsPerGroupEnv = "HORNLAB_SOLVER_METAL_NATIVE_THREADS_PER_GROUP"
-let metalMatrixThreadsPerGroupEnv = "HORNLAB_SOLVER_METAL_NATIVE_MATRIX_THREADS_PER_GROUP"
-let metalRhsThreadsPerGroupEnv = "HORNLAB_SOLVER_METAL_NATIVE_RHS_THREADS_PER_GROUP"
-let metalDuffyThreadsPerGroupEnv = "HORNLAB_SOLVER_METAL_NATIVE_DUFFY_THREADS_PER_GROUP"
-let metalFieldThreadsPerGroupEnv = "HORNLAB_SOLVER_METAL_NATIVE_FIELD_THREADS_PER_GROUP"
-let metalRegularAssemblyImplementationEnv = "HORNLAB_SOLVER_METAL_NATIVE_REGULAR_ASSEMBLY_IMPL"
-let metalDenseSolveImplementationEnv = "HORNLAB_SOLVER_METAL_NATIVE_DENSE_SOLVE_IMPL"
+let metalThreadsPerGroupEnv = "HORNLAB_METAL_BEM_NATIVE_THREADS_PER_GROUP"
+let metalMatrixThreadsPerGroupEnv = "HORNLAB_METAL_BEM_NATIVE_MATRIX_THREADS_PER_GROUP"
+let metalRhsThreadsPerGroupEnv = "HORNLAB_METAL_BEM_NATIVE_RHS_THREADS_PER_GROUP"
+let metalDuffyThreadsPerGroupEnv = "HORNLAB_METAL_BEM_NATIVE_DUFFY_THREADS_PER_GROUP"
+let metalFieldThreadsPerGroupEnv = "HORNLAB_METAL_BEM_NATIVE_FIELD_THREADS_PER_GROUP"
+let metalRegularAssemblyImplementationEnv = "HORNLAB_METAL_BEM_NATIVE_REGULAR_ASSEMBLY_IMPL"
+let metalDenseSolveImplementationEnv = "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_IMPL"
 let defaultMetalThreadsPerThreadgroup = 64
 
 func parseMetalThreadsPerGroupEnv(_ envName: String) throws -> Int? {
@@ -3946,7 +3946,7 @@ func assembleRegular(
     residentContext: ResidentMetalContext? = nil
 ) throws -> AssemblyRun {
     let mode = ProcessInfo.processInfo.environment[
-        "HORNLAB_SOLVER_METAL_NATIVE_ASSEMBLY_MODE"
+        "HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE"
     ] ?? "optimized"
     if mode == "reference" {
         let (arrays, seconds) = timedRun {
@@ -4064,7 +4064,7 @@ func evaluateExterior(
     cachedObservationCount: Int? = nil
 ) throws -> FieldRun {
     let mode = ProcessInfo.processInfo.environment[
-        "HORNLAB_SOLVER_METAL_NATIVE_FIELD_MODE"
+        "HORNLAB_METAL_BEM_NATIVE_FIELD_MODE"
     ] ?? "reference"
     if mode == "reference" {
         let (values, seconds) = timedRun {
@@ -5005,7 +5005,7 @@ func smoke() throws {
     guard let device = MTLCreateSystemDefaultDevice() else {
         try fail("Metal device unavailable")
     }
-    print("hornlab-solver native Metal helper smoke ok: \(device.name)")
+    print("hornlab-metal-bem native Metal helper smoke ok: \(device.name)")
 }
 
 func main(_ args: [String]) throws {
@@ -5016,7 +5016,7 @@ func main(_ args: [String]) throws {
     let op = args[0]
     if op == "validate_session" {
         guard args.count == 3 else {
-            try fail("usage: HornlabSolverMetalNative.swift validate_session <session.json> <result.json>")
+            try fail("usage: HornlabMetalBemNative.swift validate_session <session.json> <result.json>")
         }
         let sessionPath = args[1]
         let resultPath = args[2]
@@ -5024,7 +5024,7 @@ func main(_ args: [String]) throws {
         try writeJSON(resultPath, result)
     } else if op == "assemble_standard_neumann" {
         guard args.count == 4 else {
-            try fail("usage: HornlabSolverMetalNative.swift assemble_standard_neumann <session.json> <payload.json> <result.json>")
+            try fail("usage: HornlabMetalBemNative.swift assemble_standard_neumann <session.json> <payload.json> <result.json>")
         }
         try assembleStandardNeumann(
             sessionManifestPath: args[1],
@@ -5033,7 +5033,7 @@ func main(_ args: [String]) throws {
         )
     } else if op == "assemble_standard_neumann_batch" {
         guard args.count == 4 else {
-            try fail("usage: HornlabSolverMetalNative.swift assemble_standard_neumann_batch <session.json> <payload.json> <result.json>")
+            try fail("usage: HornlabMetalBemNative.swift assemble_standard_neumann_batch <session.json> <payload.json> <result.json>")
         }
         try assembleStandardNeumannBatch(
             sessionManifestPath: args[1],
@@ -5042,7 +5042,7 @@ func main(_ args: [String]) throws {
         )
     } else if op == "assemble_solve_standard_neumann_batch" {
         guard args.count == 4 else {
-            try fail("usage: HornlabSolverMetalNative.swift assemble_solve_standard_neumann_batch <session.json> <payload.json> <result.json>")
+            try fail("usage: HornlabMetalBemNative.swift assemble_solve_standard_neumann_batch <session.json> <payload.json> <result.json>")
         }
         try assembleSolveStandardNeumannBatch(
             sessionManifestPath: args[1],
@@ -5051,7 +5051,7 @@ func main(_ args: [String]) throws {
         )
     } else if op == "assemble_solve_evaluate_standard_neumann_batch" {
         guard args.count == 4 else {
-            try fail("usage: HornlabSolverMetalNative.swift assemble_solve_evaluate_standard_neumann_batch <session.json> <payload.json> <result.json>")
+            try fail("usage: HornlabMetalBemNative.swift assemble_solve_evaluate_standard_neumann_batch <session.json> <payload.json> <result.json>")
         }
         try assembleSolveEvaluateStandardNeumannBatch(
             sessionManifestPath: args[1],
@@ -5060,7 +5060,7 @@ func main(_ args: [String]) throws {
         )
     } else if op == "evaluate_standard_exterior" {
         guard args.count == 4 else {
-            try fail("usage: HornlabSolverMetalNative.swift evaluate_standard_exterior <session.json> <payload.json> <result.json>")
+            try fail("usage: HornlabMetalBemNative.swift evaluate_standard_exterior <session.json> <payload.json> <result.json>")
         }
         try evaluateStandardExterior(
             sessionManifestPath: args[1],
@@ -5069,7 +5069,7 @@ func main(_ args: [String]) throws {
         )
     } else if op == "evaluate_standard_exterior_batch" {
         guard args.count == 4 else {
-            try fail("usage: HornlabSolverMetalNative.swift evaluate_standard_exterior_batch <session.json> <payload.json> <result.json>")
+            try fail("usage: HornlabMetalBemNative.swift evaluate_standard_exterior_batch <session.json> <payload.json> <result.json>")
         }
         try evaluateStandardExteriorBatch(
             sessionManifestPath: args[1],

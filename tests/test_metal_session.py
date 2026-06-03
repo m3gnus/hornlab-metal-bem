@@ -6,9 +6,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from hornlab_solver.metal import session as metal_session
-from hornlab_solver.metal.geometry import build_metal_geometry_buffers
-from hornlab_solver.metal.session import (
+from hornlab_metal_bem.metal import session as metal_session
+from hornlab_metal_bem.metal.geometry import build_metal_geometry_buffers
+from hornlab_metal_bem.metal.session import (
     AssemblyPayload,
     BinaryArrayDescriptor,
     FieldPayload,

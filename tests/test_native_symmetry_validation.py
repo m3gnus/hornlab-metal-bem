@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from hornlab_solver.validation.native_symmetry import (
+from hornlab_metal_bem.validation.native_symmetry import (
     build_local2global_xy_mirror_orbits,
     build_xy_mirror_orbits,
     classify_orbits_by_size,

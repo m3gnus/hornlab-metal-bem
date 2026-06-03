@@ -22,11 +22,11 @@ markers = [
 ]
 
 [tool.setuptools.package-data]
-hornlab_solver = [
-    "metal/HornlabSolverMetalNative.swift",
+hornlab_metal_bem = [
+    "metal/HornlabMetalBemNative.swift",
     "metal/native_helper/Package.swift",
-    "metal/native_helper/Sources/HornlabSolverMetalNative/main.swift",
+    "metal/native_helper/Sources/HornlabMetalBemNative/main.swift",
 ]
 
 [tool.setuptools.packages.find]
-include = ["hornlab_solver*", "hornlab_metal_bem*"]
+include = ["hornlab_metal_bem*"]

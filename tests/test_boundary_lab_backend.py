@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from hornlab_metal_bem.boundary_lab import BACKEND_ID, create_backend
-from hornlab_solver.boundary_lab import solve_config_from_boundary_lab
+from hornlab_metal_bem.boundary_lab import solve_config_from_boundary_lab
 
 
 def test_boundary_lab_config_defaults_to_native_metal():
@@ -20,9 +20,6 @@ def test_boundary_lab_config_defaults_to_native_metal():
     )
 
     assert frequencies is None
-    assert config.assembly_backend == "metal"
-    assert config.experimental_metal_backend is True
-    assert config.metal_backend_fallback == "error"
     assert config.freq_min_hz == 800.0
     assert config.freq_max_hz == 12_500.0
     assert config.freq_count == 9

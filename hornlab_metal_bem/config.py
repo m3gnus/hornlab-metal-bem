@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import TYPE_CHECKING, Callable, Literal
 
 if TYPE_CHECKING:
@@ -9,25 +8,11 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 
-class BIEFormulation(Enum):
-    STANDARD = "standard"
-    BURTON_MILLER = "burton_miller"
-    COMPLEX_K = "complex_k"
-
-
-class LinearSolver(Enum):
-    AUTO = "auto"
-    LU = "lu"
-    GMRES = "gmres"
-
-
-class VelocityMode(Enum):
+class VelocityMode:
     VELOCITY = "velocity"
     ACCELERATION = "acceleration"
 
 
-AssemblyBackend = Literal["metal"]
-MetalBackendFallback = Literal["error"]
 NativeSymmetryPlane = Literal["yz", "xz", "yz+xz"]
 MetalNativeAssemblyMode = Literal["corrected", "optimized"]
 
@@ -56,33 +41,12 @@ class SolveConfig:
     freq_count: int = 40
     freq_spacing: Literal["log", "linear"] = "log"
 
-    # BIE
-    formulation: BIEFormulation = BIEFormulation.STANDARD
-    complex_k_shift: float = 0.005
-    slp_dlp_quadrature: int = 4
-    hyp_adlp_quadrature: int = 4
-
-    # Linear solver
-    solver: LinearSolver = LinearSolver.GMRES
-    lu_threshold: int = 6000
-    gmres_tol: float = 1e-5
-    gmres_max_iter: int = 5000
-
     # Boundary condition
-    velocity_mode: VelocityMode = VelocityMode.ACCELERATION
+    velocity_mode: Literal["velocity", "acceleration"] = VelocityMode.ACCELERATION
     velocity_sources: dict[int, float] = field(
         default_factory=lambda: {2: 1.0}
     )
     velocity_source_callback: Callable[[float], dict[int, complex]] | None = None
-    velocity_profile: Literal["piston", "dome", "ring"] = "piston"
-
-    # Robin / impedance boundary condition (wall damping).
-    # Maps physical tag -> normalized surface admittance β = ρc / Z_s
-    # (dimensionless). β = 0 is rigid wall, β = 1 is air-matched absorber.
-    # Light damping (the "clean up unrealistic dips" trick): β ~ 0.02-0.1.
-    # When non-empty, the solver substitutes ∂p/∂n = i·k·β·p directly into
-    # the BIE and solves once (no iteration); see _assemble_and_solve_impedance.
-    impedance_sources: dict[int, complex] = field(default_factory=dict)
 
     # Observation
     observation: ObservationConfig = field(default_factory=ObservationConfig)
@@ -92,12 +56,7 @@ class SolveConfig:
     # axis wrong, or when the caller has a known frame (e.g. WG bridge).
     frame_override: object | None = None  # ObservationFrame, kept as object to avoid circular import
 
-    # Performance
-    workers: int = 1
-    precision: Literal["single", "double"] = "single"
-    assembly_backend: AssemblyBackend = "metal"
-    experimental_metal_backend: bool = True
-    metal_backend_fallback: MetalBackendFallback = "error"
+    # Native Metal controls
     native_symmetry_plane: NativeSymmetryPlane | None = None
     metal_native_assembly_mode: MetalNativeAssemblyMode = "corrected"
     metal_native_threads_per_group: int | None = None
@@ -122,10 +81,10 @@ class SolveConfig:
     on_frequency_result: Callable[[int, float, dict], bool] | None = None
 
     def __post_init__(self) -> None:
-        if self.assembly_backend != "metal":
-            raise ValueError("assembly_backend must be 'metal'")
-        if self.metal_backend_fallback != "error":
-            raise ValueError("metal_backend_fallback must be 'error'")
+        if self.freq_spacing not in {"log", "linear"}:
+            raise ValueError("freq_spacing must be 'log' or 'linear'")
+        if self.velocity_mode not in {VelocityMode.VELOCITY, VelocityMode.ACCELERATION}:
+            raise ValueError("velocity_mode must be 'velocity' or 'acceleration'")
         if self.native_symmetry_plane not in {None, "yz", "xz", "yz+xz"}:
             raise ValueError(
                 "native_symmetry_plane must be None, 'yz', 'xz', or 'yz+xz'"

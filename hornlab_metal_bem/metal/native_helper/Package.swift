@@ -3,19 +3,19 @@
 import PackageDescription
 
 let package = Package(
-    name: "HornlabSolverMetalNative",
+    name: "HornlabMetalBemNative",
     platforms: [
         .macOS(.v13)
     ],
     products: [
         .executable(
-            name: "HornlabSolverMetalNative",
-            targets: ["HornlabSolverMetalNative"]
+            name: "HornlabMetalBemNative",
+            targets: ["HornlabMetalBemNative"]
         )
     ],
     targets: [
         .executableTarget(
-            name: "HornlabSolverMetalNative",
+            name: "HornlabMetalBemNative",
             linkerSettings: [
                 .linkedFramework("Accelerate")
             ]

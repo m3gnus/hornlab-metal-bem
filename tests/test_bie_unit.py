@@ -1,4 +1,4 @@
-"""Unit tests for pure acoustic helpers in hornlab_solver.bie."""
+"""Unit tests for pure acoustic helpers in hornlab_metal_bem.bie."""
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 
-from hornlab_solver.config import SolveConfig, VelocityMode
+from hornlab_metal_bem.config import SolveConfig, VelocityMode
 
 
 # ---------------------------------------------------------------------------
@@ -17,7 +17,7 @@ from hornlab_solver.config import SolveConfig, VelocityMode
 class TestAirDensityInNeumann:
 
     def test_default_air_density_in_coefficients(self):
-        from hornlab_solver.bie import _build_driver_neumann_coeffs
+        from hornlab_metal_bem.bie import _build_driver_neumann_coeffs
 
         dp0_space = SimpleNamespace(global_dof_count=4)
 
@@ -41,7 +41,7 @@ class TestAirDensityInNeumann:
             np.testing.assert_allclose(coeffs[dof], expected_coeff, rtol=1e-6)
 
     def test_custom_air_density_propagates(self):
-        from hornlab_solver.bie import _build_driver_neumann_coeffs
+        from hornlab_metal_bem.bie import _build_driver_neumann_coeffs
 
         dp0_space = SimpleNamespace(global_dof_count=4)
 
@@ -69,7 +69,7 @@ class TestAirDensityInNeumann:
             np.testing.assert_allclose(coeffs[dof], expected_coeff, rtol=1e-6)
 
     def test_velocity_mode_velocity_uses_weight_directly(self):
-        from hornlab_solver.bie import _build_driver_neumann_coeffs
+        from hornlab_metal_bem.bie import _build_driver_neumann_coeffs
 
         dp0_space = SimpleNamespace(global_dof_count=3)
 
@@ -96,7 +96,7 @@ class TestAirDensityInNeumann:
         assert coeffs[2] == 0.0
 
     def test_zero_omega_acceleration_gives_zero(self):
-        from hornlab_solver.bie import _build_driver_neumann_coeffs
+        from hornlab_metal_bem.bie import _build_driver_neumann_coeffs
 
         dp0_space = SimpleNamespace(global_dof_count=2)
 
@@ -122,7 +122,7 @@ class TestAirDensityInNeumann:
 class TestComputeSurfacePressureAvg:
 
     def test_single_tag_uniform_pressure(self):
-        from hornlab_solver.bie import compute_surface_pressure_avg
+        from hornlab_metal_bem.bie import compute_surface_pressure_avg
 
         n_verts = 6
 
@@ -152,7 +152,7 @@ class TestComputeSurfacePressureAvg:
         np.testing.assert_allclose(result[2], pressure_val, rtol=1e-10)
 
     def test_area_weighting_matters(self):
-        from hornlab_solver.bie import compute_surface_pressure_avg
+        from hornlab_metal_bem.bie import compute_surface_pressure_avg
 
         grid = MagicMock()
         grid.elements = MagicMock()
@@ -176,7 +176,7 @@ class TestComputeSurfacePressureAvg:
         np.testing.assert_allclose(result[2], expected, rtol=1e-10)
 
     def test_missing_tag_returns_zero(self):
-        from hornlab_solver.bie import compute_surface_pressure_avg
+        from hornlab_metal_bem.bie import compute_surface_pressure_avg
 
         grid = MagicMock()
         grid.elements = MagicMock()
@@ -199,7 +199,7 @@ class TestComputeSurfacePressureAvg:
         assert result[3] == 0.0 + 0.0j
 
     def test_multiple_tags_independent(self):
-        from hornlab_solver.bie import compute_surface_pressure_avg
+        from hornlab_metal_bem.bie import compute_surface_pressure_avg
 
         grid = MagicMock()
         grid.elements = MagicMock()

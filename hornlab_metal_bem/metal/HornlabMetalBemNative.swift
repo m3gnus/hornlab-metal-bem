@@ -5,7 +5,7 @@ import Foundation
 let backendDir = URL(fileURLWithPath: CommandLine.arguments[0])
     .deletingLastPathComponent()
 let packageDir = backendDir.appendingPathComponent("native_helper")
-let swiftExecutable = ProcessInfo.processInfo.environment["HORNLAB_SOLVER_SWIFT"] ?? "swift"
+let swiftExecutable = ProcessInfo.processInfo.environment["HORNLAB_METAL_BEM_SWIFT"] ?? "swift"
 
 let process = Process()
 process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -14,7 +14,7 @@ process.arguments = [
     "run",
     "--package-path",
     packageDir.path,
-    "HornlabSolverMetalNative",
+    "HornlabMetalBemNative",
 ] + Array(CommandLine.arguments.dropFirst())
 
 let stdout = Pipe()

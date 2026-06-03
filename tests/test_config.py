@@ -1,16 +1,16 @@
-"""Unit tests for hornlab_solver.config — pure dataclass tests, no bempp needed."""
+"""Unit tests for hornlab_metal_bem.config — pure dataclass tests, no bempp needed."""
 from __future__ import annotations
 
 import pytest
 
-from hornlab_solver.backends import (
+from hornlab_metal_bem.backends import (
     AssemblyBackendUnavailable,
     discover_metal_backend,
     resolve_assembly_backend,
 )
-import hornlab_solver.backends as backends
-from hornlab_solver.config import BIEFormulation, ObservationConfig, SolveConfig
-from hornlab_solver.sweep import should_route_native_metal
+import hornlab_metal_bem.backends as backends
+from hornlab_metal_bem.config import ObservationConfig, SolveConfig
+from hornlab_metal_bem.sweep import should_route_native_metal
 
 
 def test_observation_config_custom_points_defaults_none():
@@ -43,11 +43,8 @@ def test_solve_config_on_frequency_result_defaults_none():
     assert cfg.on_frequency_result is None
 
 
-def test_solve_config_default_backend_is_native_metal():
+def test_solve_config_default_native_metal_controls():
     cfg = SolveConfig()
-    assert cfg.assembly_backend == "metal"
-    assert cfg.experimental_metal_backend is True
-    assert cfg.metal_backend_fallback == "error"
     assert cfg.native_symmetry_plane is None
     assert cfg.metal_native_assembly_mode == "corrected"
     assert cfg.metal_native_threads_per_group is None
@@ -57,24 +54,14 @@ def test_solve_config_default_backend_is_native_metal():
     assert cfg.metal_native_field_threads_per_group is None
 
 
-def test_solve_config_rejects_unknown_backend():
-    with pytest.raises(ValueError, match="assembly_backend"):
-        SolveConfig(assembly_backend="cuda")  # type: ignore[arg-type]
+def test_solve_config_rejects_unknown_frequency_spacing():
+    with pytest.raises(ValueError, match="freq_spacing"):
+        SolveConfig(freq_spacing="octave")  # type: ignore[arg-type]
 
 
-def test_solve_config_rejects_removed_opencl_backend():
-    with pytest.raises(ValueError, match="assembly_backend"):
-        SolveConfig(assembly_backend="opencl")  # type: ignore[arg-type]
-
-
-def test_solve_config_rejects_unknown_metal_fallback():
-    with pytest.raises(ValueError, match="metal_backend_fallback"):
-        SolveConfig(metal_backend_fallback="numba")  # type: ignore[arg-type]
-
-
-def test_solve_config_rejects_removed_opencl_fallback():
-    with pytest.raises(ValueError, match="metal_backend_fallback"):
-        SolveConfig(metal_backend_fallback="opencl")  # type: ignore[arg-type]
+def test_solve_config_rejects_unknown_velocity_mode():
+    with pytest.raises(ValueError, match="velocity_mode"):
+        SolveConfig(velocity_mode="force")  # type: ignore[arg-type]
 
 
 def test_solve_config_rejects_unknown_native_symmetry_plane():
@@ -153,7 +140,7 @@ def test_resolve_backend_raises_when_native_unavailable(monkeypatch):
     monkeypatch.setattr(backends, "discover_metal_backend", lambda: Status())
 
     with pytest.raises(AssemblyBackendUnavailable, match="native unavailable"):
-        resolve_assembly_backend(SolveConfig())
+        resolve_assembly_backend()
 
 
 def test_metal_discovery_reports_native_helper(monkeypatch):
@@ -180,7 +167,7 @@ def test_resolve_backend_returns_metal_when_native_discovered(monkeypatch):
 
     monkeypatch.setattr(backends, "discover_metal_backend", lambda: Status())
 
-    resolution = resolve_assembly_backend(SolveConfig())
+    resolution = resolve_assembly_backend()
 
     assert resolution.requested_backend == "metal"
     assert resolution.effective_backend == "metal"
@@ -188,30 +175,9 @@ def test_resolve_backend_returns_metal_when_native_discovered(monkeypatch):
 
 
 def test_explicit_experimental_metal_request_routes_to_native_sweep():
-    cfg = SolveConfig(
-        assembly_backend="metal",
-        experimental_metal_backend=True,
-    )
+    cfg = SolveConfig()
 
     assert should_route_native_metal(cfg) is True
-
-
-def test_native_symmetry_requires_native_metal_route():
-    cfg = SolveConfig(native_symmetry_plane="yz", experimental_metal_backend=False)
-
-    with pytest.raises(AssemblyBackendUnavailable, match="native_symmetry_plane"):
-        should_route_native_metal(cfg)
-
-
-def test_native_metal_sweep_rejects_unsupported_formulation_in_strict_mode():
-    cfg = SolveConfig(
-        assembly_backend="metal",
-        experimental_metal_backend=True,
-        formulation=BIEFormulation.BURTON_MILLER,
-    )
-
-    with pytest.raises(AssemblyBackendUnavailable, match="STANDARD"):
-        should_route_native_metal(cfg)
 
 
 def test_solve_config_callbacks_accept_callables():

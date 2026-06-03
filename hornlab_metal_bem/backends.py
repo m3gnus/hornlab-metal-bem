@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .config import SolveConfig
 from .metal.native import MetalNativeRuntimeConfig, discover_native_runtime
 
 
@@ -26,7 +25,7 @@ class MetalBackendStatus:
 
     @property
     def packaged_backend_available(self) -> bool:
-        """Backward-compatible aggregate asset/runtime availability."""
+        """Aggregate asset/runtime availability."""
         return self.native_helper_available
 
 
@@ -71,25 +70,16 @@ def discover_metal_backend(
     )
 
 
-def resolve_assembly_backend(config: SolveConfig) -> AssemblyBackendResolution:
-    """Resolve ``SolveConfig.assembly_backend`` to the native Metal backend."""
-
-    requested = config.assembly_backend
-    if requested != "metal":
-        raise ValueError("assembly_backend must be 'metal'")
-
+def resolve_assembly_backend() -> AssemblyBackendResolution:
+    """Resolve native Metal runtime availability."""
     status = discover_metal_backend()
-    if not config.experimental_metal_backend:
-        raise AssemblyBackendUnavailable(
-            "Metal backend requires experimental_metal_backend=True."
-        )
     if not status.available:
         raise AssemblyBackendUnavailable(
             status.reason or "Metal backend is unavailable."
         )
 
     return AssemblyBackendResolution(
-        requested_backend=requested,
+        requested_backend="metal",
         effective_backend="metal",
         fallback_used=False,
         reason=status.reason,

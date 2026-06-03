@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from hornlab_solver.mesh import (
+from hornlab_metal_bem.mesh import (
     MeshError,
     _signed_mesh_volume_indicator,
     _validate_outward_normals,

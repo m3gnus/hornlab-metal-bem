@@ -18,14 +18,19 @@ class MeshInfo:
 
 @dataclass
 class SolveResult:
+    """Native Metal BEM solve output.
+
+    Array dimensions use ``F`` for frequency count, ``P`` for observation
+    plane count, and ``N`` for points or angles per plane.
+    """
 
     frequencies_hz: NDArray[np.float64]
 
     # (F, P, N_angles) — complex pressure at every observation point
     pressure_complex: NDArray[np.complex128]
 
-    # (F, P, N_angles) — SPL in dB, normalised on-axis = 0 dB
-    spl_db: NDArray[np.float64]
+    # (F, P, N_angles) — normalized directivity in dB, on-axis = 0 dB
+    directivity_db: NDArray[np.float64]
 
     # (F,) — complex throat impedance, normalised to rho*c
     impedance: NDArray[np.complex128]
@@ -42,3 +47,8 @@ class SolveResult:
     # Area-weighted average surface pressure per velocity-source tag.
     # tag -> (F,) complex array. Populated when velocity_sources has tags.
     surface_pressure_avg: dict[int, NDArray[np.complex128]] | None = None
+
+    @property
+    def spl_norm_db(self) -> NDArray[np.float64]:
+        """Alias for normalized directivity in dB."""
+        return self.directivity_db
