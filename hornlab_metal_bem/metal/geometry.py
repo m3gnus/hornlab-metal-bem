@@ -22,6 +22,15 @@ class MetalGeometryError(ValueError):
     """Raised when grid/space metadata cannot satisfy the Metal data contract."""
 
 
+# Vertex coordinates this close to zero are snapped to exactly 0.0. The Swift
+# helper quantizes vertex coordinates with a 1e-6 tolerance when matching
+# mirrored image vertices for singular-pair detection, while Python symmetry
+# validation uses 1e-7; without snapping, a CAD vertex at e.g. z=5e-7 passes
+# neither as on-plane nor mirrors onto itself, so image Duffy pairs silently
+# fail to fire. Must stay aligned with coordinateKey() in the native helper.
+_PLANE_SNAP_TOLERANCE = 1.0e-6
+
+
 @dataclass(frozen=True)
 class MetalGeometryBuffers:
     """Validated NumPy buffers for Metal dense BEM assembly.
@@ -97,6 +106,8 @@ def build_metal_geometry_buffers(
         it implicitly.
     """
     vertices_f64 = _require_vertices_3xn(grid)
+    vertices_f64 = vertices_f64.copy()
+    vertices_f64[np.abs(vertices_f64) <= _PLANE_SNAP_TOLERANCE] = 0.0
     triangles_i32 = _require_triangles_3xm(grid, vertices_f64.shape[1])
     n_triangles = int(triangles_i32.shape[1])
 

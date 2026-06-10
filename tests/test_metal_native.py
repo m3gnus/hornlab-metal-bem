@@ -1747,6 +1747,87 @@ def test_native_executable_corrected_xy_symmetry_applies_image_duffy(
     assert result["duffy_corrections"]["image_adjacent_pairs"] >= 1
 
 
+def test_native_executable_xy_image_duffy_fires_for_near_plane_vertex(
+    monkeypatch,
+    tmp_path,
+):
+    """A CAD vertex at z=5e-7 must snap onto the symmetry plane.
+
+    5e-7 sits in the crack between Python plane validation (1e-7) and the
+    Swift image-pair coordinate keys (1e-6 quantization): without snapping,
+    the vertex neither counts as on-plane nor matches its own mirror, so
+    image Duffy pairs silently stop firing.
+    """
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", raising=False)
+    grid = SimpleNamespace(
+        vertices=np.array(
+            [
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 5.0e-7, 1.0],
+            ],
+            dtype=np.float64,
+        ),
+        elements=np.array([[0], [1], [2]], dtype=np.int64),
+        number_of_elements=1,
+    )
+    p1 = SimpleNamespace(
+        local2global=np.array([[0, 1, 2]], dtype=np.int64),
+        global_dof_count=3,
+    )
+    near_plane_buffers = build_metal_geometry_buffers(
+        grid,
+        np.array([2], dtype=np.int32),
+        p1,
+        SimpleNamespace(global_dof_count=1),
+    )
+    np.testing.assert_array_equal(
+        near_plane_buffers.vertices_3xn_f32,
+        _tiny_xy_half_buffers().vertices_3xn_f32,
+    )
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=near_plane_buffers,
+        work_dir=tmp_path / "native-near-plane-xy-session",
+        session_id="native-near-plane-xy-test",
+        symmetry_plane="xy",
+    ) as session:
+        assembly = session.assemble_standard_neumann(
+            100.0,
+            1.8318326,
+            np.array([1.0 + 0.0j], dtype=np.complex64),
+            operation_id="near-plane-assembly",
+        )
+
+    result = json.loads(
+        (
+            tmp_path
+            / "native-near-plane-xy-session"
+            / "near-plane-assembly"
+            / "assembly-result.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert result["symmetry_plane"] == "xy"
+    assert result["duffy_corrections"]["image_singular_correction"] is True
+    assert result["duffy_corrections"]["image_adjacent_pairs"] >= 1
+    # The mirrored triangle shares the full on-plane edge, so the image pair
+    # must be edge-kind; without snapping, the 5e-7 vertex fails to match its
+    # mirror and the pair silently degrades to a vertex-kind correction.
+    assert result["duffy_corrections"]["planned_pairs"]["edge"] >= 1
+
+    half_matrix, half_rhs = _read_complex_assembly(assembly)
+    assert np.all(np.isfinite(half_matrix))
+    assert np.all(np.isfinite(half_rhs))
+
+
 def test_native_executable_rejects_payload_without_wavenumber(tmp_path):
     status = discover_native_runtime(run_smoke_test=True)
     if not status.available or status.helper_executable_path is None:

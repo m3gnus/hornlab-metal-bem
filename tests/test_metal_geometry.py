@@ -200,3 +200,29 @@ def test_build_metal_geometry_buffers_rejects_dp0_count_mismatch():
             _mock_p1(),
             _mock_dp0(3),
         )
+
+
+def test_build_metal_geometry_buffers_snaps_near_zero_coordinates():
+    # Near-plane CAD vertices must land exactly on 0.0 so they cannot fall
+    # between Python plane validation (1e-7) and the native helper's 1e-6
+    # image-pair coordinate keys; coordinates beyond the tolerance survive.
+    vertices = np.array(
+        [
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, -5.0e-7],
+            [5.0e-7, 2.0e-6, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    buffers = build_metal_geometry_buffers(
+        _mock_grid(vertices),
+        np.array([1, 2], dtype=np.int32),
+        _mock_p1(),
+        _mock_dp0(),
+    )
+
+    assert buffers.vertices_3xn_f32[2, 0] == 0.0
+    assert buffers.vertices_3xn_f32[1, 3] == 0.0
+    assert buffers.vertices_3xn_f32[2, 1] == np.float32(2.0e-6)
+    # The caller's array is untouched.
+    assert vertices[2, 0] == 5.0e-7
