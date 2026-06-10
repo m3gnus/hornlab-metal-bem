@@ -3,9 +3,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
-from hornlab_metal_bem.boundary_lab import BACKEND_ID, create_backend
+from hornlab_metal_bem.boundary_lab import BACKEND_ID, BoundaryLabSolverError, create_backend
+from hornlab_metal_bem.boundary_lab import _coerce_symmetry_plane
+from hornlab_metal_bem.boundary_lab import _crossover_response
 from hornlab_metal_bem.boundary_lab import _frequency_result_from_log_entry
+from hornlab_metal_bem.boundary_lab import _level_polarity_delay_filter_drive
 from hornlab_metal_bem.boundary_lab import solve_config_from_boundary_lab
 
 
@@ -80,6 +84,116 @@ def test_boundary_lab_backend_accepts_solve_request_contract():
     assert solve_config.observation.angle_min_deg == -90.0
     assert solve_config.observation.angle_max_deg == 90.0
     assert solve_config.observation.angle_count == 5
+
+
+def test_boundary_lab_session_translates_dict_shaped_requests():
+    backend = create_backend()
+    session = backend.create_session(
+        {
+            "config": {"frequency_count": 7, "source_tag": 3},
+            "frequencies_hz": [100.0, 200.0],
+        }
+    )
+
+    assert session._simulation_config == {"frequency_count": 7, "source_tag": 3}
+    np.testing.assert_allclose(session._frequencies_hz, [100.0, 200.0])
+
+
+def test_boundary_lab_metadata_angles_match_solved_grid_for_non_divisible_step():
+    config = {"min_angle": 0.0, "max_angle": 100.0, "step_size": 30.0}
+    backend = create_backend()
+    session = backend.create_session({"config": config})
+
+    solve_config, _ = solve_config_from_boundary_lab(config)
+    solved = np.linspace(
+        solve_config.observation.angle_min_deg,
+        solve_config.observation.angle_max_deg,
+        solve_config.observation.angle_count,
+    )
+    np.testing.assert_allclose(session.metadata.polar_angle_deg, solved)
+
+
+def test_boundary_lab_solve_stream_resets_stop_flag_between_streams():
+    backend = create_backend()
+    session = backend.create_session({"config": {"mesh_file": "m.msh"}})
+    session._stop = True
+
+    # The reset happens at solve_stream entry, before any solving starts;
+    # pull one step of the generator setup by checking the flag directly.
+    stream = session.solve_stream()
+    with pytest.raises(BoundaryLabSolverError, match="frequencies_hz"):
+        next(stream)
+    assert session._stop is False
+
+
+def test_drive_delay_uses_positive_phase_for_lagging_channel():
+    # e^{-i omega t} convention: a delayed channel's phasor rotates by
+    # +omega*tau. 1 ms at 250 Hz is a quarter turn: 1 -> +j.
+    drive = _level_polarity_delay_filter_drive(
+        {"delay_ms": 1.0},
+        250.0,
+    )
+    np.testing.assert_allclose(drive, np.exp(1j * np.pi / 2.0), rtol=1e-12)
+
+
+def test_drive_rejects_polarity_outside_unit():
+    with pytest.raises(BoundaryLabSolverError, match="polarity"):
+        _level_polarity_delay_filter_drive({"polarity": 0}, 1000.0)
+
+
+def test_crossover_response_is_conjugate_of_scipy_convention():
+    # 1st-order Butterworth LPF at cutoff: H(j w_c) = 1/(1+j) in scipy's
+    # e^{+j omega t} convention, so the drive must be 1/(1-j).
+    response = _crossover_response(
+        {"type": "lpf", "filter": "butterworth", "order": 1, "frequency_hz": 1000.0},
+        1000.0,
+    )
+    np.testing.assert_allclose(response, 1.0 / (1.0 - 1.0j), rtol=1e-9)
+
+
+@pytest.mark.parametrize(
+    ("crossover", "match"),
+    [
+        ({"type": "bandpass", "frequency_hz": 1000.0}, "crossover type"),
+        ({"type": "lpf", "filter": "bessel", "frequency_hz": 1000.0}, "crossover filter"),
+        ({"type": "lpf"}, "missing frequency_hz"),
+        ({"type": "lpf", "frequency_hz": 0.0}, "must be positive"),
+        ({"type": "lpf", "order": 0, "frequency_hz": 1000.0}, "order"),
+        (
+            {"type": "lpf", "filter": "linkwitz_riley", "order": 3, "frequency_hz": 1000.0},
+            "even",
+        ),
+    ],
+)
+def test_crossover_response_rejects_malformed_configs(crossover, match):
+    with pytest.raises(BoundaryLabSolverError, match=match):
+        _crossover_response(crossover, 2000.0)
+
+
+def test_linkwitz_riley_squares_butterworth_sections():
+    lr4 = _crossover_response(
+        {"type": "lpf", "filter": "linkwitz_riley", "order": 4, "frequency_hz": 1000.0},
+        1000.0,
+    )
+    # LR4 at cutoff is -6 dB.
+    np.testing.assert_allclose(abs(lr4), 0.5, rtol=1e-9)
+
+
+@pytest.mark.parametrize(
+    ("token", "expected"),
+    [
+        ("off", None),
+        ("x", "yz"),
+        ("y", "xz"),
+        ("z", "xy"),
+        ("xy", "yz+xz"),
+        ("yz", "yz"),
+        ("xz", "xz"),
+        ("yz+xz", "yz+xz"),
+    ],
+)
+def test_coerce_symmetry_plane_maps_boundary_lab_tokens(token, expected):
+    assert _coerce_symmetry_plane(token) == expected
 
 
 def test_boundary_lab_frequency_result_preserves_streamed_complex_pressure():

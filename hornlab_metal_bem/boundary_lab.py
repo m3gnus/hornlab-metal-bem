@@ -140,17 +140,23 @@ class BoundaryLabSession:
             config_source,
             **merged_overrides,
         )
+        if frequencies_hz is None and simulation_config is None:
+            # Request-shaped inputs carry frequencies next to the config.
+            frequencies_hz = self._frequencies_hz
         if frequencies_hz is not None:
             return _solve_frequencies(mesh, frequencies_hz, solve_config)
         return _solve(mesh, solve_config)
 
     @property
     def _simulation_config(self) -> Any | None:
-        return getattr(self.request_or_config, "config", self.request_or_config)
+        if self.request_or_config is None:
+            return None
+        nested = _first(self.request_or_config, "config", default=None)
+        return nested if nested is not None else self.request_or_config
 
     @property
     def _frequencies_hz(self) -> np.ndarray | None:
-        frequencies = getattr(self.request_or_config, "frequencies_hz", None)
+        frequencies = _first(self.request_or_config, "frequencies_hz", default=None)
         return _coerce_frequencies(frequencies)
 
     @property
@@ -168,6 +174,11 @@ class BoundaryLabSession:
         stop_requested: Callable[[], bool] | None = None,
     ) -> Iterator[FrequencyResult]:
         from . import solve_frequencies as _solve_frequencies
+
+        # A previous stream (even one that ran to completion) leaves _stop
+        # set; reset so session reuse does not silently truncate to one
+        # frequency.
+        self._stop = False
 
         cfg = self._simulation_config
         if cfg is None:
@@ -263,6 +274,10 @@ def solve_config_from_boundary_lab(
     )
     frequencies_hz = _coerce_frequencies(frequencies)
 
+    # Derive the observation arc directly from the Boundary Lab angle grid so
+    # the solved angles always match the metadata.polar_angle_deg the adapter
+    # publishes. With a step-based grid whose step does not divide the span,
+    # the grid's last angle (not the configured max) is the true endpoint.
     boundary_angles = _boundary_lab_angles(simulation_config)
     observation = ObservationConfig(
         planes=list(
@@ -281,32 +296,9 @@ def solve_config_from_boundary_lab(
                 default=2.0,
             )
         ),
-        angle_min_deg=float(
-            _first(
-                simulation_config,
-                "angle_min_deg",
-                "min_angle_deg",
-                "min_angle",
-                default=float(boundary_angles[0]),
-            )
-        ),
-        angle_max_deg=float(
-            _first(
-                simulation_config,
-                "angle_max_deg",
-                "max_angle_deg",
-                "max_angle",
-                default=float(boundary_angles[-1]),
-            )
-        ),
-        angle_count=int(
-            _first(
-                simulation_config,
-                "angle_count",
-                "n_angles",
-                default=len(boundary_angles),
-            )
-        ),
+        angle_min_deg=float(boundary_angles[0]),
+        angle_max_deg=float(boundary_angles[-1]),
+        angle_count=len(boundary_angles),
         origin=_first(
             simulation_config,
             "origin",
@@ -451,7 +443,14 @@ def _level_polarity_delay_filter_drive(source: Any, frequency_hz: float) -> comp
     omega = 2.0 * np.pi * float(frequency_hz)
     level = 10.0 ** (float(_first(source, "level_db", default=0.0)) / 20.0)
     polarity = int(_first(source, "polarity", default=1))
-    delay = np.exp(-1j * omega * (float(_first(source, "delay_ms", default=0.0)) / 1000.0))
+    if polarity not in {-1, 1}:
+        raise BoundaryLabSolverError(
+            f"polarity must be -1 or 1, got {polarity!r}"
+        )
+    # The BEM core uses the e^{-i omega t} convention (Green's kernel
+    # e^{+ikr}/4*pi*r, Neumann coefficient +i*rho*omega*v_n). A time delay of
+    # tau therefore multiplies the phasor by e^{+i omega tau}.
+    delay = np.exp(1j * omega * (float(_first(source, "delay_ms", default=0.0)) / 1000.0))
     crossover = 1.0 + 0.0j
     for name in ("hpf", "lpf"):
         crossover_config = _first(source, name, default=None)
@@ -460,15 +459,42 @@ def _level_polarity_delay_filter_drive(source: Any, frequency_hz: float) -> comp
     return complex(level * polarity * delay * crossover)
 
 
+_CROSSOVER_TYPES = {"highpass", "hpf", "lowpass", "lpf"}
+_CROSSOVER_FILTERS = {"butterworth", "linkwitz_riley"}
+
+
 def _crossover_response(crossover: Any, frequency_hz: float) -> complex:
     crossover_type = str(_first(crossover, "type", default="none")).lower()
     if crossover_type == "none":
         return 1.0 + 0.0j
+    if crossover_type not in _CROSSOVER_TYPES:
+        raise BoundaryLabSolverError(
+            f"Unsupported crossover type {crossover_type!r}; "
+            "expected one of 'highpass', 'hpf', 'lowpass', 'lpf', or 'none'"
+        )
 
     filter_name = str(_first(crossover, "filter", default="butterworth")).lower()
+    if filter_name not in _CROSSOVER_FILTERS:
+        raise BoundaryLabSolverError(
+            f"Unsupported crossover filter {filter_name!r}; "
+            "expected 'butterworth' or 'linkwitz_riley'"
+        )
     order = int(_first(crossover, "order", default=1))
-    cutoff_hz = float(_first(crossover, "frequency_hz", default=frequency_hz))
+    if order < 1:
+        raise BoundaryLabSolverError(f"crossover order must be >= 1, got {order}")
+    cutoff = _first(crossover, "frequency_hz", default=None)
+    if cutoff is None:
+        raise BoundaryLabSolverError(
+            f"crossover of type {crossover_type!r} is missing frequency_hz"
+        )
+    cutoff_hz = float(cutoff)
+    if cutoff_hz <= 0:
+        raise BoundaryLabSolverError("crossover frequency_hz must be positive")
     if filter_name == "linkwitz_riley":
+        if order % 2 != 0:
+            raise BoundaryLabSolverError(
+                f"linkwitz_riley order must be even, got {order}"
+            )
         section_order = order // 2
         section = _butterworth_response(crossover_type, section_order, cutoff_hz, frequency_hz)
         return section * section
@@ -476,12 +502,12 @@ def _crossover_response(crossover: Any, frequency_hz: float) -> complex:
 
 
 def _butterworth_response(crossover_type: str, order: int, cutoff_hz: float, frequency_hz: float) -> complex:
-    if order <= 0:
-        return 1.0 + 0.0j
     btype = "highpass" if crossover_type in {"highpass", "hpf"} else "lowpass"
     b, a = signal.butter(order, 2.0 * np.pi * cutoff_hz, btype=btype, analog=True)
     _, response = signal.freqs(b, a, worN=[2.0 * np.pi * frequency_hz])
-    return complex(response[0])
+    # scipy's analog H(j omega) assumes the e^{+j omega t} convention; the BEM
+    # core uses e^{-i omega t}, so the drive phasor is the conjugate.
+    return complex(np.conj(response[0]))
 
 
 def _boundary_lab_angles(source: Any | None) -> np.ndarray:
@@ -509,11 +535,23 @@ def _radiator_names(source: Any | None) -> tuple[str, ...]:
 
 
 def _coerce_symmetry_plane(symmetry: Any) -> str | None:
+    """Map Boundary Lab symmetry tokens onto native plane names.
+
+    Boundary Lab names the mirrored *axes* ("x" mirrors across X=0, "xy"
+    mirrors across both X=0 and Y=0), while the native solver names the
+    *plane* ("yz" is the X=0 plane, "xy" is the Z=0 plane). The same token
+    "xy" therefore means quarter symmetry here but a z-mirror in SolveConfig
+    — do not pass native plane intentions through this adapter.
+    """
     mode = str(symmetry or "off").strip().lower()
     if mode in {"", "off", "none"}:
         return None
     if mode == "x":
         return "yz"
+    if mode == "y":
+        return "xz"
+    if mode == "z":
+        return "xy"
     if mode == "xy":
         return "yz+xz"
     if mode in {"yz", "xz", "yz+xz"}:
