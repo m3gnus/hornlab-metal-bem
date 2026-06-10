@@ -208,6 +208,56 @@ def _tiny_xy_half_buffers():
     )
 
 
+def _tiny_xy_mirror_full_buffers():
+    grid = SimpleNamespace(
+        vertices=np.array(
+            [
+                [0.0, 1.0, 0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0, 0.0, 0.0, -1.0],
+            ],
+            dtype=np.float64,
+        ),
+        elements=np.array([[0, 3], [1, 5], [2, 4]], dtype=np.int64),
+        number_of_elements=2,
+    )
+    p1 = SimpleNamespace(
+        local2global=np.array([[0, 1, 2], [3, 5, 4]], dtype=np.int64),
+        global_dof_count=6,
+    )
+    return build_metal_geometry_buffers(
+        grid,
+        np.array([2, 2], dtype=np.int32),
+        p1,
+        SimpleNamespace(global_dof_count=2),
+    )
+
+
+def _tiny_xy_shared_full_buffers():
+    grid = SimpleNamespace(
+        vertices=np.array(
+            [
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 1.0],
+                [0.0, 0.0, 1.0, -1.0],
+            ],
+            dtype=np.float64,
+        ),
+        elements=np.array([[0, 0], [1, 3], [2, 1]], dtype=np.int64),
+        number_of_elements=2,
+    )
+    p1 = SimpleNamespace(
+        local2global=np.array([[0, 1, 2], [0, 3, 1]], dtype=np.int64),
+        global_dof_count=4,
+    )
+    return build_metal_geometry_buffers(
+        grid,
+        np.array([2, 2], dtype=np.int32),
+        p1,
+        SimpleNamespace(global_dof_count=2),
+    )
+
+
 def _tiny_xy_full_buffers():
     grid = SimpleNamespace(
         vertices=np.array(
@@ -1493,6 +1543,208 @@ def test_native_executable_corrected_yz_xz_symmetry_applies_image_duffy(
     assert result["symmetry_plane"] == "yz+xz"
     assert result["duffy_corrections"]["image_singular_correction"] is True
     assert result["duffy_corrections"]["image_adjacent_pairs"] == 15
+
+
+def test_native_executable_xy_symmetry_matches_even_full_domain_solve(
+    monkeypatch,
+    tmp_path,
+):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "optimized")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
+    frequency_hz = 100.0
+    k_real = 1.8318326
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_xy_mirror_full_buffers(),
+        work_dir=tmp_path / "native-full-xy-session",
+        session_id="native-full-xy-test",
+    ) as full_session:
+        full_assembly = full_session.assemble_standard_neumann(
+            frequency_hz,
+            k_real,
+            np.array([1.0 + 0.0j, 1.0 + 0.0j], dtype=np.complex64),
+            operation_id="full-assembly",
+        )
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_xy_half_buffers(),
+        work_dir=tmp_path / "native-half-xy-session",
+        session_id="native-half-xy-test",
+        symmetry_plane="xy",
+    ) as half_session:
+        half_assembly = half_session.assemble_standard_neumann(
+            frequency_hz,
+            k_real,
+            np.array([1.0 + 0.0j], dtype=np.complex64),
+            operation_id="half-assembly",
+        )
+
+        half_matrix = np.fromfile(
+            half_assembly.matrix_real_f32, dtype="<f4",
+        ).reshape(half_assembly.matrix_shape) + 1j * np.fromfile(
+            half_assembly.matrix_imag_f32, dtype="<f4",
+        ).reshape(half_assembly.matrix_shape)
+        half_rhs = np.fromfile(half_assembly.rhs_real_f32, dtype="<f4") + 1j * np.fromfile(
+            half_assembly.rhs_imag_f32,
+            dtype="<f4",
+        )
+        half_pressure = np.linalg.solve(half_matrix, half_rhs).astype(np.complex64)
+        half_field = half_session.evaluate_standard_exterior(
+            frequency_hz,
+            k_real,
+            half_pressure,
+            np.array([1.0 + 0.0j], dtype=np.complex64),
+            np.array([[0.25, 0.2, 1.0], [0.25, 0.2, -1.0]], dtype=np.float32),
+            batch_id="symmetry-points",
+            operation_id="half-field",
+        )
+
+    full_matrix = np.fromfile(
+        full_assembly.matrix_real_f32, dtype="<f4",
+    ).reshape(full_assembly.matrix_shape) + 1j * np.fromfile(
+        full_assembly.matrix_imag_f32, dtype="<f4",
+    ).reshape(full_assembly.matrix_shape)
+    full_rhs = np.fromfile(full_assembly.rhs_real_f32, dtype="<f4") + 1j * np.fromfile(
+        full_assembly.rhs_imag_f32,
+        dtype="<f4",
+    )
+    real_dofs = np.array([0, 1, 2], dtype=np.int64)
+    mirror_dofs = np.array([3, 4, 5], dtype=np.int64)
+    even_full_matrix = (
+        full_matrix[np.ix_(real_dofs, real_dofs)]
+        + full_matrix[np.ix_(real_dofs, mirror_dofs)]
+    )
+    even_full_rhs = full_rhs[real_dofs]
+    even_full_pressure = np.linalg.solve(
+        even_full_matrix,
+        even_full_rhs,
+    ).astype(np.complex64)
+    full_pressure = np.zeros(6, dtype=np.complex64)
+    full_pressure[real_dofs] = even_full_pressure
+    full_pressure[mirror_dofs] = even_full_pressure
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_xy_mirror_full_buffers(),
+        work_dir=tmp_path / "native-full-xy-field-session",
+        session_id="native-full-xy-field-test",
+    ) as full_field_session:
+        full_field = full_field_session.evaluate_standard_exterior(
+            frequency_hz,
+            k_real,
+            full_pressure,
+            np.array([1.0 + 0.0j, 1.0 + 0.0j], dtype=np.complex64),
+            np.array([[0.25, 0.2, 1.0], [0.25, 0.2, -1.0]], dtype=np.float32),
+            batch_id="full-points",
+            operation_id="full-field",
+        )
+
+    assert np.allclose(
+        even_full_pressure,
+        half_pressure,
+        rtol=5.0e-4,
+        atol=5.0e-5,
+    )
+
+    full_values = np.fromfile(full_field.pressure_real_f32, dtype="<f4") + 1j * np.fromfile(
+        full_field.pressure_imag_f32,
+        dtype="<f4",
+    )
+    half_values = np.fromfile(half_field.pressure_real_f32, dtype="<f4") + 1j * np.fromfile(
+        half_field.pressure_imag_f32,
+        dtype="<f4",
+    )
+    assert np.allclose(full_values, half_values, rtol=5.0e-4, atol=5.0e-5)
+
+    result = json.loads(
+        (
+            tmp_path
+            / "native-half-xy-session"
+            / "half-assembly"
+            / "assembly-result.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert result["symmetry_plane"] == "xy"
+
+
+def test_native_executable_corrected_xy_symmetry_applies_image_duffy(
+    monkeypatch,
+    tmp_path,
+):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", raising=False)
+    frequency_hz = 100.0
+    k_real = 1.8318326
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_xy_shared_full_buffers(),
+        work_dir=tmp_path / "native-full-corrected-xy-session",
+        session_id="native-full-corrected-xy-test",
+    ) as full_session:
+        full_assembly = full_session.assemble_standard_neumann(
+            frequency_hz,
+            k_real,
+            np.ones(2, dtype=np.complex64),
+            operation_id="full-assembly",
+        )
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_xy_half_buffers(),
+        work_dir=tmp_path / "native-half-corrected-xy-session",
+        session_id="native-half-corrected-xy-test",
+        symmetry_plane="xy",
+    ) as half_session:
+        half_assembly = half_session.assemble_standard_neumann(
+            frequency_hz,
+            k_real,
+            np.array([1.0 + 0.0j], dtype=np.complex64),
+            operation_id="half-assembly",
+        )
+
+    full_matrix, full_rhs = _read_complex_assembly(full_assembly)
+    half_matrix, half_rhs = _read_complex_assembly(half_assembly)
+    row_orbits = [
+        np.array([0], dtype=np.int64),
+        np.array([1], dtype=np.int64),
+        np.array([2, 3], dtype=np.int64),
+    ]
+    even_full_matrix, even_full_rhs = orbit_reduce_matrix_rhs(
+        full_matrix,
+        full_rhs,
+        row_orbits,
+    )
+
+    assert np.linalg.norm(half_matrix - even_full_matrix) / np.linalg.norm(
+        even_full_matrix
+    ) < 1.0e-6
+    assert np.linalg.norm(half_rhs - even_full_rhs) / np.linalg.norm(
+        even_full_rhs
+    ) < 1.0e-6
+
+    result = json.loads(
+        (
+            tmp_path
+            / "native-half-corrected-xy-session"
+            / "half-assembly"
+            / "assembly-result.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert result["symmetry_plane"] == "xy"
+    assert result["duffy_corrections"]["image_singular_correction"] is True
+    assert result["duffy_corrections"]["image_adjacent_pairs"] >= 1
 
 
 def test_native_executable_gpu_duffy_matches_cpu_duffy_on_tiny_mesh(

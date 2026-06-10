@@ -1988,15 +1988,17 @@ inline float2 regular_dlp_entry(
             float sb = basis_value(qx[b], qy[b], trialLocal);
             float weight = tb * sb * qw[a] * qw[b] * jac;
             acc += helmholtz_dlp(trialPoint - testPoint, normal, k) * weight;
-            for (int mask = 1; mask <= 7; ++mask) {
-                if (!has_image_mask(symmetryPlane, mask)) {
-                    continue;
+            if (symmetryPlane != 0) {
+                for (int mask = 1; mask <= 7; ++mask) {
+                    if (!has_image_mask(symmetryPlane, mask)) {
+                        continue;
+                    }
+                    acc += helmholtz_dlp(
+                        mirror_point(trialPoint, mask) - testPoint,
+                        mirror_normal(normal, mask),
+                        k
+                    ) * weight;
                 }
-                acc += helmholtz_dlp(
-                    mirror_point(trialPoint, mask) - testPoint,
-                    mirror_normal(normal, mask),
-                    k
-                ) * weight;
             }
         }
     }
@@ -2027,14 +2029,16 @@ inline float2 regular_slp_entry(
                 px, py, pz, triangles, nTriangles, trialTri, qx[b], qy[b]);
             float weight = tb * qw[a] * qw[b] * jac;
             acc += helmholtz_g(trialPoint - testPoint, k) * weight;
-            for (int mask = 1; mask <= 7; ++mask) {
-                if (!has_image_mask(symmetryPlane, mask)) {
-                    continue;
+            if (symmetryPlane != 0) {
+                for (int mask = 1; mask <= 7; ++mask) {
+                    if (!has_image_mask(symmetryPlane, mask)) {
+                        continue;
+                    }
+                    acc += helmholtz_g(
+                        mirror_point(trialPoint, mask) - testPoint,
+                        k
+                    ) * weight;
                 }
-                acc += helmholtz_g(
-                    mirror_point(trialPoint, mask) - testPoint,
-                    k
-                ) * weight;
             }
         }
     }
@@ -2232,26 +2236,28 @@ kernel void assemble_pair_blocks_regular(
             localDlp20 += d * (tb2 * sb0);
             localDlp21 += d * (tb2 * sb1);
             localDlp22 += d * (tb2 * sb2);
-            for (int mask = 1; mask <= 7; ++mask) {
-                if (!has_image_mask(params.symmetryPlane, mask)) {
-                    continue;
+            if (params.symmetryPlane != 0) {
+                for (int mask = 1; mask <= 7; ++mask) {
+                    if (!has_image_mask(params.symmetryPlane, mask)) {
+                        continue;
+                    }
+                    float3 imagePoint = mirror_point(trialPoint, mask);
+                    float3 imageNormal = mirror_normal(normal, mask);
+                    float2 imageG = helmholtz_g(imagePoint - testPoint, params.k) * weight;
+                    float2 imageD = helmholtz_dlp(imagePoint - testPoint, imageNormal, params.k) * weight;
+                    localSlp0 += imageG * tb0;
+                    localSlp1 += imageG * tb1;
+                    localSlp2 += imageG * tb2;
+                    localDlp00 += imageD * (tb0 * sb0);
+                    localDlp01 += imageD * (tb0 * sb1);
+                    localDlp02 += imageD * (tb0 * sb2);
+                    localDlp10 += imageD * (tb1 * sb0);
+                    localDlp11 += imageD * (tb1 * sb1);
+                    localDlp12 += imageD * (tb1 * sb2);
+                    localDlp20 += imageD * (tb2 * sb0);
+                    localDlp21 += imageD * (tb2 * sb1);
+                    localDlp22 += imageD * (tb2 * sb2);
                 }
-                float3 imagePoint = mirror_point(trialPoint, mask);
-                float3 imageNormal = mirror_normal(normal, mask);
-                float2 imageG = helmholtz_g(imagePoint - testPoint, params.k) * weight;
-                float2 imageD = helmholtz_dlp(imagePoint - testPoint, imageNormal, params.k) * weight;
-                localSlp0 += imageG * tb0;
-                localSlp1 += imageG * tb1;
-                localSlp2 += imageG * tb2;
-                localDlp00 += imageD * (tb0 * sb0);
-                localDlp01 += imageD * (tb0 * sb1);
-                localDlp02 += imageD * (tb0 * sb2);
-                localDlp10 += imageD * (tb1 * sb0);
-                localDlp11 += imageD * (tb1 * sb1);
-                localDlp12 += imageD * (tb1 * sb2);
-                localDlp20 += imageD * (tb2 * sb0);
-                localDlp21 += imageD * (tb2 * sb1);
-                localDlp22 += imageD * (tb2 * sb2);
             }
         }
     }
@@ -2333,15 +2339,17 @@ kernel void evaluate_field_regular(
             float2 slp = helmholtz_g(sourcePoint - obsPoint, params.k);
             float weight = qw[q] * jac;
             acc += (c_mul(dlp, pressure) - c_mul(slp, gTri)) * weight;
-            for (int mask = 1; mask <= 7; ++mask) {
-                if (!has_image_mask(params.symmetryPlane, mask)) {
-                    continue;
+            if (params.symmetryPlane != 0) {
+                for (int mask = 1; mask <= 7; ++mask) {
+                    if (!has_image_mask(params.symmetryPlane, mask)) {
+                        continue;
+                    }
+                    float3 imagePoint = mirror_point(sourcePoint, mask);
+                    float3 imageNormal = mirror_normal(normal, mask);
+                    float2 imageDlp = helmholtz_dlp(imagePoint - obsPoint, imageNormal, params.k);
+                    float2 imageSlp = helmholtz_g(imagePoint - obsPoint, params.k);
+                    acc += (c_mul(imageDlp, pressure) - c_mul(imageSlp, gTri)) * weight;
                 }
-                float3 imagePoint = mirror_point(sourcePoint, mask);
-                float3 imageNormal = mirror_normal(normal, mask);
-                float2 imageDlp = helmholtz_dlp(imagePoint - obsPoint, imageNormal, params.k);
-                float2 imageSlp = helmholtz_g(imagePoint - obsPoint, params.k);
-                acc += (c_mul(imageDlp, pressure) - c_mul(imageSlp, gTri)) * weight;
             }
         }
     }
