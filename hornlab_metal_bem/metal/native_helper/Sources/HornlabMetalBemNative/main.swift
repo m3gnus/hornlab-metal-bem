@@ -83,6 +83,13 @@ func requireInt(_ object: [String: Any], _ key: String) throws -> Int {
     try fail("\(key) must be an integer")
 }
 
+func requireDouble(_ object: [String: Any], _ key: String) throws -> Double {
+    if let value = object[key] as? NSNumber {
+        return value.doubleValue
+    }
+    try fail("\(key) must be a number")
+}
+
 func requireString(_ object: [String: Any], _ key: String) throws -> String {
     guard let value = object[key] as? String else {
         try fail("\(key) must be a string")
@@ -234,17 +241,7 @@ func validateSession(_ manifest: [String: Any]) throws -> [String: Any] {
     if dp0DofCount != nTriangles {
         try fail("space.dp0_dof_count must equal n_triangles")
     }
-    let scope = manifest["assembly_scope"] as? [String: Any]
-    var symmetryPlane: Any = NSNull()
-    if let rawPlane = scope?["symmetry_plane"], !(rawPlane is NSNull) {
-        guard let plane = rawPlane as? String else {
-            try fail("assembly_scope.symmetry_plane must be null or a string")
-        }
-        if plane != "yz" && plane != "xz" && plane != "xy" && plane != "yz+xz" {
-            try fail("native symmetry currently supports yz, xz, xy, and yz+xz")
-        }
-        symmetryPlane = plane
-    }
+    let symmetryPlane = try parseSymmetryPlane(manifest)
 
     return [
         "schema": schema,
@@ -255,9 +252,23 @@ func validateSession(_ manifest: [String: Any]) throws -> [String: Any] {
         "n_triangles": nTriangles,
         "p1_dof_count": p1DofCount,
         "dp0_dof_count": dp0DofCount,
-        "symmetry_plane": symmetryPlane,
+        "symmetry_plane": symmetryPlane.map { $0 as Any } ?? NSNull(),
         "status": "ok",
     ]
+}
+
+func parseSymmetryPlane(_ manifest: [String: Any]) throws -> String? {
+    let scope = manifest["assembly_scope"] as? [String: Any]
+    guard let rawPlane = scope?["symmetry_plane"], !(rawPlane is NSNull) else {
+        return nil
+    }
+    guard let plane = rawPlane as? String else {
+        try fail("assembly_scope.symmetry_plane must be null or a string")
+    }
+    if plane != "yz" && plane != "xz" && plane != "xy" && plane != "yz+xz" {
+        try fail("native symmetry currently supports yz, xz, xy, and yz+xz")
+    }
+    return plane
 }
 
 struct Complex32 {
@@ -490,15 +501,6 @@ struct Geometry {
         return weight
     }
 
-    func dofPoint(_ dof: Int) -> (Float, Float, Float)? {
-        for tri in 0..<nTriangles {
-            for local in 0..<3 where p1Dof(tri, local) == dof {
-                let vertex = triangleVertex(tri, local)
-                return (px[vertex], py[vertex], pz[vertex])
-            }
-        }
-        return nil
-    }
 }
 
 func readGeometry(_ sessionManifestPath: String) throws -> Geometry {
@@ -547,17 +549,7 @@ func readGeometry(_ sessionManifestPath: String) throws -> Geometry {
         try descriptorPath(root: root, descriptor: normalsDesc),
         expectedCount: 3 * nTriangles
     )
-    let scope = manifest["assembly_scope"] as? [String: Any]
-    var symmetryPlane: String? = nil
-    if let rawPlane = scope?["symmetry_plane"], !(rawPlane is NSNull) {
-        guard let plane = rawPlane as? String else {
-            try fail("assembly_scope.symmetry_plane must be null or a string")
-        }
-        if plane != "yz" && plane != "xz" && plane != "xy" && plane != "yz+xz" {
-            try fail("native symmetry currently supports yz, xz, xy, and yz+xz")
-        }
-        symmetryPlane = plane
-    }
+    let symmetryPlane = try parseSymmetryPlane(manifest)
 
     return Geometry(
         root: root,
@@ -751,35 +743,8 @@ func mirrorNormal(_ normal: (Float, Float, Float), mask: Int) -> (Float, Float, 
     )
 }
 
-func imageCount(_ symmetryPlane: String?) -> Int {
-    mirrorMasks(symmetryPlane).count
-}
-
 func symmetryImageMasks(_ symmetryPlane: String?) -> [Int] {
     mirrorMasks(symmetryPlane)
-}
-
-func symmetryRowWeight(_ geom: Geometry, row: Int) -> Float {
-    geom.symmetryRowWeight(row)
-}
-
-func symmetryDofWeight(_ geom: Geometry, triangle: Int, local: Int) -> Float {
-    let row = geom.p1Dof(triangle, local)
-    return geom.symmetryRowWeight(row)
-}
-
-func mirrorPoint(_ point: (Float, Float, Float), symmetryPlane: String?) -> (Float, Float, Float) {
-    guard let mask = mirrorMasks(symmetryPlane).first else {
-        return point
-    }
-    return mirrorPoint(point, mask: mask)
-}
-
-func mirrorNormal(_ normal: (Float, Float, Float), symmetryPlane: String?) -> (Float, Float, Float) {
-    guard let mask = mirrorMasks(symmetryPlane).first else {
-        return normal
-    }
-    return mirrorNormal(normal, mask: mask)
 }
 
 func readComplexVector(root: String, descriptors: [String: Any], count: Int) throws -> [Complex32] {
@@ -1334,7 +1299,11 @@ func buildDuffyReductionPlan(geom: Geometry, pairList: DuffyPairList) -> DuffyRe
             let row = geom.p1Dof(pair.test, i)
             let slpIndex = pairIndex + i * pairCount
             rhsRows[slpIndex] = row
-            rowWeights[slpIndex] = geom.symmetryPlane == nil ? geom.symmetryRowWeight(row) : 1.0
+            // Duffy deltas are applied at weight 1: with symmetry, the pair list
+            // enumerates (testImageMask, trialImageMask) combinations explicitly,
+            // which already produces the same 2^planes factor that p1_row_weight
+            // applies to the regular assembly.
+            rowWeights[slpIndex] = 1.0
             for j in 0..<3 {
                 let col = geom.p1Dof(pair.trial, j)
                 let deltaIndex = pairIndex + (i * 3 + j) * pairCount
@@ -1621,7 +1590,8 @@ func applyDuffyCorrectionsCPU(
 
         for i in 0..<3 {
             let row = geom.p1Dof(pair.test, i)
-            let rowWeight = geom.symmetryPlane == nil ? geom.symmetryRowWeight(row) : 1.0
+            // Weight 1: image-mask pair enumeration already carries the symmetry factor.
+            let rowWeight: Float = 1.0
             let slpDelta = singular.slp[i] - regular.slp[i]
             let rhsDelta = (slpDelta * gTrial) * rowWeight
             rhsRe[row] += rhsDelta.re
@@ -1738,7 +1708,8 @@ func applyDuffyCorrections(
             let gTrial = neumann[pair.trial]
             for i in 0..<3 {
                 let row = geom.p1Dof(pair.test, i)
-                let rowWeight: Float = geom.symmetryPlane == nil ? geom.symmetryRowWeight(row) : 1.0
+                // Weight 1: image-mask pair enumeration already carries the symmetry factor.
+                let rowWeight: Float = 1.0
                 let slpDelta = Complex32(
                     re: blocks.slpRe[pairIndex + i * pairCount],
                     im: blocks.slpIm[pairIndex + i * pairCount]
@@ -2089,43 +2060,6 @@ kernel void assemble_matrix_regular(
     }
     outRe[idx] = acc.x * rowWeight;
     outIm[idx] = acc.y * rowWeight;
-}
-
-kernel void assemble_rhs_regular(
-    device float *outRe [[buffer(0)]],
-    device float *outIm [[buffer(1)]],
-    device const float *px [[buffer(2)]],
-    device const float *py [[buffer(3)]],
-    device const float *pz [[buffer(4)]],
-    device const int *triangles [[buffer(5)]],
-    device const float *areas [[buffer(6)]],
-    device const int *incTri [[buffer(7)]],
-    device const int *incLoc [[buffer(8)]],
-    device const int *counts [[buffer(9)]],
-    device const float *neumannRe [[buffer(10)]],
-    device const float *neumannIm [[buffer(11)]],
-    constant Params &params [[buffer(12)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    if (gid >= uint(params.nDof)) {
-        return;
-    }
-    int row = int(gid);
-    float2 acc = float2(0.0f, 0.0f);
-    float rowWeight = p1_row_weight(
-        row, px, py, triangles, incTri, incLoc, params);
-    for (int rs = 0; rs < counts[row]; ++rs) {
-        int testTri = incTri[row * params.maxInc + rs];
-        int testLocal = incLoc[row * params.maxInc + rs];
-        for (int trialTri = 0; trialTri < params.nTriangles; ++trialTri) {
-            float2 slp = regular_slp_entry(
-                px, py, pz, triangles, areas, params.nTriangles,
-                testTri, trialTri, testLocal, params.symmetryPlane, params.k);
-            acc += c_mul(slp, float2(neumannRe[trialTri], neumannIm[trialTri]));
-        }
-    }
-    outRe[row] = acc.x * rowWeight;
-    outIm[row] = acc.y * rowWeight;
 }
 
 kernel void assemble_rhs_source_regular(
@@ -4218,7 +4152,7 @@ func assembleStandardNeumann(
     if try requireString(payload, "op") != "assemble_standard_neumann" {
         try fail("expected assemble_standard_neumann op")
     }
-    let k = Float((payload["k_real_f32"] as? NSNumber)?.doubleValue ?? 0)
+    let k = Float(try requireDouble(payload, "k_real_f32"))
     let neumann = try readComplexVector(
         root: geom.root,
         descriptors: try requireObject(payload, "neumann_dp0"),
@@ -4370,7 +4304,7 @@ func assembleStandardNeumannBatch(
     var totalAssemblySeconds = 0.0
     var totalRegularSeconds = 0.0
     for casePayload in cases {
-        let k = Float((casePayload["k_real_f32"] as? NSNumber)?.doubleValue ?? 0)
+        let k = Float(try requireDouble(casePayload, "k_real_f32"))
         let neumann = try readComplexVector(
             root: geom.root,
             descriptors: try requireObject(casePayload, "neumann_dp0"),
@@ -4461,7 +4395,7 @@ func assembleSolveStandardNeumannBatch(
     var totalDenseSolveSeconds = 0.0
 
     for casePayload in cases {
-        let k = Float((casePayload["k_real_f32"] as? NSNumber)?.doubleValue ?? 0)
+        let k = Float(try requireDouble(casePayload, "k_real_f32"))
         let neumann = try readComplexVector(
             root: geom.root,
             descriptors: try requireObject(casePayload, "neumann_dp0"),
@@ -4602,8 +4536,11 @@ func assembleSolveEvaluateStandardNeumannBatch(
             "path"
         )
     }
-    if let firstObservationPath = observationPaths.first,
-       observationPaths.allSatisfy({ $0 == firstObservationPath }) {
+    let allObservationPathsShared = observationPaths.allSatisfy { $0 == observationPaths[0] }
+    if batchFieldReDesc != nil && !allObservationPathsShared {
+        try fail("batch_outputs requires every case to use the same observation_points file")
+    }
+    if !observationPaths.isEmpty && allObservationPathsShared {
         let points = try readObservationPoints(
             root: geom.root,
             descriptor: try requireObject(cases[0], "observation_points")
@@ -4615,7 +4552,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
     }
 
     for (caseIndex, casePayload) in cases.enumerated() {
-        let k = Float((casePayload["k_real_f32"] as? NSNumber)?.doubleValue ?? 0)
+        let k = Float(try requireDouble(casePayload, "k_real_f32"))
         let neumann = try readComplexVector(
             root: geom.root,
             descriptors: try requireObject(casePayload, "neumann_dp0"),
@@ -4692,9 +4629,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
         }
         let fieldReValues = field.values.map { $0.re }
         let fieldImValues = field.values.map { $0.im }
-        if let batchFieldReDesc, let batchFieldImDesc {
-            _ = batchFieldReDesc
-            _ = batchFieldImDesc
+        if batchFieldReDesc != nil {
             batchFieldReValues.append(contentsOf: fieldReValues)
             batchFieldImValues.append(contentsOf: fieldImValues)
         } else if let fieldReDesc, let fieldImDesc {
@@ -4841,7 +4776,7 @@ func evaluateStandardExterior(
     if try requireString(payload, "op") != "evaluate_standard_exterior" {
         try fail("expected evaluate_standard_exterior op")
     }
-    let k = Float((payload["k_real_f32"] as? NSNumber)?.doubleValue ?? 0)
+    let k = Float(try requireDouble(payload, "k_real_f32"))
     let pressure = try readComplexVector(
         root: geom.root,
         descriptors: try requireObject(payload, "pressure_p1"),
@@ -4963,7 +4898,7 @@ func evaluateStandardExteriorBatch(
     caseResults.reserveCapacity(cases.count)
     var totalFieldSeconds = 0.0
     for casePayload in cases {
-        let k = Float((casePayload["k_real_f32"] as? NSNumber)?.doubleValue ?? 0)
+        let k = Float(try requireDouble(casePayload, "k_real_f32"))
         let pressure = try readComplexVector(
             root: geom.root,
             descriptors: try requireObject(casePayload, "pressure_p1"),
@@ -5051,7 +4986,9 @@ func main(_ args: [String]) throws {
         try smoke()
         return
     }
-    let op = args[0]
+    guard let op = args.first else {
+        try fail("usage: HornlabMetalBemNative <operation> <session.json> [<payload.json>] <result.json>")
+    }
     if op == "validate_session" {
         guard args.count == 3 else {
             try fail("usage: HornlabMetalBemNative.swift validate_session <session.json> <result.json>")

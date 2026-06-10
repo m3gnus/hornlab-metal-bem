@@ -1747,6 +1747,47 @@ def test_native_executable_corrected_xy_symmetry_applies_image_duffy(
     assert result["duffy_corrections"]["image_adjacent_pairs"] >= 1
 
 
+def test_native_executable_rejects_payload_without_wavenumber(tmp_path):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available or status.helper_executable_path is None:
+        pytest.skip("compiled native helper unavailable")
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_geometry_buffers(),
+        work_dir=tmp_path / "native-missing-k-session",
+        session_id="native-missing-k-test",
+    ) as session:
+        session.assemble_standard_neumann(
+            100.0,
+            1.8318326,
+            np.array([1.0 + 0.0j, 0.0 + 0.5j], dtype=np.complex64),
+            operation_id="seed-assembly",
+        )
+        op_dir = session.info.work_dir / "seed-assembly"
+        payload_path = op_dir / "assembly.json"
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        del payload["k_real_f32"]
+        doctored_path = op_dir / "assembly-missing-k.json"
+        doctored_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        import subprocess
+
+        completed = subprocess.run(
+            [
+                str(status.helper_executable_path),
+                "assemble_standard_neumann",
+                str(session.info.manifest_path),
+                str(doctored_path),
+                str(op_dir / "missing-k-result.json"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+    assert completed.returncode != 0
+    assert "k_real_f32" in completed.stderr + completed.stdout
+
+
 def test_native_executable_gpu_duffy_matches_cpu_duffy_on_tiny_mesh(
     monkeypatch,
     tmp_path,

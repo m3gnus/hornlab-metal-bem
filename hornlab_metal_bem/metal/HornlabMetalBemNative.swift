@@ -17,16 +17,13 @@ process.arguments = [
     "HornlabMetalBemNative",
 ] + Array(CommandLine.arguments.dropFirst())
 
-let stdout = Pipe()
-let stderr = Pipe()
-process.standardOutput = stdout
-process.standardError = stderr
+// Let the child inherit stdout/stderr directly. Buffering through Pipe()
+// and draining only after waitUntilExit() deadlocks once the child writes
+// more than the pipe buffer (e.g. swift build progress or a long error).
 
 do {
     try process.run()
     process.waitUntilExit()
-    FileHandle.standardOutput.write(stdout.fileHandleForReading.readDataToEndOfFile())
-    FileHandle.standardError.write(stderr.fileHandleForReading.readDataToEndOfFile())
     exit(process.terminationStatus)
 } catch {
     FileHandle.standardError.write(Data("failed to run packaged native helper: \(error)\n".utf8))
