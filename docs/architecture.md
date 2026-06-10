@@ -73,6 +73,11 @@ set, it runs one-frequency native batches so streaming callbacks and early stop
 can be honored. Streaming callback entries include normalized directivity and
 complex observation pressure for the solved frequency.
 
+"Resident" refers to buffer and pipeline reuse across the cases of a single
+helper invocation: each operation manifest launches one helper process. The
+batch path therefore pays Metal device/pipeline setup and geometry upload
+once per sweep, while the streaming path pays it once per frequency.
+
 ## Boundary Lab Adapter
 
 `boundary_lab.py` exposes backend id `hornlab_metal`.

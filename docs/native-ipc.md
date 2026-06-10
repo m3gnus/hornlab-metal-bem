@@ -48,7 +48,7 @@ The create-session geometry manifest contains:
 - `mesh.triangle_normals_3xm_f32`: shape `(3, n_triangles)`, float32
 - `space.p1_dof_count`: positive integer
 - `space.dp0_dof_count`: must equal `n_triangles`
-- `assembly_scope.symmetry_plane`: `null`, `yz`, `xz`, or `yz+xz`
+- `assembly_scope.symmetry_plane`: `null`, `yz`, `xz`, `xy`, or `yz+xz`
 
 All triangle indices and DOF indices are zero-based at the Python/native
 boundary.

@@ -79,7 +79,7 @@ Common fields:
 - `observation`, an `ObservationConfig`
 - `mesh_scale`
 - `air_density`
-- `native_symmetry_plane`, one of `None`, `"yz"`, `"xz"`, or `"yz+xz"`
+- `native_symmetry_plane`, one of `None`, `"yz"`, `"xz"`, `"xy"`, or `"yz+xz"`
 - `return_surface_pressure`, opt-in full solved P1 surface pressure output
 - `progress_callback`
 - `on_frequency_result`, for streaming/early stop; entries include complex
@@ -127,7 +127,9 @@ Key result fields:
 - `pressure_complex`: `(F, P, N)` complex pressure at observation points
 - `directivity_db`: `(F, P, N)` directivity normalized so the on-axis angle is `0 dB`
 - `spl_norm_db`: alias for `directivity_db`
-- `impedance`: `(F,)` complex throat impedance normalized to `rho*c`
+- `impedance`: `(F,)` area-weighted average complex surface pressure on the
+  impedance source tag, in pascals per unit drive (not divided by drive
+  velocity and not normalized to `rho*c`)
 - `observation_angles_deg`: `(N,)` polar angles in degrees
 - `observation_points`: `(P, N, 3)` observation coordinates in metres
 - `observation_planes`: plane names matching axis `P`
