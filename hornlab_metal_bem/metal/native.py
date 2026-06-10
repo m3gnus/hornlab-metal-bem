@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 import os
 from pathlib import Path
 import platform
@@ -14,6 +15,8 @@ from uuid import uuid4
 
 import numpy as np
 from numpy.typing import NDArray
+
+logger = logging.getLogger(__name__)
 
 
 _DEFAULT_SWIFT_ENV_VAR = "HORNLAB_METAL_BEM_SWIFT"
@@ -37,6 +40,11 @@ class MetalNativeRuntimeConfig:
     native_package_dir: str = _DEFAULT_NATIVE_PACKAGE_DIR
     native_binary_name: str = _DEFAULT_NATIVE_BINARY_NAME
     smoke_timeout_s: float = _DEFAULT_SMOKE_TIMEOUT_S
+
+    # Wall-clock limit for one helper operation (assembly/solve/field batch).
+    # None means unbounded, matching dense solves whose runtime scales with
+    # mesh size; set a limit to turn a wedged GPU/helper hang into an error.
+    operation_timeout_s: float | None = None
 
     @property
     def resolved_backend_dir(self) -> Path:
@@ -231,11 +239,13 @@ class MetalNativeStandardSession:
         *,
         owns_work_dir: bool,
         runtime_config: MetalNativeRuntimeConfig | None,
+        extra_env: dict[str, str] | None = None,
     ) -> None:
         self.info = info
         self.geometry_payload = geometry_payload
         self._owns_work_dir = owns_work_dir
         self._runtime_config = runtime_config
+        self._extra_env = dict(extra_env) if extra_env else None
         self._closed = False
 
     @classmethod
@@ -255,13 +265,30 @@ class MetalNativeStandardSession:
         duffy_1d_order: int = 4,
         precision: str = "complex64",
         symmetry_plane: str | None = None,
+        runtime_status: MetalNativeRuntimeStatus | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> "MetalNativeStandardSession":
-        """Create a Python-written session after native helper discovery."""
+        """Create a Python-written session after native helper discovery.
+
+        Pass an already-validated ``runtime_status`` to skip the discovery
+        smoke test (a helper subprocess) when the caller just ran one.
+        """
         from .geometry import build_metal_geometry_buffers
         from .geometry import validate_native_symmetry_plane
         from .session import GeometryPayload, write_geometry_buffers, write_json_manifest
 
-        status = discover_native_runtime(runtime_config, run_smoke_test=True)
+        # The native helper currently hardcodes its quadrature rules; these
+        # manifest fields are recorded but not yet honored, so reject silent
+        # accuracy expectations until the helper reads them.
+        if regular_triangle_order != 4 or duffy_1d_order != 4:
+            raise ValueError(
+                "regular_triangle_order and duffy_1d_order are fixed at 4; "
+                "the native helper does not yet honor quadrature overrides"
+            )
+
+        status = runtime_status
+        if status is None or not status.available:
+            status = discover_native_runtime(runtime_config, run_smoke_test=True)
         if not status.available:
             raise RuntimeError(
                 "Swift/Metal native helper is unavailable for session creation: "
@@ -287,28 +314,34 @@ class MetalNativeStandardSession:
 
         session_id = session_id or f"native-metal-{uuid4().hex[:12]}"
         owns_work_dir = work_dir is None and not keep_artifacts
+        created_temp_dir = work_dir is None
         root = (
             Path(tempfile.mkdtemp(prefix="hornlab-native-metal-session-"))
             if work_dir is None
             else Path(work_dir)
         )
-        geometry_dir = root / "geometry"
-        mesh = write_geometry_buffers(
-            geometry_buffers,
-            geometry_dir,
-            relative_to=root,
-        )
-        payload = GeometryPayload(
-            session_id=session_id,
-            mesh=mesh,
-            p1_dof_count=geometry_buffers.p1_dof_count,
-            dp0_dof_count=geometry_buffers.dp0_dof_count,
-            regular_triangle_order=regular_triangle_order,
-            duffy_1d_order=duffy_1d_order,
-            precision=precision,
-            symmetry_plane=symmetry_plane,
-        )
-        manifest_path = write_json_manifest(payload, root / "session.json")
+        try:
+            geometry_dir = root / "geometry"
+            mesh = write_geometry_buffers(
+                geometry_buffers,
+                geometry_dir,
+                relative_to=root,
+            )
+            payload = GeometryPayload(
+                session_id=session_id,
+                mesh=mesh,
+                p1_dof_count=geometry_buffers.p1_dof_count,
+                dp0_dof_count=geometry_buffers.dp0_dof_count,
+                regular_triangle_order=regular_triangle_order,
+                duffy_1d_order=duffy_1d_order,
+                precision=precision,
+                symmetry_plane=symmetry_plane,
+            )
+            manifest_path = write_json_manifest(payload, root / "session.json")
+        except BaseException:
+            if created_temp_dir:
+                shutil.rmtree(root, ignore_errors=True)
+            raise
         info = MetalNativeSessionInfo(
             session_id=session_id,
             work_dir=root,
@@ -321,6 +354,7 @@ class MetalNativeStandardSession:
             payload,
             owns_work_dir=owns_work_dir,
             runtime_config=runtime_config,
+            extra_env=extra_env,
         )
 
     def validate_contract(self, *, result_name: str = "native-result.json") -> dict[str, Any]:
@@ -1209,6 +1243,12 @@ class MetalNativeStandardSession:
                 str(result_path),
             )
         ]
+        timeout_s = (
+            self._runtime_config or MetalNativeRuntimeConfig()
+        ).operation_timeout_s
+        env = None
+        if self._extra_env:
+            env = {**os.environ, **self._extra_env}
         try:
             result = subprocess.run(
                 command,
@@ -1216,7 +1256,13 @@ class MetalNativeStandardSession:
                 check=False,
                 capture_output=True,
                 text=True,
+                timeout=timeout_s,
+                env=env,
             )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Swift/Metal native helper timed out after {timeout_s}s during {op}"
+            ) from exc
         except OSError as exc:
             raise RuntimeError(
                 f"Failed to launch Swift/Metal native helper: {exc}"
@@ -1254,19 +1300,43 @@ def _find_helper_executable(
 ) -> tuple[Path | None, str | None]:
     if config.helper_executable:
         helper = Path(config.helper_executable)
-        return (helper if helper.is_file() else None), "explicit"
+        if not helper.is_file():
+            raise ValueError(
+                f"helper_executable {helper} does not exist or is not a file"
+            )
+        return helper, "explicit"
 
     env_path = os.environ.get(config.helper_env_var)
     if env_path:
         helper = Path(env_path)
-        return (helper if helper.is_file() else None), config.helper_env_var
+        if helper.is_file():
+            return helper, config.helper_env_var
+        logger.warning(
+            "%s points at %s, which does not exist; falling back to "
+            "compiled-package discovery",
+            config.helper_env_var,
+            helper,
+        )
 
     candidates = (
         native_package_dir / ".build" / "release" / config.native_binary_name,
         native_package_dir / ".build" / "debug" / config.native_binary_name,
     )
+    main_source = (
+        native_package_dir / "Sources" / config.native_binary_name / "main.swift"
+    )
     for candidate in candidates:
         if candidate.is_file():
+            if (
+                main_source.is_file()
+                and candidate.stat().st_mtime < main_source.stat().st_mtime
+            ):
+                logger.warning(
+                    "Native helper binary %s is older than %s; numeric changes "
+                    "in the source are not active until `swift build -c release`",
+                    candidate,
+                    main_source,
+                )
             return candidate, "swift-package"
 
     return None, None
@@ -1448,4 +1518,9 @@ def _complex_map_from_manifest(value: Any) -> dict[int, complex] | None:
         return None
     if not isinstance(value, dict):
         raise ValueError("complex map manifest value must be an object")
-    return {int(key): _complex_from_manifest(raw) or 0.0j for key, raw in value.items()}
+    result: dict[int, complex] = {}
+    for key, raw in value.items():
+        if raw is None:
+            raise ValueError(f"complex map manifest entry {key!r} must not be null")
+        result[int(key)] = _complex_from_manifest(raw)
+    return result

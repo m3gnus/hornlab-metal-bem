@@ -4,7 +4,6 @@ from __future__ import annotations
 import logging
 import os
 import time
-from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -66,58 +65,39 @@ def _read_complex_f32(
     return np.ascontiguousarray(real + 1j * imag, dtype=np.complex64)
 
 
-@contextmanager
-def _native_environment(config: SolveConfig):
-    env_values: dict[str, str | None] = {
+def _native_env_overrides(config: SolveConfig) -> dict[str, str]:
+    """Helper-process environment overrides for this solve.
+
+    Passed to the helper subprocess instead of mutating os.environ so
+    concurrent solves on different threads cannot race on each other's
+    assembly mode or threadgroup overrides.
+    """
+    overrides: dict[str, str] = {
         "HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE": config.metal_native_assembly_mode,
-        "HORNLAB_METAL_BEM_NATIVE_FIELD_MODE": "optimized",
+    }
+    if os.environ.get("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE") is None:
+        overrides["HORNLAB_METAL_BEM_NATIVE_FIELD_MODE"] = "optimized"
+    threadgroup_values = {
         "HORNLAB_METAL_BEM_NATIVE_THREADS_PER_GROUP": (
-            None
-            if config.metal_native_threads_per_group is None
-            else str(config.metal_native_threads_per_group)
+            config.metal_native_threads_per_group
         ),
         "HORNLAB_METAL_BEM_NATIVE_MATRIX_THREADS_PER_GROUP": (
-            None
-            if config.metal_native_matrix_threads_per_group is None
-            else str(config.metal_native_matrix_threads_per_group)
+            config.metal_native_matrix_threads_per_group
         ),
         "HORNLAB_METAL_BEM_NATIVE_RHS_THREADS_PER_GROUP": (
-            None
-            if config.metal_native_rhs_threads_per_group is None
-            else str(config.metal_native_rhs_threads_per_group)
+            config.metal_native_rhs_threads_per_group
         ),
         "HORNLAB_METAL_BEM_NATIVE_DUFFY_THREADS_PER_GROUP": (
-            None
-            if config.metal_native_duffy_threads_per_group is None
-            else str(config.metal_native_duffy_threads_per_group)
+            config.metal_native_duffy_threads_per_group
         ),
         "HORNLAB_METAL_BEM_NATIVE_FIELD_THREADS_PER_GROUP": (
-            None
-            if config.metal_native_field_threads_per_group is None
-            else str(config.metal_native_field_threads_per_group)
+            config.metal_native_field_threads_per_group
         ),
     }
-    previous_values = {name: os.environ.get(name) for name in env_values}
-
-    os.environ["HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE"] = (
-        config.metal_native_assembly_mode
-    )
-    if previous_values["HORNLAB_METAL_BEM_NATIVE_FIELD_MODE"] is None:
-        os.environ["HORNLAB_METAL_BEM_NATIVE_FIELD_MODE"] = "optimized"
-    for name, value in env_values.items():
-        if name.endswith("_ASSEMBLY_MODE") or name.endswith("_FIELD_MODE"):
-            continue
+    for name, value in threadgroup_values.items():
         if value is not None:
-            os.environ[name] = value
-
-    try:
-        yield
-    finally:
-        for name, previous in previous_values.items():
-            if previous is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = previous
+            overrides[name] = str(value)
+    return overrides
 
 
 def _build_neumann_rows(
@@ -353,151 +333,152 @@ def run_sweep_native_metal(
     n_planes, n_angles, _ = obs_points.shape
     field_points = _field_points_3xn(obs_points)
 
-    with _native_environment(config):
-        with MetalNativeStandardSession.create_session(
-            geometry_buffers=geometry_buffers,
-            symmetry_plane=config.native_symmetry_plane,
-        ) as session:
-            if config.on_frequency_result is None:
-                freq_values = np.asarray(frequencies, dtype=np.float64)
-                k_values = (2.0 * np.pi * freq_values / SPEED_OF_SOUND).astype(
-                    np.float32,
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=geometry_buffers,
+        symmetry_plane=config.native_symmetry_plane,
+        runtime_status=runtime,
+        extra_env=_native_env_overrides(config),
+    ) as session:
+        if config.on_frequency_result is None:
+            freq_values = np.asarray(frequencies, dtype=np.float64)
+            k_values = (2.0 * np.pi * freq_values / SPEED_OF_SOUND).astype(
+                np.float32,
+            )
+            neumann_rows = _build_neumann_rows(
+                dp0_space,
+                mesh.physical_tags,
+                freq_values,
+                config,
+            )
+
+            logger.info(
+                "Running %d-frequency native Metal resident assembly/solve/field batch.",
+                len(freq_values),
+            )
+            systems = session.assemble_solve_evaluate_standard_neumann_batch(
+                freq_values,
+                k_values,
+                neumann_rows,
+                field_points,
+                batch_id="all_observation_planes",
+                operation_id="assembly-solve-field-resident-batch",
+                source_tags=source_tags,
+                impedance_source_tag=impedance_source_tag,
+                write_surface_pressure=config.return_surface_pressure,
+                write_batched_field=True,
+            )
+            field_batch_complex: NDArray[np.complex128] | None = None
+            if systems and systems[0].field_row_index is not None:
+                first = systems[0]
+                if first.field_batch_shape is None:
+                    raise RuntimeError("native batched field result missing shape")
+                field_batch_complex = _read_complex_f32(
+                    Path(first.field_real_f32),
+                    Path(first.field_imag_f32),
+                    tuple(first.field_batch_shape),
+                ).astype(np.complex128)
+
+            for i, (freq, system) in enumerate(zip(freq_values, systems)):
+                frequency_hz = float(freq)
+                timing_s = (
+                    float(system.assembly_s)
+                    + float(system.dense_solve_s)
+                    + float(system.field_s)
                 )
-                neumann_rows = _build_neumann_rows(
+                _append_system_result(
+                    frequency_hz=frequency_hz,
+                    system=system,
+                    backend="native_metal_resident_assembly_solve_field_batch",
+                    timing_s=timing_s,
+                    mesh=mesh,
+                    p1_space=p1_space,
+                    source_tags=source_tags,
+                    impedance_source_tag=impedance_source_tag,
+                    n_planes=n_planes,
+                    n_angles=n_angles,
+                    on_axis_idx=on_axis_idx,
+                    field_batch_complex=field_batch_complex,
+                    surface_pavg=surface_pavg,
+                    pressure_rows=pressure_rows,
+                    spl_rows=spl_rows,
+                    impedance_rows=impedance_rows,
+                    surface_pressure_rows=surface_pressure_rows,
+                    native_diagnostics_rows=native_diagnostics_rows,
+                    solver_log=solver_log,
+                    completed_freqs=completed_freqs,
+                )
+                if config.progress_callback is not None:
+                    config.progress_callback(i, len(freq_values), frequency_hz)
+        else:
+            for i, freq in enumerate(frequencies):
+                frequency_hz = float(freq)
+                logger.info(
+                    "[%d/%d] %.1f Hz (native Metal %s assembly)",
+                    i + 1,
+                    len(frequencies),
+                    frequency_hz,
+                    config.metal_native_assembly_mode,
+                )
+                t_freq = time.time()
+                omega = 2.0 * np.pi * frequency_hz
+                k_real = omega / SPEED_OF_SOUND
+                neumann = _build_driver_neumann_coeffs(
                     dp0_space,
                     mesh.physical_tags,
-                    freq_values,
+                    omega,
                     config,
+                    np.complex64,
                 )
-
-                logger.info(
-                    "Running %d-frequency native Metal resident assembly/solve/field batch.",
-                    len(freq_values),
-                )
-                systems = session.assemble_solve_evaluate_standard_neumann_batch(
-                    freq_values,
-                    k_values,
-                    neumann_rows,
+                system = session.assemble_solve_evaluate_standard_neumann_batch(
+                    np.array([frequency_hz], dtype=np.float64),
+                    np.array([k_real], dtype=np.float32),
+                    neumann.reshape(1, -1),
                     field_points,
                     batch_id="all_observation_planes",
-                    operation_id="assembly-solve-field-resident-batch",
+                    operation_id=(
+                        f"assembly-solve-field-{i:04d}-"
+                        f"{frequency_hz:.6g}hz-all-planes"
+                    ),
                     source_tags=source_tags,
                     impedance_source_tag=impedance_source_tag,
                     write_surface_pressure=config.return_surface_pressure,
-                    write_batched_field=True,
+                )[0]
+                elapsed = time.time() - t_freq
+                log_entry = _append_system_result(
+                    frequency_hz=frequency_hz,
+                    system=system,
+                    backend="native_metal_resident_assembly_solve_field_single",
+                    timing_s=elapsed,
+                    mesh=mesh,
+                    p1_space=p1_space,
+                    source_tags=source_tags,
+                    impedance_source_tag=impedance_source_tag,
+                    n_planes=n_planes,
+                    n_angles=n_angles,
+                    on_axis_idx=on_axis_idx,
+                    field_batch_complex=None,
+                    surface_pavg=surface_pavg,
+                    pressure_rows=pressure_rows,
+                    spl_rows=spl_rows,
+                    impedance_rows=impedance_rows,
+                    surface_pressure_rows=surface_pressure_rows,
+                    native_diagnostics_rows=native_diagnostics_rows,
+                    solver_log=solver_log,
+                    completed_freqs=completed_freqs,
                 )
-                field_batch_complex: NDArray[np.complex128] | None = None
-                if systems and systems[0].field_row_index is not None:
-                    first = systems[0]
-                    if first.field_batch_shape is None:
-                        raise RuntimeError("native batched field result missing shape")
-                    field_batch_complex = _read_complex_f32(
-                        Path(first.field_real_f32),
-                        Path(first.field_imag_f32),
-                        tuple(first.field_batch_shape),
-                    ).astype(np.complex128)
 
-                for i, (freq, system) in enumerate(zip(freq_values, systems)):
-                    frequency_hz = float(freq)
-                    timing_s = (
-                        float(system.assembly_s)
-                        + float(system.dense_solve_s)
-                        + float(system.field_s)
-                    )
-                    _append_system_result(
-                        frequency_hz=frequency_hz,
-                        system=system,
-                        backend="native_metal_resident_assembly_solve_field_batch",
-                        timing_s=timing_s,
-                        mesh=mesh,
-                        p1_space=p1_space,
-                        source_tags=source_tags,
-                        impedance_source_tag=impedance_source_tag,
-                        n_planes=n_planes,
-                        n_angles=n_angles,
-                        on_axis_idx=on_axis_idx,
-                        field_batch_complex=field_batch_complex,
-                        surface_pavg=surface_pavg,
-                        pressure_rows=pressure_rows,
-                        spl_rows=spl_rows,
-                        impedance_rows=impedance_rows,
-                        surface_pressure_rows=surface_pressure_rows,
-                        native_diagnostics_rows=native_diagnostics_rows,
-                        solver_log=solver_log,
-                        completed_freqs=completed_freqs,
-                    )
-                    if config.progress_callback is not None:
-                        config.progress_callback(i, len(freq_values), frequency_hz)
-            else:
-                for i, freq in enumerate(frequencies):
-                    frequency_hz = float(freq)
-                    logger.info(
-                        "[%d/%d] %.1f Hz (native Metal %s assembly)",
-                        i + 1,
-                        len(frequencies),
-                        frequency_hz,
-                        config.metal_native_assembly_mode,
-                    )
-                    t_freq = time.time()
-                    omega = 2.0 * np.pi * frequency_hz
-                    k_real = omega / SPEED_OF_SOUND
-                    neumann = _build_driver_neumann_coeffs(
-                        dp0_space,
-                        mesh.physical_tags,
-                        omega,
-                        config,
-                        np.complex64,
-                    )
-                    system = session.assemble_solve_evaluate_standard_neumann_batch(
-                        np.array([frequency_hz], dtype=np.float64),
-                        np.array([k_real], dtype=np.float32),
-                        neumann.reshape(1, -1),
-                        field_points,
-                        batch_id="all_observation_planes",
-                        operation_id=(
-                            f"assembly-solve-field-{i:04d}-"
-                            f"{frequency_hz:.6g}hz-all-planes"
-                        ),
-                        source_tags=source_tags,
-                        impedance_source_tag=impedance_source_tag,
-                        write_surface_pressure=config.return_surface_pressure,
-                    )[0]
-                    elapsed = time.time() - t_freq
-                    log_entry = _append_system_result(
-                        frequency_hz=frequency_hz,
-                        system=system,
-                        backend="native_metal_resident_assembly_solve_field_single",
-                        timing_s=elapsed,
-                        mesh=mesh,
-                        p1_space=p1_space,
-                        source_tags=source_tags,
-                        impedance_source_tag=impedance_source_tag,
-                        n_planes=n_planes,
-                        n_angles=n_angles,
-                        on_axis_idx=on_axis_idx,
-                        field_batch_complex=None,
-                        surface_pavg=surface_pavg,
-                        pressure_rows=pressure_rows,
-                        spl_rows=spl_rows,
-                        impedance_rows=impedance_rows,
-                        surface_pressure_rows=surface_pressure_rows,
-                        native_diagnostics_rows=native_diagnostics_rows,
-                        solver_log=solver_log,
-                        completed_freqs=completed_freqs,
-                    )
-
-                    if config.progress_callback is not None:
-                        config.progress_callback(i, len(frequencies), frequency_hz)
-                    callback_entry = {
-                        **log_entry,
-                        "observation_pressure_complex": pressure_rows[-1],
-                        "observation_directivity_db": spl_rows[-1],
-                        "observation_angles_deg": angles_deg,
-                        "observation_planes": config.observation.planes,
-                    }
-                    if config.on_frequency_result(i, frequency_hz, callback_entry) is False:
-                        logger.info("Early stop requested after %.1f Hz", frequency_hz)
-                        break
+                if config.progress_callback is not None:
+                    config.progress_callback(i, len(frequencies), frequency_hz)
+                callback_entry = {
+                    **log_entry,
+                    "observation_pressure_complex": pressure_rows[-1],
+                    "observation_directivity_db": spl_rows[-1],
+                    "observation_angles_deg": angles_deg,
+                    "observation_planes": config.observation.planes,
+                }
+                if config.on_frequency_result(i, frequency_hz, callback_entry) is False:
+                    logger.info("Early stop requested after %.1f Hz", frequency_hz)
+                    break
 
     sp_avg: dict[int, np.ndarray] = {}
     for tag in source_tags:

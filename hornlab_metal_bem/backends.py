@@ -50,12 +50,14 @@ def discover_metal_backend(
         MetalNativeRuntimeConfig(swift_executable=native_executable)
     )
     supported_platform = native_status.is_apple_silicon
-    native = native_status.swift_path
-    native_available = (
-        native_status.is_apple_silicon
-        and native_status.swift_path is not None
-        and native_status.helper_assets_present
+    native = (
+        str(native_status.helper_executable_path)
+        if native_status.helper_executable_path is not None
+        else native_status.swift_path
     )
+    # A compiled helper binary alone is sufficient; Swift is only needed for
+    # the script fallback. Mirror discover_native_runtime's own availability.
+    native_available = native_status.available
 
     reasons: list[str] = []
     if native_status.unavailable_reasons:

@@ -959,47 +959,6 @@ def _validate_batch_field_manifest(manifest: dict[str, Any]) -> None:
         _validate_field_case_manifest(case_with_obs)
 
 
-def _require_complex_vector(
-    name: str,
-    value: NDArray[Any],
-    expected_len: int,
-) -> NDArray[np.complex64]:
-    array = np.asarray(value)
-    if array.shape != (expected_len,):
-        raise ValueError(
-            f"{name} must have shape {(expected_len,)}, got {array.shape}"
-        )
-    if not np.issubdtype(array.dtype, np.complexfloating):
-        raise ValueError(f"{name} must be a complex vector")
-    if not np.all(np.isfinite(array)):
-        raise ValueError(f"{name} must contain only finite values")
-    return np.ascontiguousarray(array, dtype=np.complex64)
-
-
-def _write_complex_vector(
-    vector: NDArray[np.complex64],
-    directory: Path,
-    *,
-    real_name: str,
-    imag_name: str,
-    relative_to: Path,
-) -> dict[str, BinaryArrayDescriptor]:
-    return {
-        "real_f32": write_binary_array(
-            np.ascontiguousarray(np.real(vector), dtype=np.float32),
-            directory / real_name,
-            dtype=np.float32,
-            relative_to=relative_to,
-        ),
-        "imag_f32": write_binary_array(
-            np.ascontiguousarray(np.imag(vector), dtype=np.float32),
-            directory / imag_name,
-            dtype=np.float32,
-            relative_to=relative_to,
-        ),
-    }
-
-
 def _require_observation_points_3xn(value: NDArray[Any]) -> NDArray[np.float32]:
     points = np.asarray(value, dtype=np.float32)
     if points.ndim != 2:

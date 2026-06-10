@@ -189,8 +189,10 @@ def test_resolve_backend_raises_when_native_unavailable(monkeypatch):
 
 def test_metal_discovery_reports_native_helper(monkeypatch):
     class NativeStatus:
+        available = True
         is_apple_silicon = True
         swift_path = "/usr/bin/swift"
+        helper_executable_path = None
         helper_assets_present = True
         unavailable_reasons = ()
 
@@ -202,6 +204,23 @@ def test_metal_discovery_reports_native_helper(monkeypatch):
     assert status.native_executable == "/usr/bin/swift"
     assert status.native_helper_available is True
     assert status.reason is None
+
+
+def test_metal_discovery_available_with_compiled_helper_and_no_swift(monkeypatch):
+    class NativeStatus:
+        available = True
+        is_apple_silicon = True
+        swift_path = None
+        helper_executable_path = "/opt/helper/HornlabMetalBemNative"
+        helper_assets_present = True
+        unavailable_reasons = ()
+
+    monkeypatch.setattr(backends, "discover_native_runtime", lambda config: NativeStatus())
+
+    status = discover_metal_backend()
+
+    assert status.available is True
+    assert status.native_executable == "/opt/helper/HornlabMetalBemNative"
 
 
 def test_resolve_backend_returns_metal_when_native_discovered(monkeypatch):
