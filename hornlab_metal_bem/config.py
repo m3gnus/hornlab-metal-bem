@@ -13,7 +13,7 @@ class VelocityMode:
     ACCELERATION = "acceleration"
 
 
-NativeSymmetryPlane = Literal["yz", "xz", "yz+xz"]
+NativeSymmetryPlane = Literal["yz", "xz", "xy", "yz+xz"]
 MetalNativeAssemblyMode = Literal["corrected", "optimized"]
 
 
@@ -86,9 +86,9 @@ class SolveConfig:
             raise ValueError("freq_spacing must be 'log' or 'linear'")
         if self.velocity_mode not in {VelocityMode.VELOCITY, VelocityMode.ACCELERATION}:
             raise ValueError("velocity_mode must be 'velocity' or 'acceleration'")
-        if self.native_symmetry_plane not in {None, "yz", "xz", "yz+xz"}:
+        if self.native_symmetry_plane not in {None, "yz", "xz", "xy", "yz+xz"}:
             raise ValueError(
-                "native_symmetry_plane must be None, 'yz', 'xz', or 'yz+xz'"
+                "native_symmetry_plane must be None, 'yz', 'xz', 'xy', or 'yz+xz'"
             )
         if self.metal_native_assembly_mode not in {"corrected", "optimized"}:
             raise ValueError(

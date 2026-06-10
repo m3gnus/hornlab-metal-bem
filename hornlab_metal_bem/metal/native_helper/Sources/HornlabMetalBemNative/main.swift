@@ -240,8 +240,8 @@ func validateSession(_ manifest: [String: Any]) throws -> [String: Any] {
         guard let plane = rawPlane as? String else {
             try fail("assembly_scope.symmetry_plane must be null or a string")
         }
-        if plane != "yz" && plane != "xz" && plane != "yz+xz" {
-            try fail("native symmetry currently supports yz, xz, and yz+xz")
+        if plane != "yz" && plane != "xz" && plane != "xy" && plane != "yz+xz" {
+            try fail("native symmetry currently supports yz, xz, xy, and yz+xz")
         }
         symmetryPlane = plane
     }
@@ -464,6 +464,9 @@ struct Geometry {
         if symmetryPlane == "xz" {
             return 2
         }
+        if symmetryPlane == "xy" {
+            return 4
+        }
         if symmetryPlane == "yz+xz" {
             return 3
         }
@@ -479,6 +482,9 @@ struct Geometry {
             weight *= 2.0
         }
         if symmetryPlaneCode & 2 != 0 {
+            weight *= 2.0
+        }
+        if symmetryPlaneCode & 4 != 0 {
             weight *= 2.0
         }
         return weight
@@ -547,8 +553,8 @@ func readGeometry(_ sessionManifestPath: String) throws -> Geometry {
         guard let plane = rawPlane as? String else {
             try fail("assembly_scope.symmetry_plane must be null or a string")
         }
-        if plane != "yz" && plane != "xz" && plane != "yz+xz" {
-            try fail("native symmetry currently supports yz, xz, and yz+xz")
+        if plane != "yz" && plane != "xz" && plane != "xy" && plane != "yz+xz" {
+            try fail("native symmetry currently supports yz, xz, xy, and yz+xz")
         }
         symmetryPlane = plane
     }
@@ -720,6 +726,9 @@ func mirrorMasks(_ symmetryPlane: String?) -> [Int] {
     if symmetryPlane == "xz" {
         return [2]
     }
+    if symmetryPlane == "xy" {
+        return [4]
+    }
     if symmetryPlane == "yz+xz" {
         return [1, 2, 3]
     }
@@ -730,7 +739,7 @@ func mirrorPoint(_ point: (Float, Float, Float), mask: Int) -> (Float, Float, Fl
     (
         mask & 1 != 0 ? -point.0 : point.0,
         mask & 2 != 0 ? -point.1 : point.1,
-        point.2
+        mask & 4 != 0 ? -point.2 : point.2
     )
 }
 
@@ -738,7 +747,7 @@ func mirrorNormal(_ normal: (Float, Float, Float), mask: Int) -> (Float, Float, 
     (
         mask & 1 != 0 ? -normal.0 : normal.0,
         mask & 2 != 0 ? -normal.1 : normal.1,
-        normal.2
+        mask & 4 != 0 ? -normal.2 : normal.2
     )
 }
 
@@ -1028,7 +1037,13 @@ func vertexPoint(_ geom: Geometry, _ vertex: Int) -> (Float, Float, Float) {
 }
 
 func imageUsesReversedLocalOrder(_ mask: Int) -> Bool {
-    mask == 1 || mask == 2
+    var remaining = mask
+    var bitCount = 0
+    while remaining != 0 {
+        bitCount += remaining & 1
+        remaining >>= 1
+    }
+    return bitCount % 2 == 1
 }
 
 func imageLocalForOriginalLocal(_ local: Int, mask: Int) -> Int {
@@ -1897,6 +1912,9 @@ inline float3 mirror_point(float3 point, int mask) {
     if ((mask & 2) != 0) {
         point.y = -point.y;
     }
+    if ((mask & 4) != 0) {
+        point.z = -point.z;
+    }
     return point;
 }
 
@@ -1906,6 +1924,9 @@ inline float3 mirror_normal(float3 normal, int mask) {
     }
     if ((mask & 2) != 0) {
         normal.y = -normal.y;
+    }
+    if ((mask & 4) != 0) {
+        normal.z = -normal.z;
     }
     return normal;
 }
@@ -1927,6 +1948,9 @@ inline float p1_row_weight(
         weight *= 2.0f;
     }
     if ((params.symmetryPlane & 2) != 0) {
+        weight *= 2.0f;
+    }
+    if ((params.symmetryPlane & 4) != 0) {
         weight *= 2.0f;
     }
     return weight;
@@ -1964,7 +1988,7 @@ inline float2 regular_dlp_entry(
             float sb = basis_value(qx[b], qy[b], trialLocal);
             float weight = tb * sb * qw[a] * qw[b] * jac;
             acc += helmholtz_dlp(trialPoint - testPoint, normal, k) * weight;
-            for (int mask = 1; mask <= 3; ++mask) {
+            for (int mask = 1; mask <= 7; ++mask) {
                 if (!has_image_mask(symmetryPlane, mask)) {
                     continue;
                 }
@@ -2003,7 +2027,7 @@ inline float2 regular_slp_entry(
                 px, py, pz, triangles, nTriangles, trialTri, qx[b], qy[b]);
             float weight = tb * qw[a] * qw[b] * jac;
             acc += helmholtz_g(trialPoint - testPoint, k) * weight;
-            for (int mask = 1; mask <= 3; ++mask) {
+            for (int mask = 1; mask <= 7; ++mask) {
                 if (!has_image_mask(symmetryPlane, mask)) {
                     continue;
                 }
@@ -2208,7 +2232,7 @@ kernel void assemble_pair_blocks_regular(
             localDlp20 += d * (tb2 * sb0);
             localDlp21 += d * (tb2 * sb1);
             localDlp22 += d * (tb2 * sb2);
-            for (int mask = 1; mask <= 3; ++mask) {
+            for (int mask = 1; mask <= 7; ++mask) {
                 if (!has_image_mask(params.symmetryPlane, mask)) {
                     continue;
                 }
@@ -2309,7 +2333,7 @@ kernel void evaluate_field_regular(
             float2 slp = helmholtz_g(sourcePoint - obsPoint, params.k);
             float weight = qw[q] * jac;
             acc += (c_mul(dlp, pressure) - c_mul(slp, gTri)) * weight;
-            for (int mask = 1; mask <= 3; ++mask) {
+            for (int mask = 1; mask <= 7; ++mask) {
                 if (!has_image_mask(params.symmetryPlane, mask)) {
                     continue;
                 }
@@ -2354,7 +2378,13 @@ inline float2 remap_duffy_point(float2 point, int kind, int local1, int local2) 
 }
 
 inline float2 image_ref_to_original_ref(float2 point, int mask) {
-    if (mask == 1 || mask == 2) {
+    int bitCount = 0;
+    int remaining = mask;
+    while (remaining != 0) {
+        bitCount += remaining & 1;
+        remaining >>= 1;
+    }
+    if ((bitCount & 1) != 0) {
         return float2(point.y, point.x);
     }
     return point;

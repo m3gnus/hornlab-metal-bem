@@ -183,56 +183,6 @@ def _tiny_yz_xz_full_buffers():
     )
 
 
-def _tiny_xy_half_buffers():
-    grid = SimpleNamespace(
-        vertices=np.array(
-            [
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=np.float64,
-        ),
-        elements=np.array([[0], [1], [2]], dtype=np.int64),
-        number_of_elements=1,
-    )
-    p1 = SimpleNamespace(
-        local2global=np.array([[0, 1, 2]], dtype=np.int64),
-        global_dof_count=3,
-    )
-    return build_metal_geometry_buffers(
-        grid,
-        np.array([2], dtype=np.int32),
-        p1,
-        SimpleNamespace(global_dof_count=1),
-    )
-
-
-def _tiny_xy_full_buffers():
-    grid = SimpleNamespace(
-        vertices=np.array(
-            [
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 1.0],
-                [0.0, 0.0, 1.0, -1.0],
-            ],
-            dtype=np.float64,
-        ),
-        elements=np.array([[0, 0], [1, 2], [2, 3]], dtype=np.int64),
-        number_of_elements=2,
-    )
-    p1 = SimpleNamespace(
-        local2global=np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64),
-        global_dof_count=4,
-    )
-    return build_metal_geometry_buffers(
-        grid,
-        np.array([2, 2], dtype=np.int32),
-        p1,
-        SimpleNamespace(global_dof_count=2),
-    )
-
-
 def _read_complex_assembly(assembly):
     matrix = np.fromfile(assembly.matrix_real_f32, dtype="<f4").reshape(
         assembly.matrix_shape
@@ -633,20 +583,7 @@ def test_native_symmetry_manifest_and_half_domain_guard(monkeypatch, tmp_path):
     finally:
         quarter_session.close()
 
-    xy_session = MetalNativeStandardSession.create_session(
-        geometry_buffers=_tiny_xy_half_buffers(),
-        work_dir=tmp_path / "native-xy-symmetry-session",
-        session_id="native-xy-symmetry-test",
-        symmetry_plane="xy",
-    )
-    try:
-        manifest = json.loads(xy_session.info.manifest_path.read_text(encoding="utf-8"))
-        assert manifest["assembly_scope"]["symmetry_plane"] == "xy"
-    finally:
-        xy_session.close()
-
     assert validate_native_symmetry_plane(_tiny_yz_xz_quarter_buffers(), "xz") == "xz"
-    assert validate_native_symmetry_plane(_tiny_xy_half_buffers(), "xy") == "xy"
     assert (
         validate_native_symmetry_plane(_tiny_yz_xz_quarter_buffers(), "yz+xz")
         == "yz+xz"
@@ -655,14 +592,8 @@ def test_native_symmetry_manifest_and_half_domain_guard(monkeypatch, tmp_path):
     with pytest.raises(MetalGeometryError, match="positive-x reduced-domain"):
         validate_native_symmetry_plane(_tiny_yz_full_buffers(), "yz")
 
-    with pytest.raises(MetalGeometryError, match="positive-z reduced-domain"):
-        validate_native_symmetry_plane(_tiny_xy_full_buffers(), "xy")
-
-    with pytest.raises(
-        MetalGeometryError,
-        match="supports 'yz', 'xz', 'xy', and 'yz\\+xz'",
-    ):
-        validate_native_symmetry_plane(_tiny_yz_half_buffers(), "zx")
+    with pytest.raises(MetalGeometryError, match="supports 'yz', 'xz', and 'yz\\+xz'"):
+        validate_native_symmetry_plane(_tiny_yz_half_buffers(), "xy")
 
 
 def test_native_standard_session_invokes_swift_assembly(monkeypatch, tmp_path):

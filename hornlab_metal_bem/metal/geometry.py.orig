@@ -134,16 +134,16 @@ def validate_native_symmetry_plane(
     """Validate the narrow native reduced-domain symmetry contract.
 
     The native symmetry path supports caller-supplied positive-side reduced
-    meshes mirrored across YZ (X symmetry), XZ (Y symmetry), XY (Z symmetry),
-    or YZ+XZ. Symmetry planes are not real BEM boundaries, so triangles lying
-    entirely on a requested plane are rejected.
+    meshes mirrored across YZ (X symmetry), XZ (Y symmetry), or both planes.
+    Symmetry planes are not real BEM boundaries, so triangles lying entirely
+    on a requested plane are rejected.
     """
     if symmetry_plane is None:
         return None
     plane = str(symmetry_plane).strip().lower()
-    if plane not in {"yz", "xz", "xy", "yz+xz"}:
+    if plane not in {"yz", "xz", "yz+xz"}:
         raise MetalGeometryError(
-            "native_symmetry_plane currently supports 'yz', 'xz', 'xy', and 'yz+xz'"
+            "native_symmetry_plane currently supports 'yz', 'xz', and 'yz+xz'"
         )
 
     coords = np.asarray(buffers.vertices_3xn_f32, dtype=np.float64)
@@ -181,8 +181,6 @@ def validate_native_symmetry_plane(
         _validate_axis(0, "x", "X=0")
     if "xz" in plane:
         _validate_axis(1, "y", "Y=0")
-    if plane == "xy":
-        _validate_axis(2, "z", "Z=0")
     return plane
 
 

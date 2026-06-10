@@ -67,13 +67,12 @@ def test_solve_config_rejects_unknown_velocity_mode():
 
 def test_solve_config_rejects_unknown_native_symmetry_plane():
     with pytest.raises(ValueError, match="native_symmetry_plane"):
-        SolveConfig(native_symmetry_plane="zx")  # type: ignore[arg-type]
+        SolveConfig(native_symmetry_plane="xy")  # type: ignore[arg-type]
 
 
 def test_solve_config_accepts_native_symmetry_planes():
     assert SolveConfig(native_symmetry_plane="yz").native_symmetry_plane == "yz"
     assert SolveConfig(native_symmetry_plane="xz").native_symmetry_plane == "xz"
-    assert SolveConfig(native_symmetry_plane="xy").native_symmetry_plane == "xy"
     assert SolveConfig(native_symmetry_plane="yz+xz").native_symmetry_plane == "yz+xz"
 
 

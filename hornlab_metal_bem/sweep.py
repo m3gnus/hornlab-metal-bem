@@ -34,9 +34,9 @@ def _build_frequency_grid(config: SolveConfig) -> NDArray[np.float64]:
 
 def should_route_native_metal(config: SolveConfig) -> bool:
     """Return true when the native Metal path can run this config."""
-    if config.native_symmetry_plane not in {None, "yz", "xz", "yz+xz"}:
+    if config.native_symmetry_plane not in {None, "yz", "xz", "xy", "yz+xz"}:
         raise AssemblyBackendUnavailable(
-            "native_symmetry_plane must be None, 'yz', 'xz', or 'yz+xz'"
+            "native_symmetry_plane must be None, 'yz', 'xz', 'xy', or 'yz+xz'"
         )
     return True
 
