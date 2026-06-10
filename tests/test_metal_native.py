@@ -1000,6 +1000,7 @@ def test_native_executable_optimized_matches_reference_on_tiny_mesh(
 
     monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "parity")
     monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_THREADS_PER_GROUP", "32")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_REGULAR_ASSEMBLY_IMPL", "entrywise")
     with MetalNativeStandardSession.create_session(
         geometry_buffers=_tiny_geometry_buffers(),
         work_dir=tmp_path / "native-parity-session",
@@ -1087,6 +1088,132 @@ def test_native_executable_block_staged_matches_reference_on_tiny_mesh(
     assert assembly.matrix_shape == (4, 4)
 
 
+def test_native_executable_pair_atomic_matches_reference_on_tiny_mesh(
+    monkeypatch,
+    tmp_path,
+):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "parity")
+    monkeypatch.setenv(
+        "HORNLAB_METAL_BEM_NATIVE_REGULAR_ASSEMBLY_IMPL",
+        "pair_atomic",
+    )
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_geometry_buffers(),
+        work_dir=tmp_path / "native-pair-atomic-parity-session",
+        session_id="native-pair-atomic-parity-test",
+    ) as session:
+        assembly = session.assemble_standard_neumann(
+            100.0,
+            1.8318326,
+            np.array([1.0 + 0.0j, 0.0 + 0.5j], dtype=np.complex64),
+            operation_id="native-pair-atomic-parity-assembly",
+        )
+
+    result = json.loads(
+        (
+            tmp_path
+            / "native-pair-atomic-parity-session"
+            / "native-pair-atomic-parity-assembly"
+            / "assembly-result.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert result["implementation"] == "swift_native_metal_pair_atomic_regular_quadrature"
+    assert result["reference_parity"]["matrix_relative_l2"] < 1e-4
+    assert result["reference_parity"]["rhs_relative_l2"] < 1e-4
+    assert result["metal_dispatch"]["regular_assembly_implementation"] == "pair_atomic"
+    assert result["metal_dispatch"]["matrix"]["triangle_pairs"] == 4
+    assert assembly.matrix_shape == (4, 4)
+
+
+def test_native_executable_pair_atomic_corrected_yz_xz_matches_full_domain(
+    monkeypatch,
+    tmp_path,
+):
+    """pair_atomic must reproduce the entrywise yz+xz half-vs-full parity."""
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", raising=False)
+    monkeypatch.setenv(
+        "HORNLAB_METAL_BEM_NATIVE_REGULAR_ASSEMBLY_IMPL",
+        "pair_atomic",
+    )
+    frequency_hz = 100.0
+    k_real = 1.8318326
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_yz_xz_full_buffers(),
+        work_dir=tmp_path / "native-full-pair-atomic-yz-xz-session",
+        session_id="native-full-pair-atomic-yz-xz-test",
+    ) as full_session:
+        full_assembly = full_session.assemble_standard_neumann(
+            frequency_hz,
+            k_real,
+            np.ones(4, dtype=np.complex64),
+            operation_id="full-assembly",
+        )
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_yz_xz_quarter_buffers(),
+        work_dir=tmp_path / "native-quarter-pair-atomic-yz-xz-session",
+        session_id="native-quarter-pair-atomic-yz-xz-test",
+        symmetry_plane="yz+xz",
+    ) as quarter_session:
+        quarter_assembly = quarter_session.assemble_standard_neumann(
+            frequency_hz,
+            k_real,
+            np.array([1.0 + 0.0j], dtype=np.complex64),
+            operation_id="quarter-assembly",
+        )
+
+    full_matrix, full_rhs = _read_complex_assembly(full_assembly)
+    quarter_matrix, quarter_rhs = _read_complex_assembly(quarter_assembly)
+    row_orbits = [
+        np.array([0], dtype=np.int64),
+        np.array([1, 3], dtype=np.int64),
+        np.array([2, 4], dtype=np.int64),
+    ]
+    even_full_matrix, even_full_rhs = orbit_reduce_matrix_rhs(
+        full_matrix,
+        full_rhs,
+        row_orbits,
+    )
+
+    assert np.linalg.norm(quarter_matrix - even_full_matrix) / np.linalg.norm(
+        even_full_matrix
+    ) < 1.0e-6
+    assert np.linalg.norm(quarter_rhs - even_full_rhs) / np.linalg.norm(
+        even_full_rhs
+    ) < 1.0e-6
+
+    result = json.loads(
+        (
+            tmp_path
+            / "native-quarter-pair-atomic-yz-xz-session"
+            / "quarter-assembly"
+            / "assembly-result.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert result["implementation"] == (
+        "swift_native_metal_pair_atomic_regular_plus_metal_duffy_blocks"
+    )
+    assert result["duffy_corrections"]["image_singular_correction"] is True
+    assert result["duffy_corrections"]["image_adjacent_pairs"] == 15
+
+
 def test_native_executable_corrected_mode_applies_duffy_on_tiny_mesh(
     monkeypatch,
     tmp_path,
@@ -1100,6 +1227,7 @@ def test_native_executable_corrected_mode_applies_duffy_on_tiny_mesh(
 
     monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
     monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", raising=False)
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_REGULAR_ASSEMBLY_IMPL", "entrywise")
     monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_THREADS_PER_GROUP", "256")
     monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_MATRIX_THREADS_PER_GROUP", "32")
     monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_RHS_THREADS_PER_GROUP", "64")

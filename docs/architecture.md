@@ -139,6 +139,15 @@ testable:
   implementation. It validates manifests, runs Metal kernels, calls Accelerate
   dense solve, writes binary outputs, and returns result manifests.
 
+The regular dense-assembly kernel is selected by
+`HORNLAB_METAL_BEM_NATIVE_REGULAR_ASSEMBLY_IMPL`. The default `pair_atomic`
+runs one thread per triangle pair, computes the pair's 36 kernel evaluations
+once, and scatters 3x3 blocks into A with atomic float adds; atomic ordering
+makes it nondeterministic at float32 rounding level between runs. `entrywise`
+(one thread per matrix entry, bit-reproducible, ~2x slower assembly) and
+`block_staged` (pair blocks staged through a large intermediate buffer) remain
+selectable for A/B comparison and deterministic debugging.
+
 Runtime discovery prefers an explicit helper executable, then
 `HORNLAB_METAL_BEM_NATIVE`, then compiled SwiftPM binaries under
 `metal/native_helper/.build/{release,debug}/HornlabMetalBemNative`. If no helper
