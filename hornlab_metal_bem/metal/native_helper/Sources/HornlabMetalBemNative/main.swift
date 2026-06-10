@@ -331,6 +331,11 @@ struct MetalAssemblyOutput {
 struct MetalFieldOutput {
     let values: [Complex32]
     let dispatch: [String: Any]
+    // GPU execution time plus readback, excluding command-queue wait. Set by
+    // the resident path so pipelined batches (where the field command buffer
+    // queues behind the next case's assembly) still report field cost, not
+    // queue latency.
+    var gpuSeconds: Double? = nil
 }
 
 struct MetalDuffyBlockOutput {
@@ -2920,6 +2925,7 @@ final class ResidentMetalContext {
     var fieldOutRe: MTLBuffer?
     var fieldOutIm: MTLBuffer?
     var fieldOutCount = 0
+    private var alternateOutputSlot: AssemblyOutputSlot?
 
     init(geom: Geometry) throws {
         self.geom = geom
@@ -3031,7 +3037,77 @@ final class ResidentMetalContext {
         }
     }
 
-    func assembleRegularMetal(neumann: [Complex32], k: Float) throws -> MetalAssemblyOutput {
+    struct AssemblyOutputSlot {
+        let aRe: MTLBuffer
+        let aIm: MTLBuffer
+        let rhsRe: MTLBuffer
+        let rhsIm: MTLBuffer
+        let duffySlpRe: MTLBuffer?
+        let duffySlpIm: MTLBuffer?
+        let duffyDlpRe: MTLBuffer?
+        let duffyDlpIm: MTLBuffer?
+    }
+
+    /// Even slot indices alias the primary resident output buffers; odd
+    /// indices use a lazily allocated second set so one case's GPU assembly
+    /// can run while the previous case's outputs are still being consumed
+    /// on the CPU.
+    func outputSlot(_ slotIndex: Int) throws -> AssemblyOutputSlot {
+        if slotIndex % 2 == 0 {
+            return AssemblyOutputSlot(
+                aRe: aRe,
+                aIm: aIm,
+                rhsRe: rhsRe,
+                rhsIm: rhsIm,
+                duffySlpRe: duffySlpRe,
+                duffySlpIm: duffySlpIm,
+                duffyDlpRe: duffyDlpRe,
+                duffyDlpIm: duffyDlpIm
+            )
+        }
+        if let alternateOutputSlot {
+            return alternateOutputSlot
+        }
+        let n = geom.p1DofCount
+        let pairCount = pairList.pairs.count
+        let slot = AssemblyOutputSlot(
+            aRe: try makeOutputBuffer(device, count: n * n, label: "resident_A_re_alt"),
+            aIm: try makeOutputBuffer(device, count: n * n, label: "resident_A_im_alt"),
+            rhsRe: try makeOutputBuffer(device, count: n, label: "resident_rhs_re_alt"),
+            rhsIm: try makeOutputBuffer(device, count: n, label: "resident_rhs_im_alt"),
+            duffySlpRe: pairCount == 0
+                ? nil
+                : try makeOutputBuffer(device, count: pairCount * 3, label: "resident_duffy_slp_re_alt"),
+            duffySlpIm: pairCount == 0
+                ? nil
+                : try makeOutputBuffer(device, count: pairCount * 3, label: "resident_duffy_slp_im_alt"),
+            duffyDlpRe: pairCount == 0
+                ? nil
+                : try makeOutputBuffer(device, count: pairCount * 9, label: "resident_duffy_dlp_re_alt"),
+            duffyDlpIm: pairCount == 0
+                ? nil
+                : try makeOutputBuffer(device, count: pairCount * 9, label: "resident_duffy_dlp_im_alt")
+        )
+        alternateOutputSlot = slot
+        return slot
+    }
+
+    private func readAssemblyArrays(slot: AssemblyOutputSlot) -> AssemblyArrays {
+        let n = geom.p1DofCount
+        return AssemblyArrays(
+            aRe: readFloatBuffer(slot.aRe, count: n * n),
+            aIm: readFloatBuffer(slot.aIm, count: n * n),
+            rhsRe: readFloatBuffer(slot.rhsRe, count: n),
+            rhsIm: readFloatBuffer(slot.rhsIm, count: n)
+        )
+    }
+
+    private func encodeRegularAssembly(
+        commandBuffer: MTLCommandBuffer,
+        slot: AssemblyOutputSlot,
+        neumann: [Complex32],
+        k: Float
+    ) throws -> (matrix: [String: Any], rhs: [String: Any]) {
         var params = MetalKernelParams(
             nDof: Int32(geom.p1DofCount),
             nTriangles: Int32(geom.nTriangles),
@@ -3065,16 +3141,12 @@ final class ResidentMetalContext {
         let sourceRe = try makeBuffer(device, sourceReArray, label: "resident_source_re")
         let sourceIm = try makeBuffer(device, sourceImArray, label: "resident_source_im")
 
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
-            try fail("failed to create Metal command buffer")
-        }
-        commandBuffer.label = "hornlab resident regular dense assembly"
         guard let matrixEncoder = commandBuffer.makeComputeCommandEncoder() else {
             try fail("failed to create Metal matrix encoder")
         }
         matrixEncoder.label = "resident regular P1/P1 DLP matrix"
-        matrixEncoder.setBuffer(aRe, offset: 0, index: 0)
-        matrixEncoder.setBuffer(aIm, offset: 0, index: 1)
+        matrixEncoder.setBuffer(slot.aRe, offset: 0, index: 0)
+        matrixEncoder.setBuffer(slot.aIm, offset: 0, index: 1)
         matrixEncoder.setBuffer(px, offset: 0, index: 2)
         matrixEncoder.setBuffer(py, offset: 0, index: 3)
         matrixEncoder.setBuffer(pz, offset: 0, index: 4)
@@ -3098,8 +3170,8 @@ final class ResidentMetalContext {
             try fail("failed to create Metal RHS encoder")
         }
         rhsEncoder.label = "resident regular DP0 Neumann RHS"
-        rhsEncoder.setBuffer(rhsRe, offset: 0, index: 0)
-        rhsEncoder.setBuffer(rhsIm, offset: 0, index: 1)
+        rhsEncoder.setBuffer(slot.rhsRe, offset: 0, index: 0)
+        rhsEncoder.setBuffer(slot.rhsIm, offset: 0, index: 1)
         rhsEncoder.setBuffer(px, offset: 0, index: 2)
         rhsEncoder.setBuffer(py, offset: 0, index: 3)
         rhsEncoder.setBuffer(pz, offset: 0, index: 4)
@@ -3120,23 +3192,32 @@ final class ResidentMetalContext {
             kernel: "rhs"
         )
         rhsEncoder.endEncoding()
+        return (matrix: matrixDispatch, rhs: rhsDispatch)
+    }
 
+    func assembleRegularMetal(neumann: [Complex32], k: Float) throws -> MetalAssemblyOutput {
+        let slot = try outputSlot(0)
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            try fail("failed to create Metal command buffer")
+        }
+        commandBuffer.label = "hornlab resident regular dense assembly"
+        let dispatch = try encodeRegularAssembly(
+            commandBuffer: commandBuffer,
+            slot: slot,
+            neumann: neumann,
+            k: k
+        )
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
         if let error = commandBuffer.error {
             try fail("resident Metal regular assembly failed: \(error)")
         }
         return MetalAssemblyOutput(
-            arrays: AssemblyArrays(
-                aRe: readFloatBuffer(aRe, count: matrixCount),
-                aIm: readFloatBuffer(aIm, count: matrixCount),
-                rhsRe: readFloatBuffer(rhsRe, count: n),
-                rhsIm: readFloatBuffer(rhsIm, count: n)
-            ),
+            arrays: readAssemblyArrays(slot: slot),
             dispatch: [
                 "regular_assembly_implementation": "entrywise",
-                "matrix": matrixDispatch,
-                "rhs": rhsDispatch,
+                "matrix": dispatch.matrix,
+                "rhs": dispatch.rhs,
             ]
         )
     }
@@ -3265,6 +3346,29 @@ final class ResidentMetalContext {
         guard !pairList.pairs.isEmpty else {
             return MetalDuffyBlockOutput(slpRe: [], slpIm: [], dlpRe: [], dlpIm: [], dispatch: ["pairs": 0, "kernel": "duffy_delta_blocks"])
         }
+        let slot = try outputSlot(0)
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            try fail("failed to create Metal command buffer")
+        }
+        commandBuffer.label = "hornlab resident Duffy delta blocks"
+        let dispatchReport = try encodeDuffyDeltaBlocks(
+            commandBuffer: commandBuffer,
+            slot: slot,
+            k: k
+        )
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error {
+            try fail("resident Metal Duffy correction failed: \(error)")
+        }
+        return try readDuffyBlocks(slot: slot, dispatchReport: dispatchReport)
+    }
+
+    private func encodeDuffyDeltaBlocks(
+        commandBuffer: MTLCommandBuffer,
+        slot: AssemblyOutputSlot,
+        k: Float
+    ) throws -> [String: Any] {
         guard let pairTestBuffer,
               let pairTrialBuffer,
               let pairKindBuffer,
@@ -3274,10 +3378,10 @@ final class ResidentMetalContext {
               let pairTestLocal2Buffer,
               let pairTrialLocal1Buffer,
               let pairTrialLocal2Buffer,
-              let duffySlpRe,
-              let duffySlpIm,
-              let duffyDlpRe,
-              let duffyDlpIm else {
+              let duffySlpRe = slot.duffySlpRe,
+              let duffySlpIm = slot.duffySlpIm,
+              let duffyDlpRe = slot.duffyDlpRe,
+              let duffyDlpIm = slot.duffyDlpIm else {
             try fail("resident Duffy buffers are unavailable")
         }
         let pairCount = pairList.pairs.count
@@ -3289,10 +3393,6 @@ final class ResidentMetalContext {
             k: k
         )
         var pairCountI32 = Int32(pairCount)
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
-            try fail("failed to create Metal command buffer")
-        }
-        commandBuffer.label = "hornlab resident Duffy delta blocks"
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             try fail("failed to create Metal Duffy encoder")
         }
@@ -3332,24 +3432,156 @@ final class ResidentMetalContext {
             kernel: "duffy"
         )
         encoder.endEncoding()
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        if let error = commandBuffer.error {
-            try fail("resident Metal Duffy correction failed: \(error)")
-        }
-        let slpCount = pairCount * 3
-        let dlpCount = pairCount * 9
         var dispatchReport = dispatch
         dispatchReport["kernel"] = "duffy_delta_blocks"
         dispatchReport["pairs"] = pairCount
-        dispatchReport["slp_values"] = slpCount
-        dispatchReport["dlp_values"] = dlpCount
+        dispatchReport["slp_values"] = pairCount * 3
+        dispatchReport["dlp_values"] = pairCount * 9
+        return dispatchReport
+    }
+
+    private func readDuffyBlocks(
+        slot: AssemblyOutputSlot,
+        dispatchReport: [String: Any]
+    ) throws -> MetalDuffyBlockOutput {
+        guard let duffySlpRe = slot.duffySlpRe,
+              let duffySlpIm = slot.duffySlpIm,
+              let duffyDlpRe = slot.duffyDlpRe,
+              let duffyDlpIm = slot.duffyDlpIm else {
+            try fail("resident Duffy buffers are unavailable")
+        }
+        let pairCount = pairList.pairs.count
+        let slpCount = pairCount * 3
+        let dlpCount = pairCount * 9
         return MetalDuffyBlockOutput(
             slpRe: readFloatBuffer(duffySlpRe, count: slpCount),
             slpIm: readFloatBuffer(duffySlpIm, count: slpCount),
             dlpRe: readFloatBuffer(duffyDlpRe, count: dlpCount),
             dlpIm: readFloatBuffer(duffyDlpIm, count: dlpCount),
             dispatch: dispatchReport
+        )
+    }
+
+    struct PendingAssembly {
+        let caseIndex: Int
+        let slot: AssemblyOutputSlot
+        let regularCommandBuffer: MTLCommandBuffer
+        let duffyCommandBuffer: MTLCommandBuffer?
+        let includesDuffyBlocks: Bool
+        let matrixDispatch: [String: Any]
+        let rhsDispatch: [String: Any]
+        let duffyDispatchReport: [String: Any]?
+    }
+
+    struct FinishedAssembly {
+        let regular: MetalAssemblyOutput
+        let duffyBlocks: MetalDuffyBlockOutput?
+        let regularGpuSeconds: Double
+        let duffyGpuSeconds: Double
+        let readbackSeconds: Double
+    }
+
+    /// Encode and commit one case's regular assembly (and Duffy delta blocks
+    /// when requested) without waiting, so the GPU works on case `caseIndex`
+    /// while the CPU is still solving earlier cases. Even and odd cases write
+    /// to distinct output slots; callers must finish case i before beginning
+    /// case i + 2 so a slot is never written while it is still being read.
+    func beginAssembly(
+        caseIndex: Int,
+        neumann: [Complex32],
+        k: Float,
+        includeDuffyBlocks: Bool
+    ) throws -> PendingAssembly {
+        let slot = try outputSlot(caseIndex % 2)
+        guard let regularCommandBuffer = commandQueue.makeCommandBuffer() else {
+            try fail("failed to create Metal command buffer")
+        }
+        regularCommandBuffer.label = "hornlab resident regular dense assembly case \(caseIndex)"
+        let dispatch = try encodeRegularAssembly(
+            commandBuffer: regularCommandBuffer,
+            slot: slot,
+            neumann: neumann,
+            k: k
+        )
+        regularCommandBuffer.commit()
+
+        var duffyCommandBuffer: MTLCommandBuffer? = nil
+        var duffyDispatchReport: [String: Any]? = nil
+        if includeDuffyBlocks && !pairList.pairs.isEmpty {
+            guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+                try fail("failed to create Metal command buffer")
+            }
+            commandBuffer.label = "hornlab resident Duffy delta blocks case \(caseIndex)"
+            duffyDispatchReport = try encodeDuffyDeltaBlocks(
+                commandBuffer: commandBuffer,
+                slot: slot,
+                k: k
+            )
+            commandBuffer.commit()
+            duffyCommandBuffer = commandBuffer
+        }
+        return PendingAssembly(
+            caseIndex: caseIndex,
+            slot: slot,
+            regularCommandBuffer: regularCommandBuffer,
+            duffyCommandBuffer: duffyCommandBuffer,
+            includesDuffyBlocks: includeDuffyBlocks,
+            matrixDispatch: dispatch.matrix,
+            rhsDispatch: dispatch.rhs,
+            duffyDispatchReport: duffyDispatchReport
+        )
+    }
+
+    func finishAssembly(_ pending: PendingAssembly) throws -> FinishedAssembly {
+        pending.regularCommandBuffer.waitUntilCompleted()
+        if let error = pending.regularCommandBuffer.error {
+            try fail("resident Metal regular assembly failed: \(error)")
+        }
+        var duffyGpuSeconds = 0.0
+        if let duffyCommandBuffer = pending.duffyCommandBuffer {
+            duffyCommandBuffer.waitUntilCompleted()
+            if let error = duffyCommandBuffer.error {
+                try fail("resident Metal Duffy correction failed: \(error)")
+            }
+            duffyGpuSeconds = max(
+                0.0,
+                duffyCommandBuffer.gpuEndTime - duffyCommandBuffer.gpuStartTime
+            )
+        }
+        let regularGpuSeconds = max(
+            0.0,
+            pending.regularCommandBuffer.gpuEndTime - pending.regularCommandBuffer.gpuStartTime
+        )
+        let readbackStart = CFAbsoluteTimeGetCurrent()
+        let regular = MetalAssemblyOutput(
+            arrays: readAssemblyArrays(slot: pending.slot),
+            dispatch: [
+                "regular_assembly_implementation": "entrywise",
+                "matrix": pending.matrixDispatch,
+                "rhs": pending.rhsDispatch,
+            ]
+        )
+        var duffyBlocks: MetalDuffyBlockOutput? = nil
+        if let duffyDispatchReport = pending.duffyDispatchReport {
+            duffyBlocks = try readDuffyBlocks(
+                slot: pending.slot,
+                dispatchReport: duffyDispatchReport
+            )
+        } else if pending.includesDuffyBlocks {
+            duffyBlocks = MetalDuffyBlockOutput(
+                slpRe: [],
+                slpIm: [],
+                dlpRe: [],
+                dlpIm: [],
+                dispatch: ["pairs": 0, "kernel": "duffy_delta_blocks"]
+            )
+        }
+        return FinishedAssembly(
+            regular: regular,
+            duffyBlocks: duffyBlocks,
+            regularGpuSeconds: regularGpuSeconds,
+            duffyGpuSeconds: duffyGpuSeconds,
+            readbackSeconds: CFAbsoluteTimeGetCurrent() - readbackStart
         )
     }
 
@@ -3476,11 +3708,14 @@ final class ResidentMetalContext {
         if let error = commandBuffer.error {
             try fail("resident Metal field evaluation failed: \(error)")
         }
+        let gpuSeconds = max(0.0, commandBuffer.gpuEndTime - commandBuffer.gpuStartTime)
+        let readbackStart = CFAbsoluteTimeGetCurrent()
         let re = readFloatBuffer(outRe, count: observationCount)
         let im = readFloatBuffer(outIm, count: observationCount)
         return MetalFieldOutput(
             values: zip(re, im).map { Complex32(re: $0.0, im: $0.1) },
-            dispatch: ["field": fieldDispatch]
+            dispatch: ["field": fieldDispatch],
+            gpuSeconds: gpuSeconds + (CFAbsoluteTimeGetCurrent() - readbackStart)
         )
     }
 
@@ -4093,7 +4328,7 @@ func evaluateExterior(
             values: output.values,
             implementation: "swift_native_metal_regular_field",
             mode: mode,
-            seconds: seconds,
+            seconds: output.gpuSeconds ?? seconds,
             parity: nil,
             metalDispatch: output.dispatch
         )
@@ -4563,13 +4798,104 @@ func assembleSolveEvaluateStandardNeumannBatch(
         sharedObservationCount = cached.count
     }
 
-    for (caseIndex, casePayload) in cases.enumerated() {
-        let k = Float(try requireDouble(casePayload, "k_real_f32"))
-        let neumann = try readComplexVector(
-            root: geom.root,
-            descriptors: try requireObject(casePayload, "neumann_dp0"),
-            count: geom.dp0DofCount
+    // Pre-read per-case wavenumbers and Neumann data so case i+1's GPU
+    // assembly can be committed before case i's CPU dense solve starts.
+    var caseKs: [Float] = []
+    var caseNeumanns: [[Complex32]] = []
+    caseKs.reserveCapacity(cases.count)
+    caseNeumanns.reserveCapacity(cases.count)
+    for casePayload in cases {
+        caseKs.append(Float(try requireDouble(casePayload, "k_real_f32")))
+        caseNeumanns.append(
+            try readComplexVector(
+                root: geom.root,
+                descriptors: try requireObject(casePayload, "neumann_dp0"),
+                count: geom.dp0DofCount
+            )
         )
+    }
+
+    let assemblyMode = ProcessInfo.processInfo.environment[
+        "HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE"
+    ] ?? "optimized"
+    let duffyMode = ProcessInfo.processInfo.environment[
+        "HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE"
+    ] ?? "gpu_blocks"
+    // Overlap GPU assembly of case i+1 with the CPU dense solve of case i.
+    // Reference/parity assembly, block-staged assembly, and CPU Duffy
+    // corrections keep the strictly sequential path: they exist to
+    // cross-check the optimized kernels, not to be fast.
+    let pipelineAssembly = (try requestedRegularAssemblyImplementation()) == "entrywise"
+        && (assemblyMode == "optimized"
+            || (assemblyMode == "corrected" && duffyMode == "gpu_blocks"))
+    let includeDuffyBlocks = assemblyMode == "corrected"
+    var pendingAssembly: ResidentMetalContext.PendingAssembly? = nil
+
+    func pipelinedAssemblyRun(_ caseIndex: Int) throws -> AssemblyRun {
+        guard let pending = pendingAssembly, pending.caseIndex == caseIndex else {
+            try fail("internal error: pipelined assembly is out of order")
+        }
+        let finished = try context.finishAssembly(pending)
+        pendingAssembly = caseIndex + 1 < cases.count
+            ? try context.beginAssembly(
+                caseIndex: caseIndex + 1,
+                neumann: caseNeumanns[caseIndex + 1],
+                k: caseKs[caseIndex + 1],
+                includeDuffyBlocks: includeDuffyBlocks
+            )
+            : nil
+        guard let blocks = finished.duffyBlocks else {
+            return AssemblyRun(
+                arrays: finished.regular.arrays,
+                implementation: regularMetalImplementationName(finished.regular),
+                mode: assemblyMode,
+                seconds: finished.regularGpuSeconds + finished.readbackSeconds,
+                parity: nil,
+                duffyStats: nil,
+                metalDispatch: finished.regular.dispatch
+            )
+        }
+        let (correctedArrays, reductionSeconds) = context.reduceDuffyDeltaBlocks(
+            to: finished.regular.arrays,
+            neumann: caseNeumanns[caseIndex],
+            blocks: blocks
+        )
+        let stats = DuffyCorrectionStats(
+            plan: context.pairList.plan,
+            rawTriplets: context.pairList.plan.total * 9,
+            uniqueTriplets: context.duffyReductionPlan.matrixIndices.count,
+            seconds: finished.duffyGpuSeconds + reductionSeconds,
+            implementation: "metal_duffy_blocks_cpu_reduction",
+            blockSeconds: finished.duffyGpuSeconds,
+            reductionSeconds: reductionSeconds,
+            dispatch: blocks.dispatch,
+            imagePairs: context.duffyReductionPlan.imagePairs,
+            reductionPrecomputed: true,
+            reductionPlanBuildSeconds: context.duffyReductionPlanBuildSeconds
+        )
+        return AssemblyRun(
+            arrays: correctedArrays,
+            implementation: correctedMetalImplementationName(finished.regular, stats: stats),
+            mode: assemblyMode,
+            seconds: finished.regularGpuSeconds + finished.readbackSeconds + stats.seconds,
+            parity: nil,
+            duffyStats: stats,
+            metalDispatch: finished.regular.dispatch
+        )
+    }
+
+    if pipelineAssembly {
+        pendingAssembly = try context.beginAssembly(
+            caseIndex: 0,
+            neumann: caseNeumanns[0],
+            k: caseKs[0],
+            includeDuffyBlocks: includeDuffyBlocks
+        )
+    }
+
+    for (caseIndex, casePayload) in cases.enumerated() {
+        let k = caseKs[caseIndex]
+        let neumann = caseNeumanns[caseIndex]
         let observationPoints: [(Float, Float, Float)]
         if let sharedObservationPoints {
             observationPoints = sharedObservationPoints
@@ -4603,12 +4929,17 @@ func assembleSolveEvaluateStandardNeumannBatch(
         } else {
             impedanceSourceTag = try requireInt(casePayload, "impedance_source_tag")
         }
-        let assembly = try assembleRegular(
-            geom: geom,
-            neumann: neumann,
-            k: k,
-            residentContext: context
-        )
+        let assembly: AssemblyRun
+        if pipelineAssembly {
+            assembly = try pipelinedAssemblyRun(caseIndex)
+        } else {
+            assembly = try assembleRegular(
+                geom: geom,
+                neumann: neumann,
+                k: k,
+                residentContext: context
+            )
+        }
         let solve = try solveDenseAccelerate(
             aReRowMajor: assembly.arrays.aRe,
             aImRowMajor: assembly.arrays.aIm,
@@ -4760,6 +5091,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
         "resident_context_seconds": contextSeconds,
         "resident_duffy_reduction_plan_seconds": context.duffyReductionPlanBuildSeconds,
         "wall_seconds": CFAbsoluteTimeGetCurrent() - batchStart,
+        "assembly_solve_overlap": pipelineAssembly,
         "resident_reuse": [
             "geometry_buffers": true,
             "assembly_output_buffers": true,
