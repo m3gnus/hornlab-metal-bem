@@ -1679,6 +1679,8 @@ def _native_case_diagnostics(
         "field_mode",
         "regular_assembly_seconds",
         "lapack_info",
+        "dense_solve_rcond",
+        "dense_solve_condition_1norm",
         "symmetry_plane",
         "pressure_shape",
         "field_shape",

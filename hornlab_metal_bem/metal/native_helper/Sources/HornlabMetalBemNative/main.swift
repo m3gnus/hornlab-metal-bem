@@ -353,6 +353,52 @@ struct DenseSolveRun {
     let implementation: String
     let seconds: Double
     let lapackInfo: Int32
+    // Reciprocal 1-norm condition estimate from cgecon on the LU factors;
+    // nil when the factorization or the estimator failed. Lets interior-
+    // resonance spikes in sweeps be attributed to ill conditioning.
+    let rcond: Double?
+}
+
+func matrixOneNorm(_ matrix: inout [__CLPK_complex], n: Int) -> __CLPK_real {
+    var normChar = Int8(49) // "1"
+    var mClpk = __CLPK_integer(n)
+    var nClpk = __CLPK_integer(n)
+    var lda = __CLPK_integer(n)
+    var work = [__CLPK_real(0)] // unused for the 1-norm
+    return __CLPK_real(clange_(&normChar, &mClpk, &nClpk, &matrix, &lda, &work))
+}
+
+/// 1-norm condition estimate via cgecon on an LU-factorized matrix.
+/// `anorm` must be the 1-norm of the original matrix, computed before the
+/// factorization overwrote it.
+func estimateReciprocalCondition(
+    factored: inout [__CLPK_complex],
+    n: Int,
+    anorm: __CLPK_real
+) -> Double? {
+    var normChar = Int8(49) // "1"
+    var nClpk = __CLPK_integer(n)
+    var lda = __CLPK_integer(n)
+    var anormValue = anorm
+    var rcond = __CLPK_real(0)
+    var info = __CLPK_integer(0)
+    var work = Array(repeating: __CLPK_complex(r: 0.0, i: 0.0), count: 2 * n)
+    var rwork = Array(repeating: __CLPK_real(0), count: 2 * n)
+    cgecon_(
+        &normChar,
+        &nClpk,
+        &factored,
+        &lda,
+        &anormValue,
+        &rcond,
+        &work,
+        &rwork,
+        &info
+    )
+    if info != 0 {
+        return nil
+    }
+    return Double(rcond)
 }
 
 struct DuffyPairPlan {
@@ -4047,22 +4093,25 @@ func solveDenseAccelerateCgesv(
     var ldb = __CLPK_integer(n)
     var info = __CLPK_integer(0)
     var pivots = Array(repeating: __CLPK_integer(0), count: n)
+    let anorm = matrixOneNorm(&matrix, n: n)
     cgesv_(&nClpk, &nrhs, &matrix, &lda, &pivots, &rhs, &ldb, &info)
 
-    let seconds = CFAbsoluteTimeGetCurrent() - start
     if info != 0 {
         return DenseSolveRun(
             pressure: [],
             implementation: "accelerate_lapack_cgesv",
-            seconds: seconds,
-            lapackInfo: Int32(info)
+            seconds: CFAbsoluteTimeGetCurrent() - start,
+            lapackInfo: Int32(info),
+            rcond: nil
         )
     }
+    let rcond = estimateReciprocalCondition(factored: &matrix, n: n, anorm: anorm)
     return DenseSolveRun(
         pressure: rhs.map { Complex32(re: $0.r, im: $0.i) },
         implementation: "accelerate_lapack_cgesv",
-        seconds: seconds,
-        lapackInfo: Int32(info)
+        seconds: CFAbsoluteTimeGetCurrent() - start,
+        lapackInfo: Int32(info),
+        rcond: rcond
     )
 }
 
@@ -4111,8 +4160,11 @@ func solveDenseAccelerateCgetrfCgetrs(
     var ldb = __CLPK_integer(n)
     var info = __CLPK_integer(0)
     var pivots = Array(repeating: __CLPK_integer(0), count: n)
+    let anorm = matrixOneNorm(&matrix, n: n)
     cgetrf_(&mClpk, &nClpk, &matrix, &lda, &pivots, &info)
+    var rcond: Double? = nil
     if info == 0 {
+        rcond = estimateReciprocalCondition(factored: &matrix, n: n, anorm: anorm)
         var trans = Int8(78)
         cgetrs_(&trans, &nClpk, &nrhs, &matrix, &lda, &pivots, &rhs, &ldb, &info)
     }
@@ -4123,14 +4175,16 @@ func solveDenseAccelerateCgetrfCgetrs(
             pressure: [],
             implementation: "accelerate_lapack_cgetrf_cgetrs",
             seconds: seconds,
-            lapackInfo: Int32(info)
+            lapackInfo: Int32(info),
+            rcond: rcond
         )
     }
     return DenseSolveRun(
         pressure: rhs.map { Complex32(re: $0.r, im: $0.i) },
         implementation: "accelerate_lapack_cgetrf_cgetrs",
         seconds: seconds,
-        lapackInfo: Int32(info)
+        lapackInfo: Int32(info),
+        rcond: rcond
     )
 }
 
@@ -4697,6 +4751,12 @@ func assembleSolveStandardNeumannBatch(
             "pressure_real_f32": try requireString(outReDesc, "path"),
             "pressure_imag_f32": try requireString(outImDesc, "path"),
         ]
+        if let rcond = solve.rcond {
+            caseResult["dense_solve_rcond"] = rcond
+            if rcond > 0.0 {
+                caseResult["dense_solve_condition_1norm"] = 1.0 / rcond
+            }
+        }
         if let caseId = casePayload["case_id"] as? String {
             caseResult["case_id"] = caseId
         }
@@ -5034,6 +5094,12 @@ func assembleSolveEvaluateStandardNeumannBatch(
             "pressure_shape": [geom.p1DofCount],
             "field_shape": [observationPoints.count],
         ]
+        if let rcond = solve.rcond {
+            caseResult["dense_solve_rcond"] = rcond
+            if rcond > 0.0 {
+                caseResult["dense_solve_condition_1norm"] = 1.0 / rcond
+            }
+        }
         if let pressureReDesc, let pressureImDesc {
             caseResult["pressure_real_f32"] = try requireString(pressureReDesc, "path")
             caseResult["pressure_imag_f32"] = try requireString(pressureImDesc, "path")

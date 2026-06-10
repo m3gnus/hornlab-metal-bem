@@ -2221,6 +2221,10 @@ def test_native_executable_resident_assembly_solve_field_matches_split_path(
     assert combined.assembly_s > 0.0
     assert combined.dense_solve_s > 0.0
     assert combined.field_s > 0.0
+    # cgecon condition estimate must ride along in per-case diagnostics so
+    # interior-resonance spikes in sweeps are attributable.
+    assert 0.0 < combined.diagnostics["dense_solve_rcond"] <= 1.0
+    assert combined.diagnostics["dense_solve_condition_1norm"] >= 1.0
     expected_source_avg = (
         combined_pressure[0] + combined_pressure[2] + combined_pressure[3]
     ) / 3.0
