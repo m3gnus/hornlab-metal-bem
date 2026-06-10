@@ -1775,11 +1775,16 @@ let regularAssemblyMetalSource = """
 #include <metal_stdlib>
 using namespace metal;
 
+// Specialized per session by specializedAssemblyMetalSource(): the symmetry
+// plane is a compile-time constant so the compiler prunes the image-mask
+// loops entirely for the planes that are not active.
+constant int SYMMETRY_PLANE = 0;
+
 struct Params {
     int nDof;
     int nTriangles;
     int maxInc;
-    int symmetryPlane;
+    int symmetryPlane; // unused by kernels (see SYMMETRY_PLANE); kept for layout
     float k;
 };
 
@@ -1911,17 +1916,17 @@ inline float p1_row_weight(
     device const int *incLoc,
     constant Params &params
 ) {
-    if (params.symmetryPlane == 0) {
+    if (SYMMETRY_PLANE == 0) {
         return 1.0f;
     }
     float weight = 1.0f;
-    if ((params.symmetryPlane & 1) != 0) {
+    if ((SYMMETRY_PLANE & 1) != 0) {
         weight *= 2.0f;
     }
-    if ((params.symmetryPlane & 2) != 0) {
+    if ((SYMMETRY_PLANE & 2) != 0) {
         weight *= 2.0f;
     }
-    if ((params.symmetryPlane & 4) != 0) {
+    if ((SYMMETRY_PLANE & 4) != 0) {
         weight *= 2.0f;
     }
     return weight;
@@ -2051,7 +2056,7 @@ kernel void assemble_matrix_regular(
             acc += regular_dlp_entry(
                 px, py, pz, triangles, normals, areas, params.nTriangles,
                 testTri, trialTri, testLocal, trialLocal,
-                params.symmetryPlane, params.k);
+                SYMMETRY_PLANE, params.k);
             if (testTri == trialTri) {
                 float mass = areas[testTri] * (testLocal == trialLocal ? 0.16666666666666666f : 0.08333333333333333f);
                 acc.x -= 0.5f * mass;
@@ -2094,7 +2099,7 @@ kernel void assemble_rhs_source_regular(
             int trialTri = sourceTris[src];
             float2 slp = regular_slp_entry(
                 px, py, pz, triangles, areas, params.nTriangles,
-                testTri, trialTri, testLocal, params.symmetryPlane, params.k);
+                testTri, trialTri, testLocal, SYMMETRY_PLANE, params.k);
             acc += c_mul(slp, float2(sourceRe[src], sourceIm[src]));
         }
     }
@@ -2170,9 +2175,9 @@ kernel void assemble_pair_blocks_regular(
             localDlp20 += d * (tb2 * sb0);
             localDlp21 += d * (tb2 * sb1);
             localDlp22 += d * (tb2 * sb2);
-            if (params.symmetryPlane != 0) {
+            if (SYMMETRY_PLANE != 0) {
                 for (int mask = 1; mask <= 7; ++mask) {
-                    if (!has_image_mask(params.symmetryPlane, mask)) {
+                    if (!has_image_mask(SYMMETRY_PLANE, mask)) {
                         continue;
                     }
                     float3 imagePoint = mirror_point(trialPoint, mask);
@@ -2273,9 +2278,9 @@ kernel void evaluate_field_regular(
             float2 slp = helmholtz_g(sourcePoint - obsPoint, params.k);
             float weight = qw[q] * jac;
             acc += (c_mul(dlp, pressure) - c_mul(slp, gTri)) * weight;
-            if (params.symmetryPlane != 0) {
+            if (SYMMETRY_PLANE != 0) {
                 for (int mask = 1; mask <= 7; ++mask) {
-                    if (!has_image_mask(params.symmetryPlane, mask)) {
+                    if (!has_image_mask(SYMMETRY_PLANE, mask)) {
                         continue;
                     }
                     float3 imagePoint = mirror_point(sourcePoint, mask);
@@ -2512,6 +2517,13 @@ kernel void duffy_delta_blocks(
 }
 """
 
+func specializedAssemblyMetalSource(symmetryPlaneCode: Int32) -> String {
+    regularAssemblyMetalSource.replacingOccurrences(
+        of: "constant int SYMMETRY_PLANE = 0;",
+        with: "constant int SYMMETRY_PLANE = \(symmetryPlaneCode);"
+    )
+}
+
 func makeBuffer<T>(_ device: MTLDevice, _ values: [T], label: String) throws -> MTLBuffer {
     let byteCount = values.count * MemoryLayout<T>.stride
     if byteCount <= 0 {
@@ -2570,7 +2582,7 @@ func computeDuffyDeltaBlocksMetal(
     guard let commandQueue = device.makeCommandQueue() else {
         try fail("failed to create Metal command queue")
     }
-    let library = try device.makeLibrary(source: regularAssemblyMetalSource, options: nil)
+    let library = try device.makeLibrary(source: specializedAssemblyMetalSource(symmetryPlaneCode: geom.symmetryPlaneCode), options: nil)
     guard let function = library.makeFunction(name: "duffy_delta_blocks") else {
         try fail("failed to load Metal Duffy kernel")
     }
@@ -2919,7 +2931,7 @@ final class ResidentMetalContext {
             try fail("failed to create Metal command queue")
         }
         self.commandQueue = commandQueue
-        self.library = try device.makeLibrary(source: regularAssemblyMetalSource, options: nil)
+        self.library = try device.makeLibrary(source: specializedAssemblyMetalSource(symmetryPlaneCode: geom.symmetryPlaneCode), options: nil)
         guard let matrixFunction = library.makeFunction(name: "assemble_matrix_regular"),
               let rhsFunction = library.makeFunction(name: "assemble_rhs_source_regular"),
               let pairBlockFunction = library.makeFunction(name: "assemble_pair_blocks_regular"),
@@ -3496,7 +3508,7 @@ func assembleRegularMetal(geom: Geometry, neumann: [Complex32], k: Float) throws
     guard let commandQueue = device.makeCommandQueue() else {
         try fail("failed to create Metal command queue")
     }
-    let library = try device.makeLibrary(source: regularAssemblyMetalSource, options: nil)
+    let library = try device.makeLibrary(source: specializedAssemblyMetalSource(symmetryPlaneCode: geom.symmetryPlaneCode), options: nil)
     guard let matrixFunction = library.makeFunction(name: "assemble_matrix_regular"),
           let rhsFunction = library.makeFunction(name: "assemble_rhs_source_regular") else {
         try fail("failed to load Metal regular assembly kernels")
@@ -3643,7 +3655,7 @@ func evaluateExteriorMetal(
     guard let commandQueue = device.makeCommandQueue() else {
         try fail("failed to create Metal command queue")
     }
-    let library = try device.makeLibrary(source: regularAssemblyMetalSource, options: nil)
+    let library = try device.makeLibrary(source: specializedAssemblyMetalSource(symmetryPlaneCode: geom.symmetryPlaneCode), options: nil)
     guard let fieldFunction = library.makeFunction(name: "evaluate_field_regular") else {
         try fail("failed to load Metal field kernel")
     }
