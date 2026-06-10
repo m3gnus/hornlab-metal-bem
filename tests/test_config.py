@@ -77,6 +77,44 @@ def test_solve_config_accepts_native_symmetry_planes():
     assert SolveConfig(native_symmetry_plane="yz+xz").native_symmetry_plane == "yz+xz"
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"freq_count": 0}, "freq_count"),
+        ({"freq_min_hz": 0.0}, "freq_min_hz"),
+        ({"freq_min_hz": -10.0}, "freq_min_hz"),
+        ({"freq_min_hz": 1000.0, "freq_max_hz": 500.0}, "freq_max_hz"),
+        ({"mesh_scale": 0.0}, "mesh_scale"),
+        ({"air_density": 0.0}, "air_density"),
+    ],
+)
+def test_solve_config_rejects_degenerate_sweep_settings(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        SolveConfig(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"planes": []}, "planes"),
+        ({"distance_m": 0.0}, "distance_m"),
+        ({"angle_count": 0}, "angle_count"),
+        ({"origin": "Mouth"}, "origin"),
+        ({"origin": "centre"}, "origin"),
+    ],
+)
+def test_observation_config_rejects_degenerate_settings(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        ObservationConfig(**kwargs)
+
+
+def test_solve_config_mesh_loading_options_default_off():
+    cfg = SolveConfig()
+    assert cfg.mesh_validate is True
+    assert cfg.mesh_merge_tol == 1e-9
+    assert cfg.mesh_repair_normals is False
+
+
 def test_solve_config_rejects_unknown_metal_native_assembly_mode():
     with pytest.raises(ValueError, match="metal_native_assembly_mode"):
         SolveConfig(metal_native_assembly_mode="parity")  # type: ignore[arg-type]

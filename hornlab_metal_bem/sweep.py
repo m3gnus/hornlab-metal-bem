@@ -18,7 +18,7 @@ from .bie import (
     _compute_impedance,
     compute_surface_pressure_avg,
 )
-from .config import SolveConfig
+from .config import NATIVE_SYMMETRY_PLANES, SolveConfig
 from .mesh import LoadedMesh, make_pure_function_spaces
 from .observation import ObservationFrame, build_observation_points
 from .result import SolveResult
@@ -34,11 +34,25 @@ def _build_frequency_grid(config: SolveConfig) -> NDArray[np.float64]:
 
 def should_route_native_metal(config: SolveConfig) -> bool:
     """Return true when the native Metal path can run this config."""
-    if config.native_symmetry_plane not in {None, "yz", "xz", "xy", "yz+xz"}:
+    if (
+        config.native_symmetry_plane is not None
+        and config.native_symmetry_plane not in NATIVE_SYMMETRY_PLANES
+    ):
         raise AssemblyBackendUnavailable(
-            "native_symmetry_plane must be None, 'yz', 'xz', 'xy', or 'yz+xz'"
+            "native_symmetry_plane must be None or one of "
+            + ", ".join(repr(p) for p in NATIVE_SYMMETRY_PLANES)
         )
     return True
+
+
+def _read_f32_exact(path: Path, count: int) -> NDArray[np.float32]:
+    values = np.fromfile(path, dtype="<f4")
+    if values.size != count:
+        raise RuntimeError(
+            f"native result file {path} holds {values.size} float32 values, "
+            f"expected {count}"
+        )
+    return values
 
 
 def _read_complex_f32(
@@ -46,8 +60,9 @@ def _read_complex_f32(
     imag_path: Path,
     shape: tuple[int, ...],
 ) -> NDArray[np.complex64]:
-    real = np.fromfile(real_path, dtype="<f4").reshape(shape)
-    imag = np.fromfile(imag_path, dtype="<f4").reshape(shape)
+    count = int(np.prod(shape))
+    real = _read_f32_exact(real_path, count).reshape(shape)
+    imag = _read_f32_exact(imag_path, count).reshape(shape)
     return np.ascontiguousarray(real + 1j * imag, dtype=np.complex64)
 
 
@@ -206,12 +221,11 @@ def _directivity_from_pressure(
     pressure: NDArray[np.complex128],
     on_axis_idx: int,
 ) -> NDArray[np.float64]:
-    amplitudes = np.abs(pressure)
-    spl_raw = np.where(
-        amplitudes > 1e-15,
-        20.0 * np.log10(amplitudes / REFERENCE_PRESSURE),
-        -120.0,
-    )
+    # Floor amplitudes at -120 dB SPL so silent points stay finite, the
+    # mapping stays monotonic near zero, and log10 never sees 0.
+    floor_amplitude = REFERENCE_PRESSURE * 10.0 ** (-120.0 / 20.0)
+    amplitudes = np.maximum(np.abs(pressure), floor_amplitude)
+    spl_raw = 20.0 * np.log10(amplitudes / REFERENCE_PRESSURE)
     return spl_raw - spl_raw[:, on_axis_idx][:, None]
 
 
@@ -288,6 +302,17 @@ def run_sweep_native_metal(
     from the assembled non-Hermitian system.
     """
     should_route_native_metal(config)
+    frequencies = np.asarray(frequencies, dtype=np.float64)
+    if frequencies.size == 0:
+        raise ValueError("frequencies must contain at least one value")
+
+    mesh_tags = {int(tag) for tag in np.unique(mesh.physical_tags)}
+    missing_tags = sorted(set(config.velocity_sources) - mesh_tags)
+    if missing_tags:
+        raise ValueError(
+            f"velocity_sources tags {missing_tags} are not present in the mesh; "
+            f"available physical tags: {sorted(mesh_tags)}"
+        )
 
     try:
         from .metal.geometry import build_metal_geometry_buffers
@@ -470,7 +495,7 @@ def run_sweep_native_metal(
                         "observation_angles_deg": angles_deg,
                         "observation_planes": config.observation.planes,
                     }
-                    if not config.on_frequency_result(i, frequency_hz, callback_entry):
+                    if config.on_frequency_result(i, frequency_hz, callback_entry) is False:
                         logger.info("Early stop requested after %.1f Hz", frequency_hz)
                         break
 

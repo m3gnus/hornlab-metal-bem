@@ -15,6 +15,8 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from ..config import NATIVE_SYMMETRY_PLANES
+
 
 class MetalGeometryError(ValueError):
     """Raised when grid/space metadata cannot satisfy the Metal data contract."""
@@ -141,7 +143,7 @@ def validate_native_symmetry_plane(
     if symmetry_plane is None:
         return None
     plane = str(symmetry_plane).strip().lower()
-    if plane not in {"yz", "xz", "xy", "yz+xz"}:
+    if plane not in NATIVE_SYMMETRY_PLANES:
         raise MetalGeometryError(
             "native_symmetry_plane currently supports 'yz', 'xz', 'xy', and 'yz+xz'"
         )
@@ -155,7 +157,9 @@ def validate_native_symmetry_plane(
 
     def _validate_axis(component: int, name: str, plane_name: str) -> None:
         values = coords[component]
-        min_value = float(np.min(values))
+        # Only vertices referenced by triangles constrain the reduced domain;
+        # orphan vertices on the negative side are harmless.
+        min_value = float(np.min(values[used_vertices]))
         if min_value < -tolerance:
             raise MetalGeometryError(
                 f"native_symmetry_plane={plane!r} requires a positive-{name} "

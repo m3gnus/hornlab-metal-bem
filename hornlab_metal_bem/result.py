@@ -33,7 +33,9 @@ class SolveResult:
     # (F, P, N_angles) — normalized directivity in dB, on-axis = 0 dB
     directivity_db: NDArray[np.float64]
 
-    # (F,) — complex throat impedance, normalised to rho*c
+    # (F,) — area-weighted average complex surface pressure on the impedance
+    # source tag (pascals per unit drive). Not divided by drive velocity and
+    # not normalised to rho*c.
     impedance: NDArray[np.complex128]
 
     observation_angles_deg: NDArray[np.float64]

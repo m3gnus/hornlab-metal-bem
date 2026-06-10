@@ -39,10 +39,16 @@ def _compute_impedance(
     p_surface,
     physical_tags: NDArray[np.int32],
     p1_space,
-    velocity_weights: NDArray | None = None,
     source_tag: int = 2,
 ) -> complex:
-    """Throat impedance: ``Z = integral(p dA) / Q_eff``."""
+    """Area-weighted average complex surface pressure on ``source_tag``.
+
+    ``integral(p dA) / integral(dA)`` in pascals per unit drive. This is not
+    a true acoustic impedance: it is not divided by the drive velocity and is
+    not normalised to ``rho*c``. The native helper computes the identical
+    reduction in ``averageSurfacePressureForTag``; this is the Python fallback
+    when the helper returns full surface pressure instead of reductions.
+    """
     source_mask = physical_tags == source_tag
     source_elems = np.where(source_mask)[0]
 
@@ -58,16 +64,12 @@ def _compute_impedance(
     p_avg = np.mean(p_at_verts, axis=1)
 
     total_force = np.sum(p_avg * areas)
+    total_area = np.sum(areas)
 
-    if velocity_weights is not None and len(velocity_weights) == len(source_elems):
-        q_eff = np.sum(velocity_weights * areas)
-    else:
-        q_eff = np.sum(areas)
-
-    if abs(q_eff) < 1e-30:
+    if abs(total_area) < 1e-30:
         return 0.0 + 0.0j
 
-    return complex(total_force / q_eff)
+    return complex(total_force / total_area)
 
 
 def compute_surface_pressure_avg(

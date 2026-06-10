@@ -16,6 +16,11 @@ class VelocityMode:
 NativeSymmetryPlane = Literal["yz", "xz", "xy", "yz+xz"]
 MetalNativeAssemblyMode = Literal["corrected", "optimized"]
 
+# Single source of truth for the supported native symmetry planes. Used by
+# config validation, native routing, and geometry validation so the lists
+# cannot drift apart.
+NATIVE_SYMMETRY_PLANES: tuple[str, ...] = ("yz", "xz", "xy", "yz+xz")
+
 
 @dataclass
 class ObservationConfig:
@@ -30,6 +35,16 @@ class ObservationConfig:
     # When set, build_observation_points() returns these directly
     # instead of constructing polar arcs from the frame.
     custom_points: dict[str, NDArray[np.float64]] | None = None
+
+    def __post_init__(self) -> None:
+        if not self.planes:
+            raise ValueError("observation planes must not be empty")
+        if self.distance_m <= 0:
+            raise ValueError("distance_m must be positive")
+        if self.angle_count < 1:
+            raise ValueError("angle_count must be at least 1")
+        if self.origin not in {"mouth", "throat"}:
+            raise ValueError("origin must be 'mouth' or 'throat'")
 
 
 @dataclass
@@ -69,6 +84,12 @@ class SolveConfig:
     # Mesh scale (applied on load if mesh isn't already in metres)
     mesh_scale: float = 1.0
 
+    # Mesh loading options forwarded to load_mesh() when solve() is given a
+    # path. Ignored for pre-loaded LoadedMesh inputs.
+    mesh_validate: bool = True
+    mesh_merge_tol: float = 1e-9
+    mesh_repair_normals: bool = False
+
     # Air density (kg/m^3). Default 1.2041 matches standard air at 20 C.
     air_density: float = 1.2041
 
@@ -78,15 +99,29 @@ class SolveConfig:
 
     # Per-frequency result callback for early stopping.
     # Signature: (freq_index: int, frequency_hz: float, log_entry: dict) -> bool
-    # Return False to abort the sweep (partial SolveResult is built).
+    # Return exactly False to abort the sweep (partial SolveResult is built);
+    # any other return value, including None, continues.
     on_frequency_result: Callable[[int, float, dict], bool] | None = None
 
     def __post_init__(self) -> None:
         if self.freq_spacing not in {"log", "linear"}:
             raise ValueError("freq_spacing must be 'log' or 'linear'")
+        if self.freq_count < 1:
+            raise ValueError("freq_count must be at least 1")
+        if self.freq_min_hz <= 0:
+            raise ValueError("freq_min_hz must be positive")
+        if self.freq_max_hz < self.freq_min_hz:
+            raise ValueError("freq_max_hz must be >= freq_min_hz")
+        if self.mesh_scale <= 0:
+            raise ValueError("mesh_scale must be positive")
+        if self.air_density <= 0:
+            raise ValueError("air_density must be positive")
         if self.velocity_mode not in {VelocityMode.VELOCITY, VelocityMode.ACCELERATION}:
             raise ValueError("velocity_mode must be 'velocity' or 'acceleration'")
-        if self.native_symmetry_plane not in {None, "yz", "xz", "xy", "yz+xz"}:
+        if (
+            self.native_symmetry_plane is not None
+            and self.native_symmetry_plane not in NATIVE_SYMMETRY_PLANES
+        ):
             raise ValueError(
                 "native_symmetry_plane must be None, 'yz', 'xz', 'xy', or 'yz+xz'"
             )

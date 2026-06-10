@@ -40,7 +40,13 @@ def native_config(**overrides) -> SolveConfig:
 def _resolve_mesh(mesh, config: SolveConfig) -> LoadedMesh:
     if isinstance(mesh, LoadedMesh):
         return mesh
-    return load_mesh(mesh, scale=config.mesh_scale)
+    return load_mesh(
+        mesh,
+        scale=config.mesh_scale,
+        validate=config.mesh_validate,
+        merge_tol=config.mesh_merge_tol,
+        repair_normals=config.mesh_repair_normals,
+    )
 
 
 def _resolve_frame(loaded: LoadedMesh, config: SolveConfig) -> ObservationFrame:

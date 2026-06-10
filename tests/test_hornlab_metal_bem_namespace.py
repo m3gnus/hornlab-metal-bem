@@ -36,7 +36,7 @@ def test_hornlab_metal_bem_solve_defaults_to_pure_native_dispatch(monkeypatch):
     sentinel = object()
     calls = {}
 
-    def fake_load_mesh(mesh, *, scale):
+    def fake_load_mesh(mesh, *, scale, validate=True, merge_tol=1e-9, repair_normals=False):
         calls["mesh"] = mesh
         calls["scale"] = scale
         return loaded
