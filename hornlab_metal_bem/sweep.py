@@ -410,45 +410,40 @@ def run_sweep_native_metal(
                 if config.progress_callback is not None:
                     config.progress_callback(i, len(freq_values), frequency_hz)
         else:
-            for i, freq in enumerate(frequencies):
-                frequency_hz = float(freq)
+            freq_values = np.asarray(frequencies, dtype=np.float64)
+            k_values = (2.0 * np.pi * freq_values / SPEED_OF_SOUND).astype(
+                np.float32,
+            )
+            neumann_rows = _build_neumann_rows(
+                dp0_space,
+                mesh.physical_tags,
+                freq_values,
+                config,
+            )
+            logger.info(
+                "Running %d-frequency native Metal streamed assembly/solve/field batch.",
+                len(freq_values),
+            )
+
+            def _on_case_result(i: int, system) -> bool | None:
+                frequency_hz = float(freq_values[i])
                 logger.info(
                     "[%d/%d] %.1f Hz (native Metal %s assembly)",
                     i + 1,
-                    len(frequencies),
+                    len(freq_values),
                     frequency_hz,
                     config.metal_native_assembly_mode,
                 )
-                t_freq = time.time()
-                omega = 2.0 * np.pi * frequency_hz
-                k_real = omega / SPEED_OF_SOUND
-                neumann = _build_driver_neumann_coeffs(
-                    dp0_space,
-                    mesh.physical_tags,
-                    omega,
-                    config,
-                    np.complex64,
+                timing_s = (
+                    float(system.assembly_s)
+                    + float(system.dense_solve_s)
+                    + float(system.field_s)
                 )
-                system = session.assemble_solve_evaluate_standard_neumann_batch(
-                    np.array([frequency_hz], dtype=np.float64),
-                    np.array([k_real], dtype=np.float32),
-                    neumann.reshape(1, -1),
-                    field_points,
-                    batch_id="all_observation_planes",
-                    operation_id=(
-                        f"assembly-solve-field-{i:04d}-"
-                        f"{frequency_hz:.6g}hz-all-planes"
-                    ),
-                    source_tags=source_tags,
-                    impedance_source_tag=impedance_source_tag,
-                    write_surface_pressure=config.return_surface_pressure,
-                )[0]
-                elapsed = time.time() - t_freq
                 log_entry = _append_system_result(
                     frequency_hz=frequency_hz,
                     system=system,
-                    backend="native_metal_resident_assembly_solve_field_single",
-                    timing_s=elapsed,
+                    backend="native_metal_resident_assembly_solve_field_streamed",
+                    timing_s=timing_s,
                     mesh=mesh,
                     p1_space=p1_space,
                     source_tags=source_tags,
@@ -466,9 +461,8 @@ def run_sweep_native_metal(
                     solver_log=solver_log,
                     completed_freqs=completed_freqs,
                 )
-
                 if config.progress_callback is not None:
-                    config.progress_callback(i, len(frequencies), frequency_hz)
+                    config.progress_callback(i, len(freq_values), frequency_hz)
                 callback_entry = {
                     **log_entry,
                     "observation_pressure_complex": pressure_rows[-1],
@@ -478,7 +472,24 @@ def run_sweep_native_metal(
                 }
                 if config.on_frequency_result(i, frequency_hz, callback_entry) is False:
                     logger.info("Early stop requested after %.1f Hz", frequency_hz)
-                    break
+                    return False
+                return None
+
+            # One resident helper invocation for the whole sweep; per-case
+            # results stream back as each frequency completes, and a False
+            # callback return terminates the helper early.
+            session.assemble_solve_evaluate_standard_neumann_batch(
+                freq_values,
+                k_values,
+                neumann_rows,
+                field_points,
+                batch_id="all_observation_planes",
+                operation_id="assembly-solve-field-resident-stream",
+                source_tags=source_tags,
+                impedance_source_tag=impedance_source_tag,
+                write_surface_pressure=config.return_surface_pressure,
+                on_case_result=_on_case_result,
+            )
 
     sp_avg: dict[int, np.ndarray] = {}
     for tag in source_tags:

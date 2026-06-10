@@ -2173,6 +2173,115 @@ def test_native_executable_resident_assembly_solve_field_matches_split_path(
     assert np.linalg.norm(combined_field - split_field) / np.linalg.norm(split_field) < 1e-5
 
 
+def test_native_executable_streams_per_case_results(monkeypatch, tmp_path):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
+    neumann = np.array(
+        [
+            [1.0 + 0.0j, 0.0 + 0.5j],
+            [0.5 + 0.0j, 0.0 + 0.25j],
+            [0.25 + 0.0j, 0.0 + 0.125j],
+        ],
+        dtype=np.complex64,
+    )
+    frequency_hz = np.array([100.0, 200.0, 300.0], dtype=np.float64)
+    k_real = np.array([1.83, 3.66, 5.49], dtype=np.float32)
+    observation_points = np.array(
+        [[0.0, 0.0, 1.0], [0.1, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    streamed_calls: list[tuple[int, object]] = []
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_geometry_buffers(),
+        work_dir=tmp_path / "native-streamed-case-results-session",
+        session_id="native-streamed-case-results-test",
+    ) as session:
+        streamed = session.assemble_solve_evaluate_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            neumann,
+            observation_points,
+            operation_id="streamed-batch",
+            source_tags=[2],
+            impedance_source_tag=2,
+            on_case_result=lambda i, solved: streamed_calls.append((i, solved)),
+        )
+        oneshot = session.assemble_solve_evaluate_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            neumann,
+            observation_points,
+            operation_id="oneshot-batch",
+            source_tags=[2],
+            impedance_source_tag=2,
+        )
+
+        assert [index for index, _ in streamed_calls] == [0, 1, 2]
+        assert [solved for _, solved in streamed_calls] == streamed
+        assert len(streamed) == len(oneshot) == 3
+        case_dir = (
+            tmp_path
+            / "native-streamed-case-results-session"
+            / "streamed-batch"
+            / "case-results"
+        )
+        case_files = sorted(path.name for path in case_dir.glob("case-*.json"))
+        assert case_files == ["case-0000.json", "case-0001.json", "case-0002.json"]
+        for solved, reference in zip(streamed, oneshot):
+            assert solved.frequency_hz == reference.frequency_hz
+            assert solved.lapack_info == 0
+            assert solved.impedance == pytest.approx(reference.impedance, rel=1e-6)
+            streamed_field = np.fromfile(solved.field_real_f32, dtype="<f4")
+            reference_field = np.fromfile(reference.field_real_f32, dtype="<f4")
+            np.testing.assert_allclose(streamed_field, reference_field, rtol=1e-5)
+            # Whole-batch diagnostics are only known once the batch ends, so
+            # streamed per-case diagnostics must omit them rather than guess.
+            assert "batch" not in solved.diagnostics
+            assert "batch" in reference.diagnostics
+        result = json.loads(
+            (
+                tmp_path
+                / "native-streamed-case-results-session"
+                / "streamed-batch"
+                / "assembly-solve-field-batch-result.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert result["streamed_case_results"] is True
+
+        early = session.assemble_solve_evaluate_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            neumann,
+            observation_points,
+            operation_id="early-stop-batch",
+            source_tags=[2],
+            impedance_source_tag=2,
+            on_case_result=lambda i, solved: False,
+        )
+        assert len(early) == 1
+        assert early[0].frequency_hz == pytest.approx(100.0)
+
+        with pytest.raises(ValueError, match="write_batched_field"):
+            session.assemble_solve_evaluate_standard_neumann_batch(
+                frequency_hz,
+                k_real,
+                neumann,
+                observation_points,
+                operation_id="streamed-batched-field",
+                source_tags=[2],
+                impedance_source_tag=2,
+                write_batched_field=True,
+                on_case_result=lambda i, solved: None,
+            )
+
+
 def test_native_executable_field_evaluation_on_tiny_mesh(tmp_path):
     status = discover_native_runtime(run_smoke_test=True)
     if not status.available:

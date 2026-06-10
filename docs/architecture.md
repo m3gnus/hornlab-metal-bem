@@ -69,14 +69,26 @@ config=None)` share the same execution flow:
 
 When `on_frequency_result` is unset, `sweep.py` sends the full frequency batch
 and may request a single batched field output. When `on_frequency_result` is
-set, it runs one-frequency native batches so streaming callbacks and early stop
-can be honored. Streaming callback entries include normalized directivity and
-complex observation pressure for the solved frequency.
+set, it still sends one full-sweep batch but passes `on_case_result` down to
+the session, which opts the helper into streamed per-case results: the helper
+writes one `case-XXXX.json` manifest (atomically) as each frequency completes,
+Python tails those files to fire `on_frequency_result` while later frequencies
+are still solving, and an early-stop request terminates the helper process —
+every finished case's outputs are already on disk. Streaming callback entries
+include normalized directivity and complex observation pressure for the solved
+frequency. Helpers that predate streamed case results degrade gracefully: the
+batch runs to completion and callbacks fire from the final batch manifest.
 
 "Resident" refers to buffer and pipeline reuse across the cases of a single
-helper invocation: each operation manifest launches one helper process. The
-batch path therefore pays Metal device/pipeline setup and geometry upload
-once per sweep, while the streaming path pays it once per frequency.
+helper invocation: each operation manifest launches one helper process. Both
+the batch and streaming paths therefore pay Metal device/pipeline setup and
+geometry upload once per sweep.
+
+Inside one `assemble_solve_evaluate_standard_neumann_batch` invocation, the
+helper additionally overlaps GPU and CPU work: case i+1's assembly command
+buffers are committed before case i's Accelerate dense solve runs, with
+even/odd cases writing to double-buffered assembly outputs. Batch wall time
+then approaches max(GPU assembly, CPU solve) instead of their sum.
 
 ## Boundary Lab Adapter
 

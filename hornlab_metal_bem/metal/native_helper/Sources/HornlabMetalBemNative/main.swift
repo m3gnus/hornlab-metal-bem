@@ -33,7 +33,9 @@ func writeJSON(_ path: String, _ object: [String: Any]) throws {
         withJSONObject: object,
         options: [.prettyPrinted, .sortedKeys]
     )
-    try data.write(to: url)
+    // Atomic write (temp file + rename) so a reader polling for streamed
+    // per-case results never observes a partially written manifest.
+    try data.write(to: url, options: .atomic)
 }
 
 func descriptorPath(root: String, descriptor: [String: Any]) throws -> String {
@@ -4772,6 +4774,30 @@ func assembleSolveEvaluateStandardNeumannBatch(
     if (batchFieldReDesc == nil) != (batchFieldImDesc == nil) {
         try fail("batch observation real and imag outputs must be provided together")
     }
+    // Streaming contract: when case_results_dir is set, each case's result
+    // manifest is written there (atomically) as soon as the case completes,
+    // so the Python caller can fire per-frequency callbacks and terminate
+    // this process early with all finished results already on disk.
+    let caseResultsDir: String?
+    if let rawCaseResultsDir = payload["case_results_dir"] {
+        guard let dir = rawCaseResultsDir as? String, !dir.isEmpty else {
+            try fail("case_results_dir must be a non-empty string")
+        }
+        if dir.hasPrefix("/") || dir.split(separator: "/").contains("..") {
+            try fail("case_results_dir must be a relative path without '..'")
+        }
+        if batchFieldReDesc != nil {
+            try fail(
+                "case_results_dir requires per-case field outputs; "
+                    + "batch_outputs are only written when the batch completes"
+            )
+        }
+        caseResultsDir = URL(fileURLWithPath: geom.root)
+            .appendingPathComponent(dir)
+            .path
+    } else {
+        caseResultsDir = nil
+    }
     var batchFieldReValues: [Float] = []
     var batchFieldImValues: [Float] = []
     var sharedObservationPoints: [(Float, Float, Float)]? = nil
@@ -5059,6 +5085,16 @@ func assembleSolveEvaluateStandardNeumannBatch(
         if let dispatch = field.metalDispatch {
             caseResult["field_metal_dispatch"] = dispatch
         }
+        if let caseResultsDir {
+            var streamedResult = caseResult
+            streamedResult["case_index"] = caseIndex
+            try writeJSON(
+                URL(fileURLWithPath: caseResultsDir)
+                    .appendingPathComponent(String(format: "case-%04d.json", caseIndex))
+                    .path,
+                streamedResult
+            )
+        }
         caseResults.append(caseResult)
         totalAssemblySeconds += assembly.seconds
         totalRegularSeconds += max(0.0, assembly.seconds - correctionSeconds)
@@ -5092,6 +5128,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
         "resident_duffy_reduction_plan_seconds": context.duffyReductionPlanBuildSeconds,
         "wall_seconds": CFAbsoluteTimeGetCurrent() - batchStart,
         "assembly_solve_overlap": pipelineAssembly,
+        "streamed_case_results": caseResultsDir != nil,
         "resident_reuse": [
             "geometry_buffers": true,
             "assembly_output_buffers": true,

@@ -10,6 +10,7 @@ import platform
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -728,12 +729,21 @@ class MetalNativeStandardSession:
         impedance_source_tag: int | None = None,
         write_surface_pressure: bool = True,
         write_batched_field: bool = False,
+        on_case_result: Any | None = None,
     ) -> list[Any]:
-        """Assemble, solve, and evaluate field in one resident helper run."""
+        """Assemble, solve, and evaluate field in one resident helper run.
+
+        When ``on_case_result`` is provided, the helper streams per-case
+        result manifests to disk as each case completes and
+        ``on_case_result(index, result)`` fires per case while the batch is
+        still running. Returning exactly ``False`` from the callback
+        terminates the helper; the cases solved so far are returned. Streamed
+        results do not carry whole-batch diagnostics (the batch is still in
+        flight when each case completes).
+        """
         from .session import (
             BatchAssemblySolveFieldPayload,
             BinaryArrayDescriptor,
-            DenseSolveFieldResult,
             read_json_manifest,
             write_binary_array,
             write_json_manifest,
@@ -741,6 +751,11 @@ class MetalNativeStandardSession:
         )
 
         self._ensure_open()
+        if on_case_result is not None and write_batched_field:
+            raise ValueError(
+                "on_case_result streaming requires per-case field outputs; "
+                "disable write_batched_field"
+            )
         frequencies = np.asarray(frequency_hz, dtype=np.float64)
         k_values = np.asarray(k_real, dtype=np.float32)
         neumann_values = np.asarray(neumann_dp0)
@@ -867,17 +882,33 @@ class MetalNativeStandardSession:
                 }
             )
 
+        case_results_dir = op_dir / "case-results"
         payload = BatchAssemblySolveFieldPayload(
             session_id=self.info.session_id,
             batch_id=batch_id,
             cases=tuple(cases),
             batch_outputs=batch_outputs,
+            case_results_dir=(
+                case_results_dir.relative_to(self.info.work_dir).as_posix()
+                if on_case_result is not None
+                else None
+            ),
         )
         payload_path = write_json_manifest(
             payload,
             op_dir / "assembly-solve-field-batch.json",
         )
         result_path = op_dir / "assembly-solve-field-batch-result.json"
+
+        if on_case_result is not None:
+            return self._stream_assemble_solve_evaluate(
+                payload_path=payload_path,
+                result_path=result_path,
+                case_results_dir=case_results_dir,
+                expected_count=int(frequencies.size),
+                on_case_result=on_case_result,
+            )
+
         self._run_native_helper(
             "assemble_solve_evaluate_standard_neumann_batch",
             payload_path=payload_path,
@@ -890,55 +921,126 @@ class MetalNativeStandardSession:
             op="assemble_solve_evaluate_standard_neumann_batch",
         )
         batch_diagnostics = _native_batch_diagnostics(result)
-        solved_fields = []
-        for case_result in case_results:
-            pressure_real = case_result.get("pressure_real_f32")
-            pressure_imag = case_result.get("pressure_imag_f32")
-            solved_fields.append(
-                DenseSolveFieldResult(
-                    session_id=str(case_result["session_id"]),
-                    batch_id=str(case_result["batch_id"]),
-                    frequency_hz=float(case_result["frequency_hz"]),
-                    pressure_real_f32=(
-                        self.info.work_dir / str(pressure_real)
-                        if pressure_real is not None
-                        else None
-                    ),
-                    pressure_imag_f32=(
-                        self.info.work_dir / str(pressure_imag)
-                        if pressure_imag is not None
-                        else None
-                    ),
-                    pressure_shape=tuple(int(v) for v in case_result["pressure_shape"]),
-                    field_real_f32=self.info.work_dir
-                    / case_result["observation_pressure_real_f32"],
-                    field_imag_f32=self.info.work_dir
-                    / case_result["observation_pressure_imag_f32"],
-                    field_shape=tuple(int(v) for v in case_result["field_shape"]),
-                    assembly_s=float(case_result["assembly_seconds"]),
-                    dense_solve_s=float(case_result["dense_solve_seconds"]),
-                    field_s=float(case_result["field_seconds"]),
-                    lapack_info=int(case_result["lapack_info"]),
-                    field_row_index=(
-                        int(case_result["field_row_index"])
-                        if case_result.get("field_row_index") is not None
-                        else None
-                    ),
-                    field_batch_shape=(
-                        tuple(int(v) for v in case_result["field_batch_shape"])
-                        if case_result.get("field_batch_shape") is not None
-                        else None
-                    ),
-                    impedance=_complex_from_manifest(case_result.get("impedance")),
-                    surface_pressure_avg=_complex_map_from_manifest(
-                        case_result.get("surface_pressure_avg")
-                    ),
-                    diagnostics=_native_case_diagnostics(
-                        case_result,
-                        batch_diagnostics=batch_diagnostics,
-                    ),
-                )
+        return [
+            self._dense_solve_field_result(case_result, batch_diagnostics)
+            for case_result in case_results
+        ]
+
+    def _dense_solve_field_result(
+        self,
+        case_result: dict[str, Any],
+        batch_diagnostics: dict[str, Any],
+    ) -> Any:
+        from .session import DenseSolveFieldResult
+
+        pressure_real = case_result.get("pressure_real_f32")
+        pressure_imag = case_result.get("pressure_imag_f32")
+        return DenseSolveFieldResult(
+            session_id=str(case_result["session_id"]),
+            batch_id=str(case_result["batch_id"]),
+            frequency_hz=float(case_result["frequency_hz"]),
+            pressure_real_f32=(
+                self.info.work_dir / str(pressure_real)
+                if pressure_real is not None
+                else None
+            ),
+            pressure_imag_f32=(
+                self.info.work_dir / str(pressure_imag)
+                if pressure_imag is not None
+                else None
+            ),
+            pressure_shape=tuple(int(v) for v in case_result["pressure_shape"]),
+            field_real_f32=self.info.work_dir
+            / case_result["observation_pressure_real_f32"],
+            field_imag_f32=self.info.work_dir
+            / case_result["observation_pressure_imag_f32"],
+            field_shape=tuple(int(v) for v in case_result["field_shape"]),
+            assembly_s=float(case_result["assembly_seconds"]),
+            dense_solve_s=float(case_result["dense_solve_seconds"]),
+            field_s=float(case_result["field_seconds"]),
+            lapack_info=int(case_result["lapack_info"]),
+            field_row_index=(
+                int(case_result["field_row_index"])
+                if case_result.get("field_row_index") is not None
+                else None
+            ),
+            field_batch_shape=(
+                tuple(int(v) for v in case_result["field_batch_shape"])
+                if case_result.get("field_batch_shape") is not None
+                else None
+            ),
+            impedance=_complex_from_manifest(case_result.get("impedance")),
+            surface_pressure_avg=_complex_map_from_manifest(
+                case_result.get("surface_pressure_avg")
+            ),
+            diagnostics=_native_case_diagnostics(
+                case_result,
+                batch_diagnostics=batch_diagnostics,
+            ),
+        )
+
+    def _stream_assemble_solve_evaluate(
+        self,
+        *,
+        payload_path: Path,
+        result_path: Path,
+        case_results_dir: Path,
+        expected_count: int,
+        on_case_result: Any,
+    ) -> list[Any]:
+        """Run one batch helper invocation, firing callbacks per case.
+
+        Per-case results are tailed from ``case_results_dir`` while the
+        helper is still solving later frequencies. A ``False`` return from
+        ``on_case_result`` terminates the helper early; the cases already
+        solved are returned and their outputs stay on disk. Helpers that
+        predate streamed case results fall back to the one-shot protocol:
+        callbacks then fire from the final batch manifest after exit.
+        """
+        from .session import read_json_manifest
+
+        op = "assemble_solve_evaluate_standard_neumann_batch"
+        solved_fields: list[Any] = []
+
+        def consume_available_cases() -> bool:
+            """Fire callbacks for ready case files; True when stop requested."""
+            while len(solved_fields) < expected_count:
+                case_path = case_results_dir / f"case-{len(solved_fields):04d}.json"
+                if not case_path.is_file():
+                    return False
+                case_result = json.loads(case_path.read_text(encoding="utf-8"))
+                solved = self._dense_solve_field_result(case_result, {})
+                solved_fields.append(solved)
+                if on_case_result(len(solved_fields) - 1, solved) is False:
+                    return True
+            return False
+
+        completed = self._run_native_helper_streaming(
+            op,
+            payload_path=payload_path,
+            result_path=result_path,
+            poll=consume_available_cases,
+        )
+        if not completed:
+            return solved_fields
+
+        result = read_json_manifest(result_path)
+        case_results = _case_results_from_manifest(
+            result,
+            expected_count=expected_count,
+            op=op,
+        )
+        batch_diagnostics = _native_batch_diagnostics(result)
+        # One-shot fallback: a helper without streamed case results writes
+        # only the final manifest, so fire the remaining callbacks from it.
+        for index in range(len(solved_fields), expected_count):
+            solved = self._dense_solve_field_result(
+                case_results[index],
+                batch_diagnostics,
             )
+            solved_fields.append(solved)
+            if on_case_result(index, solved) is False:
+                break
         return solved_fields
 
     def evaluate_standard_exterior(
@@ -1275,6 +1377,98 @@ class MetalNativeStandardSession:
             raise RuntimeError(f"Swift/Metal native helper failed during {op}: {message}")
         if not result_path.is_file():
             raise RuntimeError(f"Swift/Metal native helper did not write {result_path}")
+
+    def _run_native_helper_streaming(
+        self,
+        op: str,
+        *,
+        payload_path: Path,
+        result_path: Path,
+        poll: Any,
+    ) -> bool:
+        """Run one helper operation while polling for streamed results.
+
+        ``poll()`` is invoked repeatedly while the helper runs and once more
+        after it exits; returning True requests an early stop, upon which the
+        helper process is terminated. Returns True when the helper ran to
+        completion, False when it was stopped early.
+        """
+        status = self.info.runtime_status
+        if not status.available:
+            raise RuntimeError(
+                "Swift/Metal native helper is unavailable for execution: "
+                + "; ".join(status.unavailable_reasons)
+            )
+        command = _native_helper_command(
+            status,
+            op,
+            str(self.info.manifest_path),
+            str(payload_path),
+            str(result_path),
+        )
+        timeout_s = (
+            self._runtime_config or MetalNativeRuntimeConfig()
+        ).operation_timeout_s
+        env = None
+        if self._extra_env:
+            env = {**os.environ, **self._extra_env}
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=status.backend_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"Failed to launch Swift/Metal native helper: {exc}"
+            ) from exc
+
+        deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+        try:
+            while True:
+                if poll():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=10.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    return False
+                if process.poll() is not None:
+                    break
+                if deadline is not None and time.monotonic() > deadline:
+                    process.kill()
+                    process.wait()
+                    raise RuntimeError(
+                        f"Swift/Metal native helper timed out after {timeout_s}s "
+                        f"during {op}"
+                    )
+                time.sleep(0.005)
+        except BaseException:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            raise
+
+        stdout, stderr = process.communicate()
+        if process.returncode != 0:
+            message = (
+                (stderr or "").strip()
+                or (stdout or "").strip()
+                or f"Swift helper exited with {process.returncode}"
+            )
+            raise RuntimeError(
+                f"Swift/Metal native helper failed during {op}: {message}"
+            )
+        if not result_path.is_file():
+            raise RuntimeError(
+                f"Swift/Metal native helper did not write {result_path}"
+            )
+        # Consume case files written between the last poll and process exit.
+        return not poll()
 
 
 def _find_swift(

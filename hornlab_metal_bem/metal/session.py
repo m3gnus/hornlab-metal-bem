@@ -183,16 +183,30 @@ class BatchAssemblySolvePayload:
 
 @dataclass(frozen=True)
 class BatchAssemblySolveFieldPayload:
-    """Manifest payload for resident assembly, dense solve, and field evaluation."""
+    """Manifest payload for resident assembly, dense solve, and field evaluation.
+
+    ``case_results_dir`` opts into streamed per-case results: the helper
+    writes ``case-XXXX.json`` manifests into that work-dir-relative directory
+    as each case completes, in addition to the final batch result manifest.
+    """
 
     session_id: str
     batch_id: str
     cases: tuple[dict[str, Any], ...]
     batch_outputs: dict[str, Any] | None = None
+    case_results_dir: str | None = None
     schema: str = METAL_STANDARD_SCHEMA
     op: str = "assemble_solve_evaluate_standard_neumann_batch"
     index_base: int = INDEX_BASE
     matrix_layout: str = MATRIX_LAYOUT_ROW_MAJOR_C
+
+    def __post_init__(self) -> None:
+        if self.case_results_dir is not None:
+            object.__setattr__(
+                self,
+                "case_results_dir",
+                _validate_relative_manifest_path(self.case_results_dir),
+            )
 
     def to_manifest(self) -> dict[str, Any]:
         payload = {
@@ -206,6 +220,8 @@ class BatchAssemblySolveFieldPayload:
         }
         if self.batch_outputs is not None:
             payload["batch_outputs"] = self.batch_outputs
+        if self.case_results_dir is not None:
+            payload["case_results_dir"] = self.case_results_dir
         return payload
 
 

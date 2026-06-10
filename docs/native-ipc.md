@@ -91,6 +91,27 @@ Batch payloads contain a non-empty `cases` list. Cases include a stable
 combined assembly/solve/field operation may also include `batch_outputs` for a
 single row-major `(case_count, n_obs)` field array pair.
 
+## Streamed Per-Case Results
+
+`assemble_solve_evaluate_standard_neumann_batch` accepts an optional
+`case_results_dir` payload key: a non-empty work-dir-relative POSIX path
+without `..`. When present, the helper writes `case-0000.json`,
+`case-0001.json`, … into that directory as each case completes, after the
+case's binary outputs are on disk. Each streamed manifest is the case's entry
+from the final result `cases` list plus a `case_index` key, and is written
+atomically (temp file + rename) so a polling reader never observes partial
+JSON. The final batch result reports `streamed_case_results: true`.
+
+This is the streaming contract used by `sweep.py` when
+`SolveConfig.on_frequency_result` is set: Python launches one helper process
+for the whole sweep, tails the per-case manifests to fire the callback per
+frequency, and terminates the helper for an early stop — results already
+streamed stay valid. `case_results_dir` is rejected together with
+`batch_outputs`, because the single batched field array is only written when
+the whole batch completes. Helpers that predate this key ignore unknown
+payload fields, so the Python side falls back to firing callbacks from the
+final batch manifest after the process exits.
+
 ## Array Conventions
 
 - Geometry vertices and triangle normals use `3 x N` orientation.
