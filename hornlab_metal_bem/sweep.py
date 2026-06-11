@@ -17,7 +17,7 @@ from .bie import (
     _compute_impedance,
     compute_surface_pressure_avg,
 )
-from .config import NATIVE_SYMMETRY_PLANES, SolveConfig
+from .config import BIEFormulation, NATIVE_SYMMETRY_PLANES, SolveConfig
 from .mesh import LoadedMesh, make_pure_function_spaces
 from .observation import ObservationFrame, build_observation_points
 from .result import SolveResult
@@ -100,8 +100,16 @@ def _native_env_overrides(config: SolveConfig) -> dict[str, str]:
     concurrent solves on different threads cannot race on each other's
     assembly mode or threadgroup overrides.
     """
+    experimental_complex_or_robin = (
+        config.formulation == BIEFormulation.COMPLEX_K
+        or bool(config.impedance_sources)
+    )
     overrides: dict[str, str] = {
-        "HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE": config.metal_native_assembly_mode,
+        "HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE": (
+            "reference"
+            if experimental_complex_or_robin
+            else config.metal_native_assembly_mode
+        ),
     }
     if os.environ.get("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE") is None:
         overrides["HORNLAB_METAL_BEM_NATIVE_FIELD_MODE"] = "optimized"
@@ -126,6 +134,41 @@ def _native_env_overrides(config: SolveConfig) -> dict[str, str]:
         if value is not None:
             overrides[name] = str(value)
     return overrides
+
+
+def _k_values_for_native(
+    frequencies: NDArray[np.float64],
+    config: SolveConfig,
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    k_real = (2.0 * np.pi * frequencies / SPEED_OF_SOUND).astype(np.float32)
+    if config.formulation == BIEFormulation.COMPLEX_K:
+        k_imag = (k_real.astype(np.float64) * config.complex_k_shift).astype(
+            np.float32,
+        )
+    else:
+        k_imag = np.zeros_like(k_real, dtype=np.float32)
+    return k_real, k_imag
+
+
+def _active_impedance_sources(
+    physical_tags: NDArray[np.int32],
+    config: SolveConfig,
+) -> dict[int, complex]:
+    active: dict[int, complex] = {}
+    if not config.impedance_sources:
+        return active
+    mesh_tags = {int(tag) for tag in np.unique(physical_tags)}
+    for tag, beta in config.impedance_sources.items():
+        tag_int = int(tag)
+        if tag_int not in mesh_tags:
+            logger.warning(
+                "impedance_sources references tag %d but mesh has no elements "
+                "with that tag; skipping",
+                tag_int,
+            )
+            continue
+        active[tag_int] = complex(beta)
+    return active
 
 
 def _build_neumann_rows(
@@ -346,6 +389,7 @@ def run_sweep_native_metal(
     )
 
     source_tags = list(config.velocity_sources.keys())
+    active_impedance_sources = _active_impedance_sources(mesh.physical_tags, config)
     surface_pavg: dict[int, list[complex]] = {tag: [] for tag in source_tags}
     pressure_rows: list[NDArray[np.complex128]] = []
     spl_rows: list[NDArray[np.float64]] = []
@@ -369,9 +413,7 @@ def run_sweep_native_metal(
     ) as session:
         if config.on_frequency_result is None:
             freq_values = np.asarray(frequencies, dtype=np.float64)
-            k_values = (2.0 * np.pi * freq_values / SPEED_OF_SOUND).astype(
-                np.float32,
-            )
+            k_values, k_imag_values = _k_values_for_native(freq_values, config)
             neumann_rows = _build_neumann_rows(
                 dp0_space,
                 mesh.physical_tags,
@@ -388,6 +430,8 @@ def run_sweep_native_metal(
                 k_values,
                 neumann_rows,
                 field_points,
+                k_imag_f32=k_imag_values,
+                impedance_sources=active_impedance_sources,
                 batch_id="all_observation_planes",
                 operation_id="assembly-solve-field-resident-batch",
                 source_tags=source_tags,
@@ -439,9 +483,7 @@ def run_sweep_native_metal(
                     config.progress_callback(i, len(freq_values), frequency_hz)
         else:
             freq_values = np.asarray(frequencies, dtype=np.float64)
-            k_values = (2.0 * np.pi * freq_values / SPEED_OF_SOUND).astype(
-                np.float32,
-            )
+            k_values, k_imag_values = _k_values_for_native(freq_values, config)
             neumann_rows = _build_neumann_rows(
                 dp0_space,
                 mesh.physical_tags,
@@ -511,6 +553,8 @@ def run_sweep_native_metal(
                 k_values,
                 neumann_rows,
                 field_points,
+                k_imag_f32=k_imag_values,
+                impedance_sources=active_impedance_sources,
                 batch_id="all_observation_planes",
                 operation_id="assembly-solve-field-resident-stream",
                 source_tags=source_tags,

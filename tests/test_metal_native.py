@@ -68,6 +68,41 @@ def _tiny_geometry_buffers():
     )
 
 
+def _tiny_robin_geometry_buffers():
+    grid = SimpleNamespace(
+        vertices=np.array(
+            [
+                [0.0, 0.3, 0.0, 0.0, -0.2],
+                [0.0, 0.0, 0.3, -0.2, 0.0],
+                [0.0, 0.0, 0.1, 0.2, 0.25],
+            ],
+            dtype=np.float64,
+        ),
+        elements=np.array(
+            [
+                [0, 0, 0],
+                [1, 2, 3],
+                [2, 3, 4],
+            ],
+            dtype=np.int64,
+        ),
+        number_of_elements=3,
+    )
+    p1 = SimpleNamespace(
+        local2global=np.array(
+            [[0, 1, 2], [0, 2, 3], [0, 3, 4]],
+            dtype=np.int64,
+        ),
+        global_dof_count=5,
+    )
+    return build_metal_geometry_buffers(
+        grid,
+        np.array([2, 8, 9], dtype=np.int32),
+        p1,
+        SimpleNamespace(global_dof_count=3),
+    )
+
+
 def _tiny_yz_half_buffers():
     grid = SimpleNamespace(
         vertices=np.array(
@@ -2384,6 +2419,68 @@ def test_native_executable_resident_assembly_solve_field_matches_split_path(
     assert np.linalg.norm(batched_field[0] - split_field) / np.linalg.norm(split_field) < 1e-5
     assert np.linalg.norm(combined_pressure - pressure) / np.linalg.norm(pressure) < 1e-5
     assert np.linalg.norm(combined_field - split_field) / np.linalg.norm(split_field) < 1e-5
+
+
+def test_native_executable_complex_k_robin_tags_8_9_solve_field(
+    monkeypatch,
+    tmp_path,
+):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
+    neumann = np.array([[1.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j]], dtype=np.complex64)
+    frequency_hz = np.array([172.0], dtype=np.float64)
+    k_real = np.array([np.float32(2.0 * np.pi * 172.0 / 343.0)], dtype=np.float32)
+    k_imag = (k_real * np.float32(0.005)).astype(np.float32)
+    observation_points = np.array(
+        [[0.0, 0.0, 0.7], [0.2, 0.0, 0.8]],
+        dtype=np.float32,
+    )
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_robin_geometry_buffers(),
+        work_dir=tmp_path / "native-complex-robin-session",
+        session_id="native-complex-robin-test",
+    ) as session:
+        solved = session.assemble_solve_evaluate_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            neumann,
+            observation_points,
+            k_imag_f32=k_imag,
+            impedance_sources={8: 0.05 + 0.0j, 9: 0.02 + 0.01j},
+            operation_id="resident-complex-robin",
+            source_tags=[2],
+            impedance_source_tag=2,
+        )[0]
+
+    pressure = np.fromfile(solved.pressure_real_f32, dtype="<f4") + 1j * np.fromfile(
+        solved.pressure_imag_f32,
+        dtype="<f4",
+    )
+    field = np.fromfile(solved.field_real_f32, dtype="<f4") + 1j * np.fromfile(
+        solved.field_imag_f32,
+        dtype="<f4",
+    )
+
+    assert solved.lapack_info == 0
+    assert np.all(np.isfinite(pressure))
+    assert np.all(np.isfinite(field))
+    assert solved.diagnostics["assembly_mode"] == "reference"
+    assert solved.diagnostics["assembly_implementation"] == (
+        "swift_native_reference_complex_robin_quadrature"
+    )
+    assert solved.diagnostics["complex_k"] is True
+    assert solved.diagnostics["robin_boundary"] is True
+    assert solved.diagnostics["field_uses_total_neumann"] is True
+    assert 0.0 < solved.diagnostics["dense_solve_rcond"] <= 1.0
+    assert solved.diagnostics["dense_solve_condition_1norm"] >= 1.0
 
 
 def test_native_executable_streams_per_case_results(monkeypatch, tmp_path):

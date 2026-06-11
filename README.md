@@ -85,9 +85,11 @@ Common fields:
 - `on_frequency_result`, for streaming/early stop; entries include complex
   observation pressure
 
-The native Metal package supports standard Neumann solves. It does not expose
-legacy OpenCL/Bempp fallback configuration, Burton-Miller, complex-k, or
-impedance wall-source modes as user-facing features.
+The native Metal package supports standard Neumann solves by default. It also
+exposes experimental opt-in `formulation="complex_k"` and
+`impedance_sources={tag: beta}` Robin admittance support. It does not expose
+legacy OpenCL/Bempp fallback configuration or Burton-Miller as user-facing
+features.
 
 Use `solve_frequencies(mesh, frequencies_hz, config=None)` when frequency order
 comes from the caller instead of a generated sweep.

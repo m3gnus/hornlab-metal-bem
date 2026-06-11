@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import TYPE_CHECKING, Callable, Literal
 
 if TYPE_CHECKING:
@@ -11,6 +12,11 @@ if TYPE_CHECKING:
 class VelocityMode:
     VELOCITY = "velocity"
     ACCELERATION = "acceleration"
+
+
+class BIEFormulation:
+    STANDARD = "standard"
+    COMPLEX_K = "complex_k"
 
 
 NativeSymmetryPlane = Literal["yz", "xz", "xy", "yz+xz"]
@@ -57,11 +63,16 @@ class SolveConfig:
     freq_spacing: Literal["log", "linear"] = "log"
 
     # Boundary condition
+    formulation: Literal["standard", "complex_k"] = BIEFormulation.STANDARD
+    complex_k_shift: float = 0.005
     velocity_mode: Literal["velocity", "acceleration"] = VelocityMode.ACCELERATION
     velocity_sources: dict[int, float] = field(
         default_factory=lambda: {2: 1.0}
     )
     velocity_source_callback: Callable[[float], dict[int, complex]] | None = None
+    # Experimental Robin boundary condition. Maps physical tag to normalized
+    # surface admittance beta = rho*c/Zs; beta=0 is rigid, beta=1 air-matched.
+    impedance_sources: dict[int, complex] = field(default_factory=dict)
 
     # Observation
     observation: ObservationConfig = field(default_factory=ObservationConfig)
@@ -116,8 +127,18 @@ class SolveConfig:
             raise ValueError("mesh_scale must be positive")
         if self.air_density <= 0:
             raise ValueError("air_density must be positive")
+        if self.formulation not in {BIEFormulation.STANDARD, BIEFormulation.COMPLEX_K}:
+            raise ValueError("formulation must be 'standard' or 'complex_k'")
+        if self.complex_k_shift < 0:
+            raise ValueError("complex_k_shift must be non-negative")
         if self.velocity_mode not in {VelocityMode.VELOCITY, VelocityMode.ACCELERATION}:
             raise ValueError("velocity_mode must be 'velocity' or 'acceleration'")
+        for tag, beta in self.impedance_sources.items():
+            if int(tag) < 0:
+                raise ValueError("impedance_sources tags must be non-negative integers")
+            beta_value = complex(beta)
+            if not math.isfinite(beta_value.real) or not math.isfinite(beta_value.imag):
+                raise ValueError("impedance_sources values must be finite complex numbers")
         if (
             self.native_symmetry_plane is not None
             and self.native_symmetry_plane not in NATIVE_SYMMETRY_PLANES

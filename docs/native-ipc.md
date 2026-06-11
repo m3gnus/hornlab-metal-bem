@@ -20,7 +20,10 @@ All current manifests use:
 
 The schema is intentionally narrow. It covers standard Neumann dense BEM
 assembly, dense solve, and exterior field evaluation for package-owned native
-Metal execution.
+Metal execution. The production combined solve operation also accepts
+experimental per-case extensions for complex-k assembly and Robin admittance;
+these keep the same schema and are ignored by older helpers that do not read
+them.
 
 ## Manifest and Binary Rules
 
@@ -91,6 +94,21 @@ Batch payloads contain a non-empty `cases` list. Cases include a stable
 combined assembly/solve/field operation may also include `batch_outputs` for a
 single row-major `(case_count, n_obs)` field array pair.
 
+`assemble_solve_evaluate_standard_neumann_batch` cases may additionally carry:
+
+- `k_imag_f32`: optional non-negative assembly wavenumber imaginary part.
+  When present with `k_real_f32`, assembly uses `k_real + i*k_imag`.
+- `field_k_real_f32`: optional real wavenumber for exterior field evaluation.
+  Complex-k solves set this to the physical real `k`.
+- `impedance_sources`: optional object mapping stringified physical tags to
+  `[real, imag]` normalized admittance beta values. The helper maps these tags
+  onto DP0 triangles, adds the Robin LHS term `-i*k*V*diag(beta)*P1_to_DP0`,
+  and reconstructs total Neumann data for field evaluation.
+
+When `k_imag_f32` is nonzero or `impedance_sources` is present, the helper uses
+the Swift reference assembly path for that case and disables pipelined Metal
+assembly for the batch.
+
 ## Streamed Per-Case Results
 
 `assemble_solve_evaluate_standard_neumann_batch` accepts an optional
@@ -131,6 +149,10 @@ final batch manifest after the process exits.
 - Surface pressure and impedance reductions are returned in result manifests
   when the helper provides them. Complex scalars use `[real, imag]`; complex
   maps use stringified integer tags mapped to `[real, imag]`.
+- Experimental case diagnostics may include `complex_k`,
+  `assembly_k_imag_f32`, `field_k_real_f32`, `robin_boundary`, and
+  `field_uses_total_neumann`. Dense-solve diagnostics include
+  `dense_solve_rcond` and, when finite, `dense_solve_condition_1norm`.
 
 ## Runtime and Binary Selection
 

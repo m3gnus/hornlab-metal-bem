@@ -9,7 +9,7 @@ from hornlab_metal_bem.backends import (
     resolve_assembly_backend,
 )
 import hornlab_metal_bem.backends as backends
-from hornlab_metal_bem.config import ObservationConfig, SolveConfig
+from hornlab_metal_bem.config import BIEFormulation, ObservationConfig, SolveConfig
 from hornlab_metal_bem.sweep import should_route_native_metal
 
 
@@ -45,6 +45,9 @@ def test_solve_config_on_frequency_result_defaults_none():
 
 def test_solve_config_default_native_metal_controls():
     cfg = SolveConfig()
+    assert cfg.formulation == BIEFormulation.STANDARD
+    assert cfg.complex_k_shift == 0.005
+    assert cfg.impedance_sources == {}
     assert cfg.native_symmetry_plane is None
     assert cfg.metal_native_assembly_mode == "corrected"
     assert cfg.return_surface_pressure is False
@@ -63,6 +66,33 @@ def test_solve_config_rejects_unknown_frequency_spacing():
 def test_solve_config_rejects_unknown_velocity_mode():
     with pytest.raises(ValueError, match="velocity_mode"):
         SolveConfig(velocity_mode="force")  # type: ignore[arg-type]
+
+
+def test_solve_config_accepts_experimental_complex_k_and_robin():
+    cfg = SolveConfig(
+        formulation=BIEFormulation.COMPLEX_K,
+        complex_k_shift=0.01,
+        impedance_sources={8: 0.05 + 0.01j, 9: 0.02 + 0.0j},
+    )
+
+    assert cfg.formulation == "complex_k"
+    assert cfg.complex_k_shift == 0.01
+    assert cfg.impedance_sources[8] == 0.05 + 0.01j
+    assert cfg.impedance_sources[9] == 0.02 + 0.0j
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"formulation": "burton_miller"}, "formulation"),
+        ({"complex_k_shift": -0.1}, "complex_k_shift"),
+        ({"impedance_sources": {-1: 0.05 + 0.0j}}, "impedance_sources"),
+        ({"impedance_sources": {8: complex(float("nan"), 0.0)}}, "impedance_sources"),
+    ],
+)
+def test_solve_config_rejects_invalid_experimental_boundary_settings(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        SolveConfig(**kwargs)
 
 
 def test_solve_config_rejects_unknown_native_symmetry_plane():

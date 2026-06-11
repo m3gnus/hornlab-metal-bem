@@ -92,6 +92,13 @@ func requireDouble(_ object: [String: Any], _ key: String) throws -> Double {
     try fail("\(key) must be a number")
 }
 
+func optionalDouble(_ object: [String: Any], _ key: String, default defaultValue: Double) throws -> Double {
+    guard object[key] != nil else {
+        return defaultValue
+    }
+    return try requireDouble(object, key)
+}
+
 func requireString(_ object: [String: Any], _ key: String) throws -> String {
     guard let value = object[key] as? String else {
         try fail("\(key) must be a string")
@@ -727,13 +734,23 @@ func pointOnTriangle(_ geom: Geometry, _ triangle: Int, _ xi: Float, _ eta: Floa
 }
 
 func helmholtzG(_ dx: Float, _ dy: Float, _ dz: Float, _ k: Float) -> Complex32 {
+    helmholtzGComplex(dx, dy, dz, kReal: k, kImag: 0.0)
+}
+
+func helmholtzGComplex(
+    _ dx: Float,
+    _ dy: Float,
+    _ dz: Float,
+    kReal: Float,
+    kImag: Float
+) -> Complex32 {
     let r2 = dx * dx + dy * dy + dz * dz
     if r2 <= 0 {
         return .zero
     }
     let r = sqrt(r2)
-    let phase = k * r
-    let scale = Float(0.07957747154594767) / r
+    let phase = kReal * r
+    let scale = exp(-kImag * r) * Float(0.07957747154594767) / r
     return Complex32(re: cos(phase) * scale, im: sin(phase) * scale)
 }
 
@@ -746,18 +763,31 @@ func helmholtzDlp(
     _ nz: Float,
     _ k: Float
 ) -> Complex32 {
+    helmholtzDlpComplex(dx, dy, dz, nx, ny, nz, kReal: k, kImag: 0.0)
+}
+
+func helmholtzDlpComplex(
+    _ dx: Float,
+    _ dy: Float,
+    _ dz: Float,
+    _ nx: Float,
+    _ ny: Float,
+    _ nz: Float,
+    kReal: Float,
+    kImag: Float
+) -> Complex32 {
     let r2 = dx * dx + dy * dy + dz * dz
     if r2 <= 0 {
         return .zero
     }
     let r = sqrt(r2)
-    let phase = k * r
-    let scale = Float(0.07957747154594767) / r
+    let phase = kReal * r
+    let scale = exp(-kImag * r) * Float(0.07957747154594767) / r
     let gre = cos(phase) * scale
     let gim = sin(phase) * scale
     let projection = (dx * nx + dy * ny + dz * nz) / r
-    let fre = -1.0 / r
-    let fim = k
+    let fre = -1.0 / r - kImag
+    let fim = kReal
     return Complex32(
         re: (gre * fre - gim * fim) * projection,
         im: (gre * fim + gim * fre) * projection
@@ -808,6 +838,68 @@ func readComplexVector(root: String, descriptors: [String: Any], count: Int) thr
     return zip(re, im).map { Complex32(re: $0.0, im: $0.1) }
 }
 
+func robinBetasByTriangle(geom: Geometry, casePayload: [String: Any]) throws -> [Complex32]? {
+    guard let raw = casePayload["impedance_sources"] else {
+        return nil
+    }
+    guard let impedanceSources = raw as? [String: Any] else {
+        try fail("impedance_sources must be an object")
+    }
+    var betaByTag: [Int32: Complex32] = [:]
+    for (tagString, value) in impedanceSources {
+        guard let tag = Int32(tagString) else {
+            try fail("impedance_sources keys must be integer tag strings")
+        }
+        guard let pair = value as? [Any], pair.count == 2 else {
+            try fail("impedance_sources values must be [real, imag]")
+        }
+        guard let reNumber = pair[0] as? NSNumber, let imNumber = pair[1] as? NSNumber else {
+            try fail("impedance_sources values must be numeric [real, imag]")
+        }
+        betaByTag[tag] = Complex32(
+            re: reNumber.floatValue,
+            im: imNumber.floatValue
+        )
+    }
+    var betas = Array(repeating: Complex32.zero, count: geom.nTriangles)
+    for tri in 0..<geom.nTriangles {
+        if let beta = betaByTag[geom.physicalTags[tri]] {
+            betas[tri] = beta
+        }
+    }
+    return betas
+}
+
+func neumannWithRobin(
+    geom: Geometry,
+    driverNeumann: [Complex32],
+    pressure: [Complex32],
+    kReal: Float,
+    kImag: Float,
+    robinBetas: [Complex32]?
+) -> [Complex32] {
+    guard let robinBetas else {
+        return driverNeumann
+    }
+    let iK = Complex32(re: -kImag, im: kReal)
+    var total = driverNeumann
+    for tri in 0..<geom.nTriangles {
+        let beta = robinBetas[tri]
+        if beta.re == 0.0 && beta.im == 0.0 {
+            continue
+        }
+        let dof0 = geom.p1Dof(tri, 0)
+        let dof1 = geom.p1Dof(tri, 1)
+        let dof2 = geom.p1Dof(tri, 2)
+        let pAvg = Complex32(
+            re: (pressure[dof0].re + pressure[dof1].re + pressure[dof2].re) / 3.0,
+            im: (pressure[dof0].im + pressure[dof1].im + pressure[dof2].im) / 3.0
+        )
+        total[tri] = total[tri] + (iK * beta * pAvg)
+    }
+    return total
+}
+
 func readObservationPoints(root: String, descriptor: [String: Any]) throws -> [(Float, Float, Float)] {
     let shape = try validateDescriptor(
         descriptor,
@@ -831,12 +923,19 @@ func readObservationPoints(root: String, descriptor: [String: Any]) throws -> [(
     return points
 }
 
-func assembleRegularReference(geom: Geometry, neumann: [Complex32], k: Float) -> AssemblyArrays {
+func assembleRegularReference(
+    geom: Geometry,
+    neumann: [Complex32],
+    k: Float,
+    kImag: Float = 0.0,
+    robinBetas: [Complex32]? = nil
+) -> AssemblyArrays {
     let (qx, qy, qw) = triangleRule6()
     let n = geom.p1DofCount
     var a = Array(repeating: Complex32.zero, count: n * n)
     var rhs = Array(repeating: Complex32.zero, count: n)
     let imageMasks = symmetryImageMasks(geom.symmetryPlane)
+    let iK = Complex32(re: -kImag, im: k)
 
     for trial in 0..<geom.nTriangles {
         let nnx = geom.normal(trial, 0)
@@ -844,6 +943,9 @@ func assembleRegularReference(geom: Geometry, neumann: [Complex32], k: Float) ->
         let nnz = geom.normal(trial, 2)
         let trialArea = geom.areas[trial]
         let gTrial = neumann[trial]
+        let betaTrial = robinBetas?[trial] ?? Complex32.zero
+        let robinCoupling = iK * betaTrial
+        let hasRobin = betaTrial.re != 0.0 || betaTrial.im != 0.0
         for test in 0..<geom.nTriangles {
             let jac = (2.0 * geom.areas[test]) * (2.0 * trialArea)
             var block = Array(repeating: Complex32.zero, count: 9)
@@ -859,8 +961,17 @@ func assembleRegularReference(geom: Geometry, neumann: [Complex32], k: Float) ->
                     let dx = sx - tx
                     let dy = sy - ty
                     let dz = sz - tz
-                    let g = helmholtzG(dx, dy, dz, k)
-                    let d = helmholtzDlp(dx, dy, dz, nnx, nny, nnz, k)
+                    let g = helmholtzGComplex(
+                        dx, dy, dz,
+                        kReal: k,
+                        kImag: kImag
+                    )
+                    let d = helmholtzDlpComplex(
+                        dx, dy, dz,
+                        nnx, nny, nnz,
+                        kReal: k,
+                        kImag: kImag
+                    )
                     let w = qw[qa] * qw[qb] * jac
                     for i in 0..<3 {
                         slp[i] = slp[i] + g * (tbasis[i] * w)
@@ -874,11 +985,16 @@ func assembleRegularReference(geom: Geometry, neumann: [Complex32], k: Float) ->
                         let idx = image.0 - tx
                         let idy = image.1 - ty
                         let idz = image.2 - tz
-                        let imageG = helmholtzG(idx, idy, idz, k)
-                        let imageD = helmholtzDlp(
+                        let imageG = helmholtzGComplex(
+                            idx, idy, idz,
+                            kReal: k,
+                            kImag: kImag
+                        )
+                        let imageD = helmholtzDlpComplex(
                             idx, idy, idz,
                             imageNormal.0, imageNormal.1, imageNormal.2,
-                            k
+                            kReal: k,
+                            kImag: kImag
                         )
                         for i in 0..<3 {
                             slp[i] = slp[i] + imageG * (tbasis[i] * w)
@@ -895,7 +1011,11 @@ func assembleRegularReference(geom: Geometry, neumann: [Complex32], k: Float) ->
                 rhs[row] = rhs[row] + (slp[i] * gTrial) * rowWeight
                 for j in 0..<3 {
                     let col = geom.p1Dof(trial, j)
-                    a[row * n + col] = a[row * n + col] + block[i * 3 + j] * rowWeight
+                    var term = block[i * 3 + j]
+                    if hasRobin {
+                        term = term - ((slp[i] * robinCoupling) * Float(1.0 / 3.0))
+                    }
+                    a[row * n + col] = a[row * n + col] + term * rowWeight
                 }
             }
             if test == trial {
@@ -4547,18 +4667,33 @@ func assembleRegular(
     geom: Geometry,
     neumann: [Complex32],
     k: Float,
+    kImag: Float = 0.0,
+    robinBetas: [Complex32]? = nil,
     residentContext: ResidentMetalContext? = nil
 ) throws -> AssemblyRun {
-    let mode = ProcessInfo.processInfo.environment[
+    var mode = ProcessInfo.processInfo.environment[
         "HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE"
     ] ?? "optimized"
+    if kImag != 0.0 || robinBetas != nil {
+        mode = "reference"
+    }
     if mode == "reference" {
         let (arrays, seconds) = timedRun {
-            assembleRegularReference(geom: geom, neumann: neumann, k: k)
+            assembleRegularReference(
+                geom: geom,
+                neumann: neumann,
+                k: k,
+                kImag: kImag,
+                robinBetas: robinBetas
+            )
         }
         return AssemblyRun(
             arrays: arrays,
-            implementation: "swift_native_reference_regular_quadrature",
+            implementation: (
+                kImag != 0.0 || robinBetas != nil
+                    ? "swift_native_reference_complex_robin_quadrature"
+                    : "swift_native_reference_regular_quadrature"
+            ),
             mode: mode,
             seconds: seconds,
             parity: nil,
@@ -5249,11 +5384,31 @@ func assembleSolveEvaluateStandardNeumannBatch(
     // Pre-read per-case wavenumbers and Neumann data so case i+1's GPU
     // assembly can be committed before case i's CPU dense solve starts.
     var caseKs: [Float] = []
+    var caseKImag: [Float] = []
+    var caseFieldKs: [Float] = []
     var caseNeumanns: [[Complex32]] = []
+    var caseRobinBetas: [[Complex32]?] = []
     caseKs.reserveCapacity(cases.count)
+    caseKImag.reserveCapacity(cases.count)
+    caseFieldKs.reserveCapacity(cases.count)
     caseNeumanns.reserveCapacity(cases.count)
+    caseRobinBetas.reserveCapacity(cases.count)
+    var requiresReferenceAssembly = false
     for casePayload in cases {
-        caseKs.append(Float(try requireDouble(casePayload, "k_real_f32")))
+        let kReal = Float(try requireDouble(casePayload, "k_real_f32"))
+        let kImag = Float(try optionalDouble(casePayload, "k_imag_f32", default: 0.0))
+        let fieldK = Float(try optionalDouble(
+            casePayload,
+            "field_k_real_f32",
+            default: Double(kReal)
+        ))
+        let robinBetas = try robinBetasByTriangle(geom: geom, casePayload: casePayload)
+        if kImag != 0.0 || robinBetas != nil {
+            requiresReferenceAssembly = true
+        }
+        caseKs.append(kReal)
+        caseKImag.append(kImag)
+        caseFieldKs.append(fieldK)
         caseNeumanns.append(
             try readComplexVector(
                 root: geom.root,
@@ -5261,6 +5416,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
                 count: geom.dp0DofCount
             )
         )
+        caseRobinBetas.append(robinBetas)
     }
 
     let assemblyMode = ProcessInfo.processInfo.environment[
@@ -5274,7 +5430,8 @@ func assembleSolveEvaluateStandardNeumannBatch(
     // corrections keep the strictly sequential path: they exist to
     // cross-check the optimized kernels, not to be fast.
     let regularImplementation = try requestedRegularAssemblyImplementation()
-    let pipelineAssembly = (regularImplementation == "entrywise"
+    let pipelineAssembly = !requiresReferenceAssembly
+        && (regularImplementation == "entrywise"
             || regularImplementation == "pair_atomic")
         && (assemblyMode == "optimized"
             || (assemblyMode == "corrected" && duffyMode == "gpu_blocks"))
@@ -5419,7 +5576,10 @@ func assembleSolveEvaluateStandardNeumannBatch(
 
     for (caseIndex, casePayload) in cases.enumerated() {
         let k = caseKs[caseIndex]
+        let kImag = caseKImag[caseIndex]
+        let fieldK = caseFieldKs[caseIndex]
         let neumann = caseNeumanns[caseIndex]
+        let robinBetas = caseRobinBetas[caseIndex]
         let observationPoints: [(Float, Float, Float)]
         if let sharedObservationPoints {
             observationPoints = sharedObservationPoints
@@ -5474,6 +5634,8 @@ func assembleSolveEvaluateStandardNeumannBatch(
                 geom: geom,
                 neumann: neumann,
                 k: k,
+                kImag: kImag,
+                robinBetas: robinBetas,
                 residentContext: context
             )
             solve = try solveDenseAccelerate(
@@ -5487,12 +5649,20 @@ func assembleSolveEvaluateStandardNeumannBatch(
         if solve.lapackInfo != 0 {
             try fail("Accelerate dense solve failed with info=\(solve.lapackInfo)")
         }
+        let fieldNeumann = neumannWithRobin(
+            geom: geom,
+            driverNeumann: neumann,
+            pressure: solve.pressure,
+            kReal: k,
+            kImag: kImag,
+            robinBetas: robinBetas
+        )
         let field = try evaluateExterior(
             geom: geom,
             pressure: solve.pressure,
-            neumann: neumann,
+            neumann: fieldNeumann,
             observationPoints: observationPoints,
-            k: k,
+            k: fieldK,
             residentContext: context,
             cachedObservationBuffer: sharedObservationBuffer,
             cachedObservationCount: sharedObservationCount
@@ -5550,6 +5720,17 @@ func assembleSolveEvaluateStandardNeumannBatch(
             if rcond > 0.0 {
                 caseResult["dense_solve_condition_1norm"] = 1.0 / rcond
             }
+        }
+        if kImag != 0.0 {
+            caseResult["assembly_k_imag_f32"] = kImag
+            caseResult["complex_k"] = true
+        }
+        if robinBetas != nil {
+            caseResult["robin_boundary"] = true
+            caseResult["field_uses_total_neumann"] = true
+        }
+        if fieldK != k {
+            caseResult["field_k_real_f32"] = fieldK
         }
         if let pressureReDesc, let pressureImDesc {
             caseResult["pressure_real_f32"] = try requireString(pressureReDesc, "path")

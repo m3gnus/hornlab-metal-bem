@@ -14,8 +14,9 @@ pressure reductions.
   observation, and result types. `native_config()` forces the supported native
   assembly mode and does not expose legacy OpenCL/Bempp options.
 - `config.py` defines `SolveConfig`, `ObservationConfig`, velocity-source
-  modes, native symmetry options, callback hooks, mesh scale, air density, and
-  native threadgroup overrides.
+  modes, the opt-in `standard`/`complex_k` formulation switch, experimental
+  Robin `impedance_sources`, native symmetry options, callback hooks, mesh
+  scale, air density, and native threadgroup overrides.
 - `mesh.py` loads Gmsh triangle meshes into NumPy-only `PureGrid` and
   `PureFunctionSpace` objects. The native path consumes these Bempp-shaped
   arrays without importing `bempp-cl`.
@@ -53,8 +54,9 @@ config=None)` share the same execution flow:
 4. Route to the native path. `should_route_native_metal()` validates the narrow
    supported native symmetry options.
 5. `run_sweep_native_metal()` builds observation points, P1 and DP0 function
-   spaces, Metal geometry buffers, frequency and wavenumber arrays, and DP0
-   Neumann rows.
+   spaces, Metal geometry buffers, frequency and wavenumber arrays, optional
+   complex-k imaginary shifts, active Robin admittance maps, and DP0 Neumann
+   rows.
 6. `MetalNativeStandardSession.create_session()` writes a session manifest and
    geometry binaries, validates native runtime availability, and launches the
    resident helper operations.
@@ -66,6 +68,19 @@ config=None)` share the same execution flow:
 8. Python reads little-endian float32 real/imag result arrays, reshapes them to
    observation planes and angles, computes normalized directivity, accumulates
    timing/log metadata and native diagnostics, and returns `SolveResult`.
+
+`SolveConfig(formulation="complex_k")` is experimental and opt-in. It follows
+the canonical bempp convention `k = k_real * (1 + i*complex_k_shift)` for
+assembly only; exterior field evaluation still uses the real acoustic
+wavenumber. `SolveConfig(impedance_sources={tag: beta})` is likewise
+experimental and maps physical tags to normalized admittance
+`beta = rho*c/Zs`. The Robin solve substitutes
+`dp/dn = i*k*beta*p` on those tags, omits prescribed velocity data on the same
+tags, and evaluates the exterior field with the reconstructed total Neumann
+data. While these flags are active, Python sends extra case metadata and the
+helper routes assembly through the Swift reference quadrature path so the
+existing optimized Metal real-k rigid numerics remain unchanged when flags are
+off.
 
 When `on_frequency_result` is unset, `sweep.py` sends the full frequency batch
 and may request a single batched field output. When `on_frequency_result` is
@@ -162,6 +177,13 @@ k-independent pair geometry across wavenumbers in one kernel does not pay on
 M-series GPUs — the kernel is throughput-saturated independent of that
 geometry, and multi-wavenumber accumulator state collapses occupancy (see
 branch `experiment/multik-assembly`).
+
+For experimental `complex_k` and Robin cases the combined op disables pipelined
+Metal assembly and reports the per-case flags in native diagnostics:
+`complex_k`, `assembly_k_imag_f32`, `robin_boundary`, and
+`field_uses_total_neumann`. The existing `dense_solve_rcond` and
+`dense_solve_condition_1norm` diagnostics remain available and should be used
+to confirm that complex-k suppresses interior-resonance conditioning spikes.
 
 Runtime discovery prefers an explicit helper executable, then
 `HORNLAB_METAL_BEM_NATIVE`, then compiled SwiftPM binaries under

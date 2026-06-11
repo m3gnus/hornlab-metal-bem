@@ -23,7 +23,10 @@ def _build_driver_neumann_coeffs(
         if config.velocity_source_callback is not None
         else config.velocity_sources
     )
+    impedance_tag_set = set(config.impedance_sources.keys())
     for tag, weight in velocity_sources.items():
+        if tag in impedance_tag_set:
+            continue
         mask = physical_tags == tag
         if not np.any(mask):
             continue

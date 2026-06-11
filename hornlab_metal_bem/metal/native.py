@@ -723,6 +723,8 @@ class MetalNativeStandardSession:
         neumann_dp0: NDArray[Any],
         observation_points: NDArray[Any],
         *,
+        k_imag_f32: NDArray[Any] | None = None,
+        impedance_sources: dict[int, complex] | None = None,
         batch_id: str = "batch",
         operation_id: str = "assembly-solve-field-batch",
         source_tags: list[int] | tuple[int, ...] | None = None,
@@ -758,11 +760,20 @@ class MetalNativeStandardSession:
             )
         frequencies = np.asarray(frequency_hz, dtype=np.float64)
         k_values = np.asarray(k_real, dtype=np.float32)
+        k_imag_values = (
+            np.zeros_like(k_values, dtype=np.float32)
+            if k_imag_f32 is None
+            else np.asarray(k_imag_f32, dtype=np.float32)
+        )
         neumann_values = np.asarray(neumann_dp0)
         if frequencies.ndim != 1 or frequencies.size == 0:
             raise ValueError("frequency_hz must be a non-empty 1D array")
         if k_values.shape != frequencies.shape:
             raise ValueError("k_real must have the same shape as frequency_hz")
+        if k_imag_values.shape != frequencies.shape:
+            raise ValueError("k_imag_f32 must have the same shape as frequency_hz")
+        if np.any(k_imag_values < 0):
+            raise ValueError("k_imag_f32 must be non-negative")
         if neumann_values.shape != (
             frequencies.size,
             self.geometry_payload.dp0_dof_count,
@@ -776,6 +787,20 @@ class MetalNativeStandardSession:
             raise ValueError("neumann_dp0 must be complex")
         if not np.all(np.isfinite(neumann_values)):
             raise ValueError("neumann_dp0 must contain only finite values")
+        impedance_payload: dict[str, list[float]] | None = None
+        if impedance_sources:
+            impedance_payload = {}
+            for tag, beta in impedance_sources.items():
+                tag_value = int(tag)
+                beta_value = complex(beta)
+                if tag_value < 0:
+                    raise ValueError("impedance_sources tags must be non-negative")
+                if not np.isfinite(beta_value.real) or not np.isfinite(beta_value.imag):
+                    raise ValueError("impedance_sources values must be finite")
+                impedance_payload[str(tag_value)] = [
+                    float(np.float32(beta_value.real)),
+                    float(np.float32(beta_value.imag)),
+                ]
 
         points_3xn = _require_observation_points_3xn(observation_points)
         n_obs = int(points_3xn.shape[1])
@@ -818,7 +843,9 @@ class MetalNativeStandardSession:
                 ).to_manifest(),
             }
         cases: list[dict[str, Any]] = []
-        for idx, (freq, kval) in enumerate(zip(frequencies, k_values)):
+        for idx, (freq, kval, kimag) in enumerate(
+            zip(frequencies, k_values, k_imag_values)
+        ):
             case_id = f"case-{idx:04d}-{float(freq):.6g}hz"
             case_input = inputs_dir / case_id
             case_output = outputs_root / case_id
@@ -863,6 +890,8 @@ class MetalNativeStandardSession:
                     "case_id": case_id,
                     "frequency_hz": float(freq),
                     "k_real_f32": float(np.float32(kval)),
+                    "k_imag_f32": float(np.float32(kimag)),
+                    "field_k_real_f32": float(np.float32(kval)),
                     "neumann_dp0": {
                         key: descriptor.to_manifest()
                         for key, descriptor in neumann.items()
@@ -877,6 +906,11 @@ class MetalNativeStandardSession:
                     **(
                         {"impedance_source_tag": impedance_tag_value}
                         if impedance_tag_value is not None
+                        else {}
+                    ),
+                    **(
+                        {"impedance_sources": impedance_payload}
+                        if impedance_payload
                         else {}
                     ),
                 }
@@ -1681,6 +1715,11 @@ def _native_case_diagnostics(
         "lapack_info",
         "dense_solve_rcond",
         "dense_solve_condition_1norm",
+        "assembly_k_imag_f32",
+        "field_k_real_f32",
+        "complex_k",
+        "robin_boundary",
+        "field_uses_total_neumann",
         "symmetry_plane",
         "pressure_shape",
         "field_shape",
