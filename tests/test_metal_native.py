@@ -2249,6 +2249,79 @@ def test_native_executable_resident_assembly_solve_matches_python_solve(
     assert np.linalg.norm(pressure - expected) / np.linalg.norm(expected) < 1e-5
 
 
+def test_native_executable_dense_solve_iterative_refinement(
+    monkeypatch,
+    tmp_path,
+):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_REFINE", "3")
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", raising=False)
+    neumann = np.array([[1.0 + 0.0j, 0.0 + 0.5j]], dtype=np.complex64)
+    frequency_hz = np.array([100.0], dtype=np.float64)
+    k_real = np.array([1.8318326], dtype=np.float32)
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_geometry_buffers(),
+        work_dir=tmp_path / "native-refine-session",
+        session_id="native-refine-test",
+    ) as session:
+        assembly = session.assemble_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            neumann,
+            operation_id="refine-batch-assembly",
+        )[0]
+        solved = session.assemble_solve_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            neumann,
+            operation_id="refine-batch-assembly-solve",
+        )[0]
+
+    matrix = np.fromfile(assembly.matrix_real_f32, dtype="<f4").reshape(
+        assembly.matrix_shape
+    ) + 1j * np.fromfile(assembly.matrix_imag_f32, dtype="<f4").reshape(
+        assembly.matrix_shape
+    )
+    rhs = np.fromfile(assembly.rhs_real_f32, dtype="<f4") + 1j * np.fromfile(
+        assembly.rhs_imag_f32,
+        dtype="<f4",
+    )
+    pressure = np.fromfile(solved.pressure_real_f32, dtype="<f4") + 1j * np.fromfile(
+        solved.pressure_imag_f32,
+        dtype="<f4",
+    )
+    result = json.loads(
+        (
+            tmp_path
+            / "native-refine-session"
+            / "refine-batch-assembly-solve"
+            / "assembly-solve-batch-result.json"
+        ).read_text(encoding="utf-8")
+    )
+    case_result = result["cases"][0]
+    # Refinement bookkeeping must ride along in per-case diagnostics, and the
+    # refined solution's float64 residual against the float32 operator must
+    # sit at the single-precision floor or better.
+    assert solved.lapack_info == 0
+    assert case_result["dense_solve_refine_iterations"] >= 0
+    residual_rel = case_result["dense_solve_refine_residual_rel"]
+    assert residual_rel <= 1.0e-5
+    exact = np.linalg.solve(matrix.astype(np.complex128), rhs.astype(np.complex128))
+    measured = np.abs(
+        rhs.astype(np.complex128)
+        - matrix.astype(np.complex128) @ pressure.astype(np.complex128)
+    ).max() / np.abs(rhs).max()
+    assert measured <= max(5.0e-6, 10.0 * residual_rel)
+    assert np.linalg.norm(pressure - exact) / np.linalg.norm(exact) < 1e-4
+
+
 def test_native_executable_resident_assembly_solve_lu_factor_variant_matches_python(
     monkeypatch,
     tmp_path,

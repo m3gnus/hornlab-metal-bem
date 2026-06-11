@@ -364,6 +364,11 @@ struct DenseSolveRun {
     // nil when the factorization or the estimator failed. Lets interior-
     // resonance spikes in sweeps be attributed to ill conditioning.
     let rcond: Double?
+    // Mixed-precision iterative refinement bookkeeping; nil when disabled.
+    // Refinement corrects LU/rounding error against the float32 operator
+    // only — float32 assembly and quadrature error survive it.
+    var refineIterations: Int? = nil
+    var refineResidualRel: Double? = nil
 }
 
 func matrixOneNorm(_ matrix: inout [__CLPK_complex], n: Int) -> __CLPK_real {
@@ -3134,6 +3139,9 @@ let metalDuffyThreadsPerGroupEnv = "HORNLAB_METAL_BEM_NATIVE_DUFFY_THREADS_PER_G
 let metalFieldThreadsPerGroupEnv = "HORNLAB_METAL_BEM_NATIVE_FIELD_THREADS_PER_GROUP"
 let metalRegularAssemblyImplementationEnv = "HORNLAB_METAL_BEM_NATIVE_REGULAR_ASSEMBLY_IMPL"
 let metalDenseSolveImplementationEnv = "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_IMPL"
+// Mixed-precision iterative refinement passes after the float32 LU solve;
+// 0 (default) disables refinement.
+let metalDenseSolveRefineEnv = "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_REFINE"
 let metalSolveConcurrencyEnv = "HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY"
 let defaultMetalThreadsPerThreadgroup = 64
 
@@ -3253,6 +3261,18 @@ func requestedDenseSolveImplementation() throws -> String {
         return raw
     }
     try fail("\(metalDenseSolveImplementationEnv) must be 'cgesv' or 'cgetrf_cgetrs'")
+}
+
+func requestedDenseSolveRefineIterations() throws -> Int {
+    guard let raw = ProcessInfo.processInfo.environment[
+        metalDenseSolveRefineEnv
+    ], !raw.isEmpty else {
+        return 0
+    }
+    guard let value = Int(raw), (0...10).contains(value) else {
+        try fail("\(metalDenseSolveRefineEnv) must be an integer in 0...10")
+    }
+    return value
 }
 
 func assembleRegularMetalSelected(
@@ -4526,6 +4546,123 @@ func timedRun<T>(_ body: () throws -> T) rethrows -> (T, Double) {
     return (value, CFAbsoluteTimeGetCurrent() - start)
 }
 
+/// Mixed-precision iterative refinement on float32 LU factors. The residual
+/// r = b - A·x is accumulated in float64 against the original row-major
+/// float32 operator (which survives the LAPACK calls untouched), the
+/// correction is solved through the existing single-precision LU via cgetrs,
+/// and the solution is accumulated in float64. Stops early once the
+/// infinity-norm relative residual reaches the single-precision floor or
+/// stops improving. Corrects LU/rounding error only — float32 assembly and
+/// quadrature error are untouched, and this is not an interior-resonance
+/// (CHIEF/Burton-Miller) substitute.
+func refineDenseSolveSolution(
+    aReRowMajor: [Float],
+    aImRowMajor: [Float],
+    rhsRe: [Float],
+    rhsIm: [Float],
+    factored: inout [__CLPK_complex],
+    pivots: inout [__CLPK_integer],
+    solution: inout [__CLPK_complex],
+    n: Int,
+    maxIterations: Int
+) -> (iterations: Int, residualRel: Double) {
+    let singlePrecisionFloor = 1.0e-7
+    var xRe = [Double](repeating: 0.0, count: n)
+    var xIm = [Double](repeating: 0.0, count: n)
+    for i in 0..<n {
+        xRe[i] = Double(solution[i].r)
+        xIm[i] = Double(solution[i].i)
+    }
+    var bNormInf = 0.0
+    for i in 0..<n {
+        bNormInf = max(bNormInf, abs(Double(rhsRe[i])), abs(Double(rhsIm[i])))
+    }
+
+    var resRe = [Double](repeating: 0.0, count: n)
+    var resIm = [Double](repeating: 0.0, count: n)
+
+    func residualRelativeNorm() -> Double {
+        xRe.withUnsafeBufferPointer { xReBuf in
+            xIm.withUnsafeBufferPointer { xImBuf in
+                aReRowMajor.withUnsafeBufferPointer { aReBuf in
+                    aImRowMajor.withUnsafeBufferPointer { aImBuf in
+                        resRe.withUnsafeMutableBufferPointer { resReBuf in
+                            resIm.withUnsafeMutableBufferPointer { resImBuf in
+                                DispatchQueue.concurrentPerform(iterations: n) { row in
+                                    var accRe = 0.0
+                                    var accIm = 0.0
+                                    let base = row * n
+                                    for col in 0..<n {
+                                        let are = Double(aReBuf[base + col])
+                                        let aim = Double(aImBuf[base + col])
+                                        let xre = xReBuf[col]
+                                        let xim = xImBuf[col]
+                                        accRe += are * xre - aim * xim
+                                        accIm += are * xim + aim * xre
+                                    }
+                                    resReBuf[row] = Double(rhsRe[row]) - accRe
+                                    resImBuf[row] = Double(rhsIm[row]) - accIm
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        var rNorm = 0.0
+        for i in 0..<n {
+            rNorm = max(rNorm, abs(resRe[i]), abs(resIm[i]))
+        }
+        return bNormInf > 0.0 ? rNorm / bNormInf : rNorm
+    }
+
+    var bestRel = residualRelativeNorm()
+    var iterationsApplied = 0
+    var nClpk = __CLPK_integer(n)
+    var nrhs = __CLPK_integer(1)
+    var lda = __CLPK_integer(n)
+    var ldb = __CLPK_integer(n)
+    var trans = Int8(78) // "N"
+
+    for _ in 0..<maxIterations {
+        if bestRel <= singlePrecisionFloor {
+            break
+        }
+        var correction = [__CLPK_complex](
+            repeating: __CLPK_complex(r: 0.0, i: 0.0),
+            count: n
+        )
+        for i in 0..<n {
+            correction[i] = __CLPK_complex(r: Float(resRe[i]), i: Float(resIm[i]))
+        }
+        var info = __CLPK_integer(0)
+        cgetrs_(&trans, &nClpk, &nrhs, &factored, &lda, &pivots, &correction, &ldb, &info)
+        if info != 0 {
+            break
+        }
+        let prevRe = xRe
+        let prevIm = xIm
+        for i in 0..<n {
+            xRe[i] += Double(correction[i].r)
+            xIm[i] += Double(correction[i].i)
+        }
+        let rel = residualRelativeNorm()
+        if rel >= bestRel {
+            // Diverged or stalled: keep the previous iterate.
+            xRe = prevRe
+            xIm = prevIm
+            break
+        }
+        bestRel = rel
+        iterationsApplied += 1
+    }
+
+    for i in 0..<n {
+        solution[i] = __CLPK_complex(r: Float(xRe[i]), i: Float(xIm[i]))
+    }
+    return (iterationsApplied, bestRel)
+}
+
 func solveDenseAccelerateCgesv(
     aReRowMajor: [Float],
     aImRowMajor: [Float],
@@ -4583,12 +4720,32 @@ func solveDenseAccelerateCgesv(
         )
     }
     let rcond = estimateReciprocalCondition(factored: &matrix, n: n, anorm: anorm)
+    var refineIterations: Int? = nil
+    var refineResidualRel: Double? = nil
+    let refinePasses = try requestedDenseSolveRefineIterations()
+    if refinePasses > 0 {
+        let outcome = refineDenseSolveSolution(
+            aReRowMajor: aReRowMajor,
+            aImRowMajor: aImRowMajor,
+            rhsRe: rhsRe,
+            rhsIm: rhsIm,
+            factored: &matrix,
+            pivots: &pivots,
+            solution: &rhs,
+            n: n,
+            maxIterations: refinePasses
+        )
+        refineIterations = outcome.iterations
+        refineResidualRel = outcome.residualRel
+    }
     return DenseSolveRun(
         pressure: rhs.map { Complex32(re: $0.r, im: $0.i) },
         implementation: "accelerate_lapack_cgesv",
         seconds: CFAbsoluteTimeGetCurrent() - start,
         lapackInfo: Int32(info),
-        rcond: rcond
+        rcond: rcond,
+        refineIterations: refineIterations,
+        refineResidualRel: refineResidualRel
     )
 }
 
@@ -4646,22 +4803,41 @@ func solveDenseAccelerateCgetrfCgetrs(
         cgetrs_(&trans, &nClpk, &nrhs, &matrix, &lda, &pivots, &rhs, &ldb, &info)
     }
 
-    let seconds = CFAbsoluteTimeGetCurrent() - start
     if info != 0 {
         return DenseSolveRun(
             pressure: [],
             implementation: "accelerate_lapack_cgetrf_cgetrs",
-            seconds: seconds,
+            seconds: CFAbsoluteTimeGetCurrent() - start,
             lapackInfo: Int32(info),
             rcond: rcond
         )
     }
+    var refineIterations: Int? = nil
+    var refineResidualRel: Double? = nil
+    let refinePasses = try requestedDenseSolveRefineIterations()
+    if refinePasses > 0 {
+        let outcome = refineDenseSolveSolution(
+            aReRowMajor: aReRowMajor,
+            aImRowMajor: aImRowMajor,
+            rhsRe: rhsRe,
+            rhsIm: rhsIm,
+            factored: &matrix,
+            pivots: &pivots,
+            solution: &rhs,
+            n: n,
+            maxIterations: refinePasses
+        )
+        refineIterations = outcome.iterations
+        refineResidualRel = outcome.residualRel
+    }
     return DenseSolveRun(
         pressure: rhs.map { Complex32(re: $0.r, im: $0.i) },
         implementation: "accelerate_lapack_cgetrf_cgetrs",
-        seconds: seconds,
+        seconds: CFAbsoluteTimeGetCurrent() - start,
         lapackInfo: Int32(info),
-        rcond: rcond
+        rcond: rcond,
+        refineIterations: refineIterations,
+        refineResidualRel: refineResidualRel
     )
 }
 
@@ -5264,6 +5440,12 @@ func assembleSolveStandardNeumannBatch(
                 caseResult["dense_solve_condition_1norm"] = 1.0 / rcond
             }
         }
+        if let refineIterations = solve.refineIterations {
+            caseResult["dense_solve_refine_iterations"] = refineIterations
+        }
+        if let refineResidualRel = solve.refineResidualRel {
+            caseResult["dense_solve_refine_residual_rel"] = refineResidualRel
+        }
         if let caseId = casePayload["case_id"] as? String {
             caseResult["case_id"] = caseId
         }
@@ -5763,6 +5945,12 @@ func assembleSolveEvaluateStandardNeumannBatch(
             if rcond > 0.0 {
                 caseResult["dense_solve_condition_1norm"] = 1.0 / rcond
             }
+        }
+        if let refineIterations = solve.refineIterations {
+            caseResult["dense_solve_refine_iterations"] = refineIterations
+        }
+        if let refineResidualRel = solve.refineResidualRel {
+            caseResult["dense_solve_refine_residual_rel"] = refineResidualRel
         }
         if kImag != 0.0 {
             caseResult["assembly_k_imag_f32"] = kImag

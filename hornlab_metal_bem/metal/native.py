@@ -1752,6 +1752,8 @@ def _native_case_diagnostics(
         "lapack_info",
         "dense_solve_rcond",
         "dense_solve_condition_1norm",
+        "dense_solve_refine_iterations",
+        "dense_solve_refine_residual_rel",
         "assembly_k_imag_f32",
         "field_k_real_f32",
         "complex_k",

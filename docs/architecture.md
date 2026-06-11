@@ -165,6 +165,16 @@ makes it nondeterministic at float32 rounding level between runs. `entrywise`
 `block_staged` (pair blocks staged through a large intermediate buffer) remain
 selectable for A/B comparison and deterministic debugging.
 
+`HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_REFINE` (default 0) enables up to N
+mixed-precision iterative-refinement passes after the float32 LU solve: the
+residual is accumulated in float64 against the original float32 operator and
+corrections are solved through the existing LU factors (cgetrs). Per-case
+diagnostics gain `dense_solve_refine_iterations` and
+`dense_solve_refine_residual_rel`. This corrects LU/rounding error only —
+float32 assembly and quadrature error survive, and it is not an
+interior-resonance (CHIEF/Burton-Miller) mitigation; pair it with the
+`dense_solve_rcond` suspect flag when sweeping through chamber resonances.
+
 In the combined assemble/solve/field batch op the per-case CPU work (Duffy
 delta reduction, Accelerate dense solve, cgecon condition estimate) runs on a
 bounded worker pool sized by `HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY`
