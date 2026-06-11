@@ -2606,7 +2606,11 @@ inline float2 regular_dlp_entry(
                 px, py, pz, triangles, nTriangles, trialTri, qx[b], qy[b]);
             float sb = basis_value(qx[b], qy[b], trialLocal);
             float weight = tb * sb * qw[a] * qw[b] * jac;
-            acc += helmholtz_dlp(trialPoint - testPoint, normal, k) * weight;
+            // Coincident self-point excluded by index; see
+            // assemble_matrix_pair_atomic for why the r2 guard is not enough.
+            if (testTri != trialTri || a != b) {
+                acc += helmholtz_dlp(trialPoint - testPoint, normal, k) * weight;
+            }
             if (symmetryPlane != 0) {
                 for (int mask = 1; mask <= 7; ++mask) {
                     if (!has_image_mask(symmetryPlane, mask)) {
@@ -2647,7 +2651,11 @@ inline float2 regular_slp_entry(
             float3 trialPoint = point_on_triangle(
                 px, py, pz, triangles, nTriangles, trialTri, qx[b], qy[b]);
             float weight = tb * qw[a] * qw[b] * jac;
-            acc += helmholtz_g(trialPoint - testPoint, k) * weight;
+            // Coincident self-point excluded by index; see
+            // assemble_matrix_pair_atomic for why the r2 guard is not enough.
+            if (testTri != trialTri || a != b) {
+                acc += helmholtz_g(trialPoint - testPoint, k) * weight;
+            }
             if (symmetryPlane != 0) {
                 for (int mask = 1; mask <= 7; ++mask) {
                     if (!has_image_mask(symmetryPlane, mask)) {
@@ -2804,8 +2812,14 @@ kernel void assemble_pair_blocks_regular(
             float sb1 = basis_value(qx[b], qy[b], 1);
             float sb2 = basis_value(qx[b], qy[b], 2);
             float weight = qw[a] * qw[b] * jac;
-            float2 g = helmholtz_g(trialPoint - testPoint, params.k) * weight;
-            float2 d = helmholtz_dlp(trialPoint - testPoint, normal, params.k) * weight;
+            // Coincident self-point excluded by index; see
+            // assemble_matrix_pair_atomic for why the r2 guard is not enough.
+            float2 g = float2(0.0f, 0.0f);
+            float2 d = float2(0.0f, 0.0f);
+            if (testTri != trialTri || a != b) {
+                g = helmholtz_g(trialPoint - testPoint, params.k) * weight;
+                d = helmholtz_dlp(trialPoint - testPoint, normal, params.k) * weight;
+            }
             localSlp0 += g * tb0;
             localSlp1 += g * tb1;
             localSlp2 += g * tb2;
@@ -2936,7 +2950,19 @@ kernel void assemble_matrix_pair_atomic(
                 basis_value(qx[b], qy[b], 2)
             };
             float weight = qw[a] * qw[b] * jac;
-            float2 d = helmholtz_dlp(trialPoint - testPoint, normal, params.k) * weight;
+            // For the coincident pair the a == b evaluation sits on the
+            // kernel singularity and must be excluded by INDEX, not by the
+            // r2 guard inside helmholtz_dlp: fast-math FMA contraction can
+            // round testPoint and trialPoint differently, leaving a few-ulp
+            // garbage delta whose r2 lands just above the guard and whose
+            // 1/r2 blows the entry up by ~1e10 (observed on bempp
+            // regular_sphere(3)). The CPU paths compute both points with
+            // identical arithmetic, get an exactly-zero delta, and return
+            // zero from the guard, so skipping the evaluation matches them.
+            float2 d = float2(0.0f, 0.0f);
+            if (testTri != trialTri || a != b) {
+                d = helmholtz_dlp(trialPoint - testPoint, normal, params.k) * weight;
+            }
             if (SYMMETRY_PLANE != 0) {
                 for (int mask = 1; mask <= 7; ++mask) {
                     if (!has_image_mask(SYMMETRY_PLANE, mask)) {
@@ -3172,8 +3198,16 @@ kernel void duffy_delta_blocks(
             float sb1 = basis_value(trialRef.x, trialRef.y, 1);
             float sb2 = basis_value(trialRef.x, trialRef.y, 2);
             float w = qw[a] * qw[b] * jac;
-            float2 g = helmholtz_g(trialPoint - testPoint, params.k) * w;
-            float2 d = helmholtz_dlp(trialPoint - testPoint, normal, params.k) * w;
+            // The regular half of the delta must exclude the same coincident
+            // self-point the regular assembly kernels exclude, or the
+            // subtraction no longer cancels the regular contribution; see
+            // assemble_matrix_pair_atomic.
+            float2 g = float2(0.0f, 0.0f);
+            float2 d = float2(0.0f, 0.0f);
+            if (testTri != trialTri || testImageMask != trialImageMask || a != b) {
+                g = helmholtz_g(trialPoint - testPoint, params.k) * w;
+                d = helmholtz_dlp(trialPoint - testPoint, normal, params.k) * w;
+            }
             regSlp0 += g * tb0;
             regSlp1 += g * tb1;
             regSlp2 += g * tb2;

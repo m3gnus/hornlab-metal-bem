@@ -184,3 +184,91 @@ def test_robin_impedance_tags_8_9_match_bempp():
     assert diagnostics["robin_boundary"] is True
     assert diagnostics["field_uses_total_neumann"] is True
     assert 0.0 < diagnostics["dense_solve_rcond"] <= 1.0
+
+
+@pytest.mark.slow
+def test_pair_atomic_regular_sphere3_assembly_stays_well_conditioned():
+    """Regression for the coincident self-point blowup on regular_sphere(3).
+
+    The pair_atomic Metal kernel used to evaluate the coincident pair's
+    a == b quadrature point: fast-math FMA contraction rounded testPoint and
+    trialPoint differently, the few-ulp garbage delta escaped helmholtz_dlp's
+    r^2 zero guard, and 1/r^2 injected ~1e8 values into every affected
+    triangle's own 3x3 dof block. On this mesh that drove dense_solve_rcond
+    to 6.6e-13 (healthy: ~1.6e-2) and observation pressure several percent
+    off. The self quadrature point is now excluded by index in all GPU
+    regular-quadrature kernels.
+    """
+    bempp_api, _ = _require_bempp_and_native()
+    grid = bempp_api.shapes.regular_sphere(3)
+    vertices_nx3 = np.asarray(grid.vertices.T, dtype=np.float64)
+    triangles_nx3 = np.asarray(grid.elements.T, dtype=np.int32)
+    tags = np.ones(triangles_nx3.shape[0], dtype=np.int32)
+    centroids = vertices_nx3[triangles_nx3].mean(axis=1)
+    tags[centroids[:, 2] > 0.75] = 2
+    mesh = MetalLoadedMesh(
+        grid=make_pure_grid(vertices_nx3, triangles_nx3),
+        physical_tags=tags,
+        info=MetalMeshInfo(
+            n_vertices=vertices_nx3.shape[0],
+            n_triangles=triangles_nx3.shape[0],
+            physical_groups={1: "1", 2: "2"},
+            bounding_box_m=(vertices_nx3.min(axis=0), vertices_nx3.max(axis=0)),
+        ),
+    )
+    observation = metal_bem.ObservationConfig(
+        planes=["probe"],
+        angle_count=2,
+        custom_points={"probe": np.array([[0.0, 0.0, 2.2], [0.6, 0.0, 2.1]])},
+    )
+
+    corrected = metal_bem.solve_frequencies(
+        mesh,
+        [100.0],
+        metal_bem.native_config(velocity_sources={2: 1.0}, observation=observation),
+    )
+    optimized = metal_bem.solve_frequencies(
+        mesh,
+        [100.0],
+        metal_bem.native_config(
+            velocity_sources={2: 1.0},
+            observation=observation,
+            metal_native_assembly_mode="optimized",
+        ),
+    )
+    # impedance_sources={8: 0.0} forces the Swift reference-quadrature path;
+    # the mesh has no tag-8 elements, so the problem stays physically
+    # identical to the rigid corrected/optimized solves.
+    reference = metal_bem.solve_frequencies(
+        mesh,
+        [100.0],
+        metal_bem.native_config(
+            velocity_sources={2: 1.0},
+            impedance_sources={8: 0.0},
+            observation=observation,
+        ),
+    )
+    assert reference.native_diagnostics[0]["assembly_implementation"].startswith(
+        "swift_native_reference"
+    )
+
+    assert corrected.native_diagnostics[0]["dense_solve_rcond"] > 1.0e-4
+    assert optimized.native_diagnostics[0]["dense_solve_rcond"] > 1.0e-4
+    assert reference.native_diagnostics[0]["dense_solve_rcond"] > 1.0e-4
+
+    # Optimized mode runs the same 6-point regular quadrature as the
+    # reference path, so the GPU and CPU solves agree at f32 level
+    # (measured ~1e-6 relative; was ~5e-2 with the corrupted kernel).
+    np.testing.assert_allclose(
+        optimized.pressure_complex,
+        reference.pressure_complex,
+        rtol=1.0e-3,
+        atol=1.0e-9,
+    )
+    # The corrected production solve adds Duffy singular corrections, which
+    # legitimately move the regular-quadrature answer by ~2% on this mesh.
+    np.testing.assert_allclose(
+        corrected.pressure_complex,
+        reference.pressure_complex,
+        rtol=5.0e-2,
+    )
