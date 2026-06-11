@@ -1,10 +1,62 @@
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 import numpy as np
 
 from hornlab_metal_bem import sweep
+from hornlab_metal_bem.metal import native
+from hornlab_metal_bem.metal.native import MetalNativeRuntimeStatus
+
+
+def test_discover_runtime_smoke_cached_reuses_validated_helper(monkeypatch, tmp_path):
+    helper = tmp_path / "HornlabMetalBemNative"
+    helper.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    def status_for(*, smoke_test_ran: bool) -> MetalNativeRuntimeStatus:
+        return MetalNativeRuntimeStatus(
+            available=True,
+            platform_system="Darwin",
+            platform_machine="arm64",
+            is_macos=True,
+            is_apple_silicon=True,
+            swift_path=None,
+            swift_source=None,
+            helper_executable_path=helper,
+            helper_source="test",
+            backend_dir=tmp_path,
+            native_entrypoint=tmp_path / "HornlabMetalBemNative.swift",
+            native_package_dir=tmp_path / "native_helper",
+            helper_assets_present=True,
+            smoke_test_ran=smoke_test_ran,
+            smoke_test_ok=smoke_test_ran,
+            smoke_test_error=None,
+            reasons=(),
+        )
+
+    no_smoke_status = status_for(smoke_test_ran=False)
+    smoke_status = status_for(smoke_test_ran=True)
+    calls: list[bool] = []
+
+    def discover_stub(*, run_smoke_test: bool = False):
+        calls.append(run_smoke_test)
+        return smoke_status if run_smoke_test else no_smoke_status
+
+    monkeypatch.setattr(native, "discover_native_runtime", discover_stub)
+    monkeypatch.setattr(sweep, "_SMOKE_VALIDATED_HELPERS", {})
+
+    assert sweep._discover_runtime_smoke_cached() is smoke_status
+    assert calls == [False, True]
+
+    assert sweep._discover_runtime_smoke_cached() is no_smoke_status
+    assert calls == [False, True, False]
+
+    bumped_mtime = helper.stat().st_mtime + 10.0
+    os.utime(helper, (bumped_mtime, bumped_mtime))
+
+    assert sweep._discover_runtime_smoke_cached() is smoke_status
+    assert calls == [False, True, False, False, True]
 
 
 def test_append_system_result_keeps_complex_field_surface_pressure_and_diagnostics(

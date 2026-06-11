@@ -24,6 +24,34 @@ from .result import SolveResult
 
 logger = logging.getLogger(__name__)
 
+_SMOKE_VALIDATED_HELPERS: dict[tuple[str, float], bool] = {}
+
+
+def _discover_runtime_smoke_cached():
+    """Native runtime discovery that skips the smoke subprocess when this
+    process already smoke-validated the same helper binary (path + mtime)."""
+    from .metal.native import discover_native_runtime
+
+    runtime = discover_native_runtime(run_smoke_test=False)
+    if not runtime.available or runtime.helper_executable_path is None:
+        return discover_native_runtime(run_smoke_test=True)
+
+    try:
+        key = (
+            str(runtime.helper_executable_path),
+            runtime.helper_executable_path.stat().st_mtime,
+        )
+    except OSError:
+        return discover_native_runtime(run_smoke_test=True)
+
+    if key in _SMOKE_VALIDATED_HELPERS:
+        return runtime
+
+    runtime = discover_native_runtime(run_smoke_test=True)
+    if runtime.available:
+        _SMOKE_VALIDATED_HELPERS[key] = True
+    return runtime
+
 
 def _build_frequency_grid(config: SolveConfig) -> NDArray[np.float64]:
     if config.freq_spacing == "log":
@@ -296,13 +324,13 @@ def run_sweep_native_metal(
 
     try:
         from .metal.geometry import build_metal_geometry_buffers
-        from .metal.native import MetalNativeStandardSession, discover_native_runtime
+        from .metal.native import MetalNativeStandardSession
     except Exception as exc:  # pragma: no cover - import/runtime specific.
         raise AssemblyBackendUnavailable(
             f"Native Metal helper could not be imported: {exc}"
         ) from exc
 
-    runtime = discover_native_runtime(run_smoke_test=True)
+    runtime = _discover_runtime_smoke_cached()
     if not runtime.available:
         reason = "; ".join(runtime.unavailable_reasons)
         raise AssemblyBackendUnavailable(reason)
