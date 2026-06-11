@@ -2986,6 +2986,7 @@ let metalDuffyThreadsPerGroupEnv = "HORNLAB_METAL_BEM_NATIVE_DUFFY_THREADS_PER_G
 let metalFieldThreadsPerGroupEnv = "HORNLAB_METAL_BEM_NATIVE_FIELD_THREADS_PER_GROUP"
 let metalRegularAssemblyImplementationEnv = "HORNLAB_METAL_BEM_NATIVE_REGULAR_ASSEMBLY_IMPL"
 let metalDenseSolveImplementationEnv = "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_IMPL"
+let metalSolveConcurrencyEnv = "HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY"
 let defaultMetalThreadsPerThreadgroup = 64
 
 func parseMetalThreadsPerGroupEnv(_ envName: String) throws -> Int? {
@@ -3078,6 +3079,22 @@ func requestedRegularAssemblyImplementation() throws -> String {
         "\(metalRegularAssemblyImplementationEnv) must be 'entrywise', "
             + "'block_staged', or 'pair_atomic'"
     )
+}
+
+func requestedSolveConcurrency() throws -> Int {
+    // Default 6: measured on a 10-core/64GB M-series machine, solve-bound
+    // batches (n_dof ~4500) keep improving up to 6-8 concurrent cgesv calls
+    // (60.9s serial -> 17.1s at 6 -> 16.0s at 8) while assembly-bound batches
+    // (n_dof ~1000) are flat for 2-8; 6 leaves headroom for the consumer
+    // thread and GPU scheduling. Memory in flight scales with the value:
+    // roughly (concurrency + 3) dense systems resident at once.
+    let raw = ProcessInfo.processInfo.environment[
+        metalSolveConcurrencyEnv
+    ] ?? "6"
+    guard let value = Int(raw), (1...8).contains(value) else {
+        try fail("\(metalSolveConcurrencyEnv) must be an integer in 1...8")
+    }
+    return value
 }
 
 func requestedDenseSolveImplementation() throws -> String {
@@ -5114,6 +5131,39 @@ func assembleSolveStandardNeumannBatch(
     try writeJSON(resultPath, result)
 }
 
+struct SolvedCase {
+    let assembly: AssemblyRun
+    let solve: DenseSolveRun
+}
+
+final class CaseSolveResults: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var slots: [Int: Result<SolvedCase, Error>] = [:]
+
+    func store(_ result: Result<SolvedCase, Error>, caseIndex: Int) {
+        condition.lock()
+        slots[caseIndex] = result
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func wait(_ caseIndex: Int) throws -> SolvedCase {
+        condition.lock()
+        while slots[caseIndex] == nil {
+            condition.wait()
+        }
+        let result = slots.removeValue(forKey: caseIndex)!
+        condition.unlock()
+
+        switch result {
+        case .success(let solved):
+            return solved
+        case .failure(let error):
+            throw error
+        }
+    }
+}
+
 func assembleSolveEvaluateStandardNeumannBatch(
     sessionManifestPath: String,
     payloadPath: String,
@@ -5228,22 +5278,27 @@ func assembleSolveEvaluateStandardNeumannBatch(
             || regularImplementation == "pair_atomic")
         && (assemblyMode == "optimized"
             || (assemblyMode == "corrected" && duffyMode == "gpu_blocks"))
+    let solveConcurrency = pipelineAssembly ? try requestedSolveConcurrency() : 1
     let includeDuffyBlocks = assemblyMode == "corrected"
     var pendingAssembly: ResidentMetalContext.PendingAssembly? = nil
+    let solveResults = CaseSolveResults()
+    let solveQueue = solveConcurrency > 1
+        ? DispatchQueue(
+            label: "hornlab.solve",
+            qos: .userInitiated,
+            attributes: .concurrent
+        )
+        : nil
+    let solveSemaphore = solveConcurrency > 1
+        ? DispatchSemaphore(value: solveConcurrency)
+        : nil
+    let runAhead = solveConcurrency + 1
+    var nextToSubmit = 0
 
-    func pipelinedAssemblyRun(_ caseIndex: Int) throws -> AssemblyRun {
-        guard let pending = pendingAssembly, pending.caseIndex == caseIndex else {
-            try fail("internal error: pipelined assembly is out of order")
-        }
-        let finished = try context.finishAssembly(pending)
-        pendingAssembly = caseIndex + 1 < cases.count
-            ? try context.beginAssembly(
-                caseIndex: caseIndex + 1,
-                neumann: caseNeumanns[caseIndex + 1],
-                k: caseKs[caseIndex + 1],
-                includeDuffyBlocks: includeDuffyBlocks
-            )
-            : nil
+    func assemblyRun(
+        from finished: ResidentMetalContext.FinishedAssembly,
+        caseIndex: Int
+    ) throws -> AssemblyRun {
         guard let blocks = finished.duffyBlocks else {
             return AssemblyRun(
                 arrays: finished.regular.arrays,
@@ -5282,6 +5337,75 @@ func assembleSolveEvaluateStandardNeumannBatch(
             duffyStats: stats,
             metalDispatch: finished.regular.dispatch
         )
+    }
+
+    func pipelinedAssemblyRun(_ caseIndex: Int) throws -> AssemblyRun {
+        guard let pending = pendingAssembly, pending.caseIndex == caseIndex else {
+            try fail("internal error: pipelined assembly is out of order")
+        }
+        let finished = try context.finishAssembly(pending)
+        pendingAssembly = caseIndex + 1 < cases.count
+            ? try context.beginAssembly(
+                caseIndex: caseIndex + 1,
+                neumann: caseNeumanns[caseIndex + 1],
+                k: caseKs[caseIndex + 1],
+                includeDuffyBlocks: includeDuffyBlocks
+            )
+            : nil
+        return try assemblyRun(from: finished, caseIndex: caseIndex)
+    }
+
+    func submitSolveJob(
+        caseIndex: Int,
+        finished: ResidentMetalContext.FinishedAssembly
+    ) throws {
+        guard let solveQueue, let solveSemaphore else {
+            try fail("internal error: solve worker pool is unavailable")
+        }
+        solveSemaphore.wait()
+        solveQueue.async {
+            defer {
+                solveSemaphore.signal()
+            }
+            do {
+                let assembly = try assemblyRun(from: finished, caseIndex: caseIndex)
+                let solve = try solveDenseAccelerate(
+                    aReRowMajor: assembly.arrays.aRe,
+                    aImRowMajor: assembly.arrays.aIm,
+                    rhsRe: assembly.arrays.rhsRe,
+                    rhsIm: assembly.arrays.rhsIm,
+                    n: geom.p1DofCount
+                )
+                solveResults.store(
+                    .success(SolvedCase(assembly: assembly, solve: solve)),
+                    caseIndex: caseIndex
+                )
+            } catch {
+                solveResults.store(.failure(error), caseIndex: caseIndex)
+            }
+        }
+    }
+
+    func pumpSubmissions(upTo caseIndex: Int) throws {
+        while nextToSubmit < cases.count
+            && (nextToSubmit <= caseIndex || nextToSubmit - caseIndex <= runAhead) {
+            guard let pending = pendingAssembly, pending.caseIndex == nextToSubmit else {
+                try fail("internal error: pipelined assembly is out of order")
+            }
+            let finished = try context.finishAssembly(pending)
+            pendingAssembly = nextToSubmit + 1 < cases.count
+                ? try context.beginAssembly(
+                    caseIndex: nextToSubmit + 1,
+                    neumann: caseNeumanns[nextToSubmit + 1],
+                    k: caseKs[nextToSubmit + 1],
+                    includeDuffyBlocks: includeDuffyBlocks
+                )
+                : nil
+            // The run-ahead window holds at most runAhead + 1 CPU-side
+            // A/rhs/Duffy cases in flight; the semaphore bounds active solves.
+            try submitSolveJob(caseIndex: nextToSubmit, finished: finished)
+            nextToSubmit += 1
+        }
     }
 
     if pipelineAssembly {
@@ -5330,8 +5454,21 @@ func assembleSolveEvaluateStandardNeumannBatch(
             impedanceSourceTag = try requireInt(casePayload, "impedance_source_tag")
         }
         let assembly: AssemblyRun
-        if pipelineAssembly {
+        let solve: DenseSolveRun
+        if pipelineAssembly && solveConcurrency > 1 {
+            try pumpSubmissions(upTo: caseIndex)
+            let solved = try solveResults.wait(caseIndex)
+            assembly = solved.assembly
+            solve = solved.solve
+        } else if pipelineAssembly {
             assembly = try pipelinedAssemblyRun(caseIndex)
+            solve = try solveDenseAccelerate(
+                aReRowMajor: assembly.arrays.aRe,
+                aImRowMajor: assembly.arrays.aIm,
+                rhsRe: assembly.arrays.rhsRe,
+                rhsIm: assembly.arrays.rhsIm,
+                n: geom.p1DofCount
+            )
         } else {
             assembly = try assembleRegular(
                 geom: geom,
@@ -5339,14 +5476,14 @@ func assembleSolveEvaluateStandardNeumannBatch(
                 k: k,
                 residentContext: context
             )
+            solve = try solveDenseAccelerate(
+                aReRowMajor: assembly.arrays.aRe,
+                aImRowMajor: assembly.arrays.aIm,
+                rhsRe: assembly.arrays.rhsRe,
+                rhsIm: assembly.arrays.rhsIm,
+                n: geom.p1DofCount
+            )
         }
-        let solve = try solveDenseAccelerate(
-            aReRowMajor: assembly.arrays.aRe,
-            aImRowMajor: assembly.arrays.aIm,
-            rhsRe: assembly.arrays.rhsRe,
-            rhsIm: assembly.arrays.rhsIm,
-            n: geom.p1DofCount
-        )
         if solve.lapackInfo != 0 {
             try fail("Accelerate dense solve failed with info=\(solve.lapackInfo)")
         }
@@ -5503,6 +5640,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
         "assembly_seconds": totalAssemblySeconds,
         "regular_assembly_seconds": totalRegularSeconds,
         "dense_solve_seconds": totalDenseSolveSeconds,
+        "dense_solve_concurrency": solveConcurrency,
         "field_seconds": totalFieldSeconds,
         "resident_context_seconds": contextSeconds,
         "resident_duffy_reduction_plan_seconds": context.duffyReductionPlanBuildSeconds,
