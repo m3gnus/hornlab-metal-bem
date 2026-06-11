@@ -390,6 +390,46 @@ def test_native_diagnostics_helpers_preserve_manifest_metadata():
     assert "ignored_output_path" not in case["batch"]
 
 
+def _minimal_dense_solve_field_case() -> dict[str, object]:
+    return {
+        "session_id": "session",
+        "batch_id": "batch",
+        "frequency_hz": 100.0,
+        "pressure_shape": [1],
+        "observation_pressure_real_f32": "outputs/field_re.bin",
+        "observation_pressure_imag_f32": "outputs/field_im.bin",
+        "field_shape": [1],
+        "assembly_seconds": 0.01,
+        "dense_solve_seconds": 0.02,
+        "field_seconds": 0.03,
+        "lapack_info": 0,
+    }
+
+
+def test_dense_solve_field_result_requires_complex_k_ack(tmp_path):
+    fake_self = SimpleNamespace(info=SimpleNamespace(work_dir=tmp_path))
+
+    with pytest.raises(RuntimeError, match="helper.*complex-k"):
+        MetalNativeStandardSession._dense_solve_field_result(
+            fake_self,
+            _minimal_dense_solve_field_case(),
+            {},
+            expect_complex_k=True,
+        )
+
+
+def test_dense_solve_field_result_requires_robin_ack(tmp_path):
+    fake_self = SimpleNamespace(info=SimpleNamespace(work_dir=tmp_path))
+
+    with pytest.raises(RuntimeError, match="helper.*Robin"):
+        MetalNativeStandardSession._dense_solve_field_result(
+            fake_self,
+            _minimal_dense_solve_field_case(),
+            {},
+            expect_robin=True,
+        )
+
+
 def test_native_discovery_reports_missing_helper_assets(monkeypatch, tmp_path):
     monkeypatch.setattr(native.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(native.platform, "machine", lambda: "arm64")
@@ -2474,7 +2514,7 @@ def test_native_executable_complex_k_robin_tags_8_9_solve_field(
     assert np.all(np.isfinite(field))
     assert solved.diagnostics["assembly_mode"] == "reference"
     assert solved.diagnostics["assembly_implementation"] == (
-        "swift_native_reference_complex_robin_quadrature"
+        "swift_native_reference_complex_robin_quadrature_plus_cpu_duffy"
     )
     assert solved.diagnostics["complex_k"] is True
     assert solved.diagnostics["robin_boundary"] is True

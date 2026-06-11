@@ -22,8 +22,10 @@ The schema is intentionally narrow. It covers standard Neumann dense BEM
 assembly, dense solve, and exterior field evaluation for package-owned native
 Metal execution. The production combined solve operation also accepts
 experimental per-case extensions for complex-k assembly and Robin admittance;
-these keep the same schema and are ignored by older helpers that do not read
-them.
+these keep the same schema. Older helpers ignore the fields, so the Python
+layer requires the `complex_k` / `robin_boundary` acknowledgement diagnostics
+whenever it sent the corresponding inputs and fails loudly instead of silently
+solving the wrong physics.
 
 ## Manifest and Binary Rules
 
@@ -106,8 +108,10 @@ single row-major `(case_count, n_obs)` field array pair.
   and reconstructs total Neumann data for field evaluation.
 
 When `k_imag_f32` is nonzero or `impedance_sources` is present, the helper uses
-the Swift reference assembly path for that case and disables pipelined Metal
-assembly for the batch.
+the Swift reference assembly path plus CPU Duffy singular corrections for that
+case and disables pipelined Metal assembly for the batch. These corrected
+experimental cases report implementation label
+`swift_native_reference_complex_robin_quadrature_plus_cpu_duffy`.
 
 ## Streamed Per-Case Results
 

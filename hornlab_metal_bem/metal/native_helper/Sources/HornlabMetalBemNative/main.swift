@@ -1632,7 +1632,8 @@ func regularPairBlocks(
     trial: Int,
     testImageMask: Int,
     trialImageMask: Int,
-    k: Float
+    k: Float,
+    kImag: Float = 0.0
 ) -> (slp: [Complex32], dlp: [Complex32]) {
     let (qx, qy, qw) = triangleRule6()
     let normal = mirrorNormal(
@@ -1658,8 +1659,13 @@ func regularPairBlocks(
             let dx = sx - tx
             let dy = sy - ty
             let dz = sz - tz
-            let g = helmholtzG(dx, dy, dz, k)
-            let d = helmholtzDlp(dx, dy, dz, normal.0, normal.1, normal.2, k)
+            let g = helmholtzGComplex(dx, dy, dz, kReal: k, kImag: kImag)
+            let d = helmholtzDlpComplex(
+                dx, dy, dz,
+                normal.0, normal.1, normal.2,
+                kReal: k,
+                kImag: kImag
+            )
             let w = qw[qa] * qw[qb] * jac
             for i in 0..<3 {
                 slp[i] = slp[i] + g * (tbasis[i] * w)
@@ -1676,7 +1682,8 @@ func singularPairBlocks(
     geom: Geometry,
     pair: DuffyPair,
     rules: [Int: DuffyRule],
-    k: Float
+    k: Float,
+    kImag: Float = 0.0
 ) throws -> (slp: [Complex32], dlp: [Complex32]) {
     guard let rule = rules[pair.kind] else {
         try fail("missing Duffy rule for kind \(pair.kind)")
@@ -1715,8 +1722,13 @@ func singularPairBlocks(
         let dx = sx - tx
         let dy = sy - ty
         let dz = sz - tz
-        let g = helmholtzG(dx, dy, dz, k)
-        let d = helmholtzDlp(dx, dy, dz, normal.0, normal.1, normal.2, k)
+        let g = helmholtzGComplex(dx, dy, dz, kReal: k, kImag: kImag)
+        let d = helmholtzDlpComplex(
+            dx, dy, dz,
+            normal.0, normal.1, normal.2,
+            kReal: k,
+            kImag: kImag
+        )
         let w = rule.weights[q] * jac
         for i in 0..<3 {
             slp[i] = slp[i] + g * (tbasis[i] * w)
@@ -1732,7 +1744,9 @@ func applyDuffyCorrectionsCPU(
     to arrays: AssemblyArrays,
     geom: Geometry,
     neumann: [Complex32],
-    k: Float
+    k: Float,
+    kImag: Float = 0.0,
+    robinBetas: [Complex32]? = nil
 ) throws -> (AssemblyArrays, DuffyCorrectionStats) {
     let start = CFAbsoluteTimeGetCurrent()
     let pairList = try buildDuffyPairList(geom)
@@ -1748,6 +1762,7 @@ func applyDuffyCorrectionsCPU(
     var rhsIm = arrays.rhsIm
     var triplets: [Int64: (Double, Double)] = [:]
     triplets.reserveCapacity(pairList.plan.total * 3)
+    let iK = Complex32(re: -kImag, im: k)
 
     for pair in pairList.pairs {
         let regular = regularPairBlocks(
@@ -1756,10 +1771,20 @@ func applyDuffyCorrectionsCPU(
             trial: pair.trial,
             testImageMask: pair.testImageMask,
             trialImageMask: pair.trialImageMask,
-            k: k
+            k: k,
+            kImag: kImag
         )
-        let singular = try singularPairBlocks(geom: geom, pair: pair, rules: rules, k: k)
+        let singular = try singularPairBlocks(
+            geom: geom,
+            pair: pair,
+            rules: rules,
+            k: k,
+            kImag: kImag
+        )
         let gTrial = neumann[pair.trial]
+        let betaTrial = robinBetas?[pair.trial] ?? Complex32.zero
+        let robinCoupling = iK * betaTrial
+        let hasRobin = betaTrial.re != 0.0 || betaTrial.im != 0.0
 
         for i in 0..<3 {
             let row = geom.p1Dof(pair.test, i)
@@ -1772,7 +1797,10 @@ func applyDuffyCorrectionsCPU(
 
             for j in 0..<3 {
                 let col = geom.p1Dof(pair.trial, j)
-                let delta = (singular.dlp[i * 3 + j] - regular.dlp[i * 3 + j]) * rowWeight
+                var delta = (singular.dlp[i * 3 + j] - regular.dlp[i * 3 + j]) * rowWeight
+                if hasRobin {
+                    delta = delta - ((slpDelta * robinCoupling) * Float(1.0 / 3.0))
+                }
                 let key = Int64(row) + Int64(col) * Int64(n)
                 let current = triplets[key] ?? (0.0, 0.0)
                 triplets[key] = (
@@ -4687,13 +4715,28 @@ func assembleRegular(
                 robinBetas: robinBetas
             )
         }
+        if kImag != 0.0 || robinBetas != nil {
+            let (corrected, stats) = try applyDuffyCorrectionsCPU(
+                to: arrays,
+                geom: geom,
+                neumann: neumann,
+                k: k,
+                kImag: kImag,
+                robinBetas: robinBetas
+            )
+            return AssemblyRun(
+                arrays: corrected,
+                implementation: "swift_native_reference_complex_robin_quadrature_plus_cpu_duffy",
+                mode: mode,
+                seconds: seconds + stats.seconds,
+                parity: nil,
+                duffyStats: stats,
+                metalDispatch: nil
+            )
+        }
         return AssemblyRun(
             arrays: arrays,
-            implementation: (
-                kImag != 0.0 || robinBetas != nil
-                    ? "swift_native_reference_complex_robin_quadrature"
-                    : "swift_native_reference_regular_quadrature"
-            ),
+            implementation: "swift_native_reference_regular_quadrature",
             mode: mode,
             seconds: seconds,
             parity: nil,

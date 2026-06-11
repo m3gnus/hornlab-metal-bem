@@ -801,6 +801,8 @@ class MetalNativeStandardSession:
                     float(np.float32(beta_value.real)),
                     float(np.float32(beta_value.imag)),
                 ]
+        expect_complex_k = bool(np.any(k_imag_values != 0.0))
+        expect_robin = impedance_payload is not None
 
         points_3xn = _require_observation_points_3xn(observation_points)
         n_obs = int(points_3xn.shape[1])
@@ -941,6 +943,8 @@ class MetalNativeStandardSession:
                 case_results_dir=case_results_dir,
                 expected_count=int(frequencies.size),
                 on_case_result=on_case_result,
+                expect_complex_k=expect_complex_k,
+                expect_robin=expect_robin,
             )
 
         self._run_native_helper(
@@ -956,7 +960,12 @@ class MetalNativeStandardSession:
         )
         batch_diagnostics = _native_batch_diagnostics(result)
         return [
-            self._dense_solve_field_result(case_result, batch_diagnostics)
+            self._dense_solve_field_result(
+                case_result,
+                batch_diagnostics,
+                expect_complex_k=expect_complex_k,
+                expect_robin=expect_robin,
+            )
             for case_result in case_results
         ]
 
@@ -964,11 +973,33 @@ class MetalNativeStandardSession:
         self,
         case_result: dict[str, Any],
         batch_diagnostics: dict[str, Any],
+        expect_complex_k: bool = False,
+        expect_robin: bool = False,
     ) -> Any:
         from .session import DenseSolveFieldResult
 
         pressure_real = case_result.get("pressure_real_f32")
         pressure_imag = case_result.get("pressure_imag_f32")
+        diagnostics = _native_case_diagnostics(
+            case_result,
+            batch_diagnostics=batch_diagnostics,
+        )
+        if expect_complex_k and diagnostics.get("complex_k") is not True:
+            raise RuntimeError(
+                "native helper acknowledged no complex-k support; the helper "
+                "binary predates k_imag_f32. Rebuild with "
+                "`swift build -c release` in "
+                "hornlab_metal_bem/metal/native_helper or unset "
+                "HORNLAB_METAL_BEM_NATIVE."
+            )
+        if expect_robin and diagnostics.get("robin_boundary") is not True:
+            raise RuntimeError(
+                "native helper acknowledged no Robin boundary support; the "
+                "helper binary predates impedance_sources. Rebuild with "
+                "`swift build -c release` in "
+                "hornlab_metal_bem/metal/native_helper or unset "
+                "HORNLAB_METAL_BEM_NATIVE."
+            )
         return DenseSolveFieldResult(
             session_id=str(case_result["session_id"]),
             batch_id=str(case_result["batch_id"]),
@@ -1007,10 +1038,7 @@ class MetalNativeStandardSession:
             surface_pressure_avg=_complex_map_from_manifest(
                 case_result.get("surface_pressure_avg")
             ),
-            diagnostics=_native_case_diagnostics(
-                case_result,
-                batch_diagnostics=batch_diagnostics,
-            ),
+            diagnostics=diagnostics,
         )
 
     def _stream_assemble_solve_evaluate(
@@ -1021,6 +1049,8 @@ class MetalNativeStandardSession:
         case_results_dir: Path,
         expected_count: int,
         on_case_result: Any,
+        expect_complex_k: bool = False,
+        expect_robin: bool = False,
     ) -> list[Any]:
         """Run one batch helper invocation, firing callbacks per case.
 
@@ -1043,7 +1073,12 @@ class MetalNativeStandardSession:
                 if not case_path.is_file():
                     return False
                 case_result = json.loads(case_path.read_text(encoding="utf-8"))
-                solved = self._dense_solve_field_result(case_result, {})
+                solved = self._dense_solve_field_result(
+                    case_result,
+                    {},
+                    expect_complex_k=expect_complex_k,
+                    expect_robin=expect_robin,
+                )
                 solved_fields.append(solved)
                 if on_case_result(len(solved_fields) - 1, solved) is False:
                     return True
@@ -1071,6 +1106,8 @@ class MetalNativeStandardSession:
             solved = self._dense_solve_field_result(
                 case_results[index],
                 batch_diagnostics,
+                expect_complex_k=expect_complex_k,
+                expect_robin=expect_robin,
             )
             solved_fields.append(solved)
             if on_case_result(index, solved) is False:

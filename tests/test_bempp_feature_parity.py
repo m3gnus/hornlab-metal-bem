@@ -116,17 +116,19 @@ def test_complex_k_near_unit_sphere_interior_resonance_matches_bempp():
     metal_result = metal_bem.solve_frequencies(metal_mesh, [frequency_hz], metal_cfg)
     bempp_result = bempp_bem.solve_frequencies(bempp_mesh, [frequency_hz], bempp_cfg)
 
+    # Measured gap with CPU Duffy corrections on the reference path: ~1.4e-6
+    # relative (f32-level agreement with bempp's numba dense assembly).
     np.testing.assert_allclose(
         metal_result.pressure_complex,
         bempp_result.pressure_complex,
-        rtol=3.5e-1,
-        atol=2.0e-2,
+        rtol=1.0e-4,
+        atol=1.0e-6,
     )
     np.testing.assert_allclose(
         metal_result.impedance,
         bempp_result.impedance,
-        rtol=3.5e-1,
-        atol=2.0e-2,
+        rtol=1.0e-4,
+        atol=1.0e-6,
     )
     diagnostics = metal_result.native_diagnostics[0]
     assert diagnostics["complex_k"] is True
@@ -164,17 +166,19 @@ def test_robin_impedance_tags_8_9_match_bempp():
     metal_result = metal_bem.solve_frequencies(metal_mesh, [frequency_hz], metal_cfg)
     bempp_result = bempp_bem.solve_frequencies(bempp_mesh, [frequency_hz], bempp_cfg)
 
+    # Measured gap with CPU Duffy corrections on the reference path: ~4e-7
+    # relative (f32-level agreement with bempp's numba dense assembly).
     np.testing.assert_allclose(
         metal_result.pressure_complex,
         bempp_result.pressure_complex,
-        rtol=1.0e-1,
-        atol=2.0e-2,
+        rtol=1.0e-4,
+        atol=1.0e-6,
     )
     np.testing.assert_allclose(
         metal_result.impedance,
         bempp_result.impedance,
-        rtol=2.5e-1,
-        atol=2.0e-2,
+        rtol=1.0e-4,
+        atol=1.0e-6,
     )
     diagnostics = metal_result.native_diagnostics[0]
     assert diagnostics["robin_boundary"] is True
