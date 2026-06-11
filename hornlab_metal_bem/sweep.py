@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -200,6 +201,88 @@ def _field_points_3xn(obs_points: NDArray[np.float64]) -> NDArray[np.float32]:
     )
 
 
+def _mesh_vertices_elements(
+    mesh: LoadedMesh,
+) -> tuple[NDArray[np.float64], NDArray[np.int32]]:
+    vertices = np.asarray(mesh.grid.vertices, dtype=np.float64)
+    if vertices.ndim == 2 and vertices.shape[0] == 3 and vertices.shape[1] != 3:
+        vertices = vertices.T
+    elements = np.asarray(mesh.grid.elements, dtype=np.int32)
+    if elements.ndim == 2 and elements.shape[0] == 3 and elements.shape[1] != 3:
+        elements = elements.T
+    return vertices, elements
+
+
+def _mesh_max_edge_m(mesh: LoadedMesh) -> float:
+    vertices, elements = _mesh_vertices_elements(mesh)
+    if elements.size == 0:
+        return 0.0
+    p0 = vertices[elements[:, 0]]
+    p1 = vertices[elements[:, 1]]
+    p2 = vertices[elements[:, 2]]
+    max_edge = max(
+        float(np.max(np.linalg.norm(p1 - p0, axis=1))),
+        float(np.max(np.linalg.norm(p2 - p1, axis=1))),
+        float(np.max(np.linalg.norm(p0 - p2, axis=1))),
+    )
+    return max_edge
+
+
+def _apply_dense_solve_policy(
+    diagnostics: dict,
+    *,
+    threshold: float,
+) -> None:
+    diagnostics["dense_solve_rcond_warning_threshold"] = float(threshold)
+    diagnostics["dense_solve_suspect"] = False
+    if threshold <= 0.0:
+        return
+    raw_rcond = diagnostics.get("dense_solve_rcond")
+    if raw_rcond is None:
+        return
+    try:
+        rcond = float(raw_rcond)
+    except (TypeError, ValueError):
+        return
+    if not math.isfinite(rcond):
+        return
+    if rcond < threshold:
+        diagnostics["dense_solve_suspect"] = True
+        diagnostics["dense_solve_recommendation"] = (
+            "Treat this frequency as suspect; nudge or densify the frequency "
+            "grid around the resonance and compare against nearby points. "
+            "This flag detects dense-solve conditioning only."
+        )
+
+
+def _apply_mesh_resolution_policy(
+    diagnostics: dict,
+    *,
+    frequency_hz: float,
+    mesh_max_edge_m: float,
+    elements_per_wavelength_min: float,
+) -> None:
+    diagnostics["mesh_max_edge_m"] = float(mesh_max_edge_m)
+    diagnostics["mesh_elements_per_wavelength_min"] = float(
+        elements_per_wavelength_min
+    )
+    if mesh_max_edge_m <= 0.0:
+        diagnostics["mesh_elements_per_wavelength"] = math.inf
+        diagnostics["mesh_max_valid_frequency_hz"] = math.inf
+        diagnostics["mesh_resolution_suspect"] = False
+        return
+    wavelength_m = SPEED_OF_SOUND / float(frequency_hz)
+    elements_per_wavelength = wavelength_m / float(mesh_max_edge_m)
+    max_valid_frequency_hz = SPEED_OF_SOUND / (
+        float(elements_per_wavelength_min) * float(mesh_max_edge_m)
+    )
+    diagnostics["mesh_elements_per_wavelength"] = float(elements_per_wavelength)
+    diagnostics["mesh_max_valid_frequency_hz"] = float(max_valid_frequency_hz)
+    diagnostics["mesh_resolution_suspect"] = bool(
+        elements_per_wavelength < elements_per_wavelength_min
+    )
+
+
 def _system_reductions(
     system,
     mesh: LoadedMesh,
@@ -302,6 +385,9 @@ def _append_system_result(
     native_diagnostics_rows: list[dict],
     solver_log: list[dict],
     completed_freqs: list[float],
+    dense_solve_rcond_warning_threshold: float = 0.0,
+    mesh_max_edge_m: float = 0.0,
+    mesh_elements_per_wavelength_min: float = 6.0,
 ) -> dict:
     impedance, pavg = _system_reductions(
         system,
@@ -316,6 +402,16 @@ def _append_system_result(
     pressure = _system_field(system, n_planes, n_angles, field_batch_complex)
     directivity = _directivity_from_pressure(pressure, on_axis_idx)
     native_diagnostics = dict(getattr(system, "diagnostics", {}) or {})
+    _apply_dense_solve_policy(
+        native_diagnostics,
+        threshold=dense_solve_rcond_warning_threshold,
+    )
+    _apply_mesh_resolution_policy(
+        native_diagnostics,
+        frequency_hz=frequency_hz,
+        mesh_max_edge_m=mesh_max_edge_m,
+        elements_per_wavelength_min=mesh_elements_per_wavelength_min,
+    )
     log_entry = {
         "frequency_hz": frequency_hz,
         "iterations": None,
@@ -387,6 +483,7 @@ def run_sweep_native_metal(
         p1_space,
         dp0_space,
     )
+    mesh_max_edge_m = _mesh_max_edge_m(mesh)
 
     source_tags = list(config.velocity_sources.keys())
     active_impedance_sources = _active_impedance_sources(mesh.physical_tags, config)
@@ -478,6 +575,13 @@ def run_sweep_native_metal(
                     native_diagnostics_rows=native_diagnostics_rows,
                     solver_log=solver_log,
                     completed_freqs=completed_freqs,
+                    dense_solve_rcond_warning_threshold=(
+                        config.dense_solve_rcond_warning_threshold
+                    ),
+                    mesh_max_edge_m=mesh_max_edge_m,
+                    mesh_elements_per_wavelength_min=(
+                        config.mesh_elements_per_wavelength_min
+                    ),
                 )
                 if config.progress_callback is not None:
                     config.progress_callback(i, len(freq_values), frequency_hz)
@@ -530,6 +634,13 @@ def run_sweep_native_metal(
                     native_diagnostics_rows=native_diagnostics_rows,
                     solver_log=solver_log,
                     completed_freqs=completed_freqs,
+                    dense_solve_rcond_warning_threshold=(
+                        config.dense_solve_rcond_warning_threshold
+                    ),
+                    mesh_max_edge_m=mesh_max_edge_m,
+                    mesh_elements_per_wavelength_min=(
+                        config.mesh_elements_per_wavelength_min
+                    ),
                 )
                 if config.progress_callback is not None:
                     config.progress_callback(i, len(freq_values), frequency_hz)

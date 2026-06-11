@@ -127,3 +127,49 @@ def test_append_system_result_keeps_complex_field_surface_pressure_and_diagnosti
     assert entry["lapack_info"] == 0
     assert entry["native_diagnostics"]["assembly_implementation"] == "test_assembly"
     assert native_diagnostics_rows == [entry["native_diagnostics"]]
+
+
+def test_dense_solve_policy_marks_low_rcond_suspect():
+    diagnostics = {"dense_solve_rcond": 1e-8}
+
+    sweep._apply_dense_solve_policy(diagnostics, threshold=1e-6)
+
+    assert diagnostics["dense_solve_rcond_warning_threshold"] == 1e-6
+    assert diagnostics["dense_solve_suspect"] is True
+    assert "nudge or densify" in diagnostics["dense_solve_recommendation"]
+
+
+def test_mesh_resolution_policy_marks_underresolved_frequency():
+    diagnostics = {}
+
+    sweep._apply_mesh_resolution_policy(
+        diagnostics,
+        frequency_hz=1000.0,
+        mesh_max_edge_m=0.1,
+        elements_per_wavelength_min=6.0,
+    )
+
+    np.testing.assert_allclose(diagnostics["mesh_elements_per_wavelength"], 3.43)
+    np.testing.assert_allclose(
+        diagnostics["mesh_max_valid_frequency_hz"],
+        571.6666666666666,
+    )
+    assert diagnostics["mesh_resolution_suspect"] is True
+
+
+def test_mesh_max_edge_accepts_bempp_shaped_arrays():
+    mesh = SimpleNamespace(
+        grid=SimpleNamespace(
+            vertices=np.array(
+                [
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.0, 0.0, 0.0],
+                ],
+                dtype=np.float64,
+            ),
+            elements=np.array([[0], [1], [2]], dtype=np.int32),
+        )
+    )
+
+    np.testing.assert_allclose(sweep._mesh_max_edge_m(mesh), np.sqrt(2.0))

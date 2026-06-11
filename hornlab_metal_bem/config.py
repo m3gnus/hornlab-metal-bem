@@ -92,6 +92,11 @@ class SolveConfig:
     metal_native_duffy_threads_per_group: int | None = None
     metal_native_field_threads_per_group: int | None = None
 
+    # Diagnostic policy. These mark results suspect; they do not change solver
+    # settings and are not an interior-resonance cure.
+    dense_solve_rcond_warning_threshold: float = 1e-6
+    mesh_elements_per_wavelength_min: float = 6.0
+
     # Mesh scale (applied on load if mesh isn't already in metres)
     mesh_scale: float = 1.0
 
@@ -127,6 +132,10 @@ class SolveConfig:
             raise ValueError("mesh_scale must be positive")
         if self.air_density <= 0:
             raise ValueError("air_density must be positive")
+        if self.dense_solve_rcond_warning_threshold < 0:
+            raise ValueError("dense_solve_rcond_warning_threshold must be non-negative")
+        if self.mesh_elements_per_wavelength_min <= 0:
+            raise ValueError("mesh_elements_per_wavelength_min must be positive")
         if self.formulation not in {BIEFormulation.STANDARD, BIEFormulation.COMPLEX_K}:
             raise ValueError("formulation must be 'standard' or 'complex_k'")
         if self.complex_k_shift < 0:

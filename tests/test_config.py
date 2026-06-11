@@ -56,6 +56,8 @@ def test_solve_config_default_native_metal_controls():
     assert cfg.metal_native_rhs_threads_per_group is None
     assert cfg.metal_native_duffy_threads_per_group is None
     assert cfg.metal_native_field_threads_per_group is None
+    assert cfg.dense_solve_rcond_warning_threshold == 1e-6
+    assert cfg.mesh_elements_per_wavelength_min == 6.0
 
 
 def test_solve_config_rejects_unknown_frequency_spacing():
@@ -116,6 +118,11 @@ def test_solve_config_accepts_native_symmetry_planes():
         ({"freq_min_hz": 1000.0, "freq_max_hz": 500.0}, "freq_max_hz"),
         ({"mesh_scale": 0.0}, "mesh_scale"),
         ({"air_density": 0.0}, "air_density"),
+        (
+            {"dense_solve_rcond_warning_threshold": -1.0},
+            "dense_solve_rcond_warning_threshold",
+        ),
+        ({"mesh_elements_per_wavelength_min": 0.0}, "mesh_elements_per_wavelength_min"),
     ],
 )
 def test_solve_config_rejects_degenerate_sweep_settings(kwargs, match):
