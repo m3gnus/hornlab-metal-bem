@@ -148,6 +148,21 @@ makes it nondeterministic at float32 rounding level between runs. `entrywise`
 `block_staged` (pair blocks staged through a large intermediate buffer) remain
 selectable for A/B comparison and deterministic debugging.
 
+In the combined assemble/solve/field batch op the per-case CPU work (Duffy
+delta reduction, Accelerate dense solve, cgecon condition estimate) runs on a
+bounded worker pool sized by `HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY`
+(default 6, range 1..8; 1 restores the serial loop), with GPU assembly
+running ahead by pool size + 1 cases. Results are consumed and streamed in
+case order; per-case `dense_solve_seconds` are worker CPU seconds, so their
+batch sum can exceed `wall_seconds`. Two profiling caveats learned the hard
+way: per-case GPU command-buffer windows reported by the pipelined sweep are
+stretched by concurrent command buffers and overstate kernel cost (use the
+sequential assembly-only batch op for kernel A/B), and amortizing the
+k-independent pair geometry across wavenumbers in one kernel does not pay on
+M-series GPUs — the kernel is throughput-saturated independent of that
+geometry, and multi-wavenumber accumulator state collapses occupancy (see
+branch `experiment/multik-assembly`).
+
 Runtime discovery prefers an explicit helper executable, then
 `HORNLAB_METAL_BEM_NATIVE`, then compiled SwiftPM binaries under
 `metal/native_helper/.build/{release,debug}/HornlabMetalBemNative`. If no helper
