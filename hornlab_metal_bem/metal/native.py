@@ -1766,6 +1766,7 @@ def _native_case_diagnostics(
         "field_batch_shape",
         "field_output_layout",
         "duffy_corrections",
+        "near_quadrature",
         "metal_dispatch",
         "field_metal_dispatch",
     )

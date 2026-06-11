@@ -320,6 +320,7 @@ struct AssemblyRun {
     let seconds: Double
     let parity: [String: Any]?
     let duffyStats: DuffyCorrectionStats?
+    let nearStats: NearQuadratureStats?
     let metalDispatch: [String: Any]?
 }
 
@@ -449,6 +450,17 @@ struct DuffyPairList {
     let plan: DuffyPairPlan
 }
 
+struct NearPair {
+    let test: Int
+    let trial: Int
+    let testImageMask: Int
+    let trialImageMask: Int
+}
+
+struct NearPairList {
+    let pairs: [NearPair]
+}
+
 struct DuffyReductionPlan {
     let pairTrialTriangles: [Int]
     let rhsRows: [Int]
@@ -501,6 +513,27 @@ struct DuffyCorrectionStats {
             payload["image_singular_correction"] = true
         }
         return payload
+    }
+}
+
+struct NearQuadratureConfig {
+    let level: Int
+    let threshold: Double
+}
+
+struct NearQuadratureStats {
+    let level: Int
+    let threshold: Double
+    let pairCount: Int
+    let seconds: Double
+
+    func toJSON() -> [String: Any] {
+        [
+            "level": level,
+            "threshold": threshold,
+            "pair_count": pairCount,
+            "seconds": seconds,
+        ]
     }
 }
 
@@ -1454,6 +1487,173 @@ func buildDuffyPairPlan(_ geom: Geometry) throws -> DuffyPairPlan {
     try buildDuffyPairList(geom).plan
 }
 
+struct TriangleNearMetrics {
+    let centroid: (Float, Float, Float)
+    let minPoint: (Float, Float, Float)
+    let maxPoint: (Float, Float, Float)
+    let longestEdge: Float
+}
+
+func distanceSquared(
+    _ a: (Float, Float, Float),
+    _ b: (Float, Float, Float)
+) -> Float {
+    let dx = a.0 - b.0
+    let dy = a.1 - b.1
+    let dz = a.2 - b.2
+    return dx * dx + dy * dy + dz * dz
+}
+
+func triangleNearMetrics(geom: Geometry, triangle: Int, mask: Int) throws -> TriangleNearMetrics {
+    var points: [(Float, Float, Float)] = []
+    points.reserveCapacity(3)
+    for local in 0..<3 {
+        let vertex = geom.triangleVertex(triangle, local)
+        if vertex < 0 || vertex >= geom.nVertices {
+            try fail("triangles_i32 contains out-of-range vertex \(vertex)")
+        }
+        points.append(mirrorPoint(vertexPoint(geom, vertex), mask: mask))
+    }
+
+    let centroid = (
+        (points[0].0 + points[1].0 + points[2].0) / 3.0,
+        (points[0].1 + points[1].1 + points[2].1) / 3.0,
+        (points[0].2 + points[1].2 + points[2].2) / 3.0
+    )
+    let minPoint = (
+        min(points[0].0, min(points[1].0, points[2].0)),
+        min(points[0].1, min(points[1].1, points[2].1)),
+        min(points[0].2, min(points[1].2, points[2].2))
+    )
+    let maxPoint = (
+        max(points[0].0, max(points[1].0, points[2].0)),
+        max(points[0].1, max(points[1].1, points[2].1)),
+        max(points[0].2, max(points[1].2, points[2].2))
+    )
+    let longestEdgeSquared = max(
+        distanceSquared(points[0], points[1]),
+        max(distanceSquared(points[1], points[2]), distanceSquared(points[2], points[0]))
+    )
+    return TriangleNearMetrics(
+        centroid: centroid,
+        minPoint: minPoint,
+        maxPoint: maxPoint,
+        longestEdge: sqrt(longestEdgeSquared)
+    )
+}
+
+func bboxDistanceSquared(_ a: TriangleNearMetrics, _ b: TriangleNearMetrics) -> Double {
+    func axisDistance(_ amin: Float, _ amax: Float, _ bmin: Float, _ bmax: Float) -> Double {
+        if amax < bmin {
+            return Double(bmin - amax)
+        }
+        if bmax < amin {
+            return Double(amin - bmax)
+        }
+        return 0.0
+    }
+    let dx = axisDistance(a.minPoint.0, a.maxPoint.0, b.minPoint.0, b.maxPoint.0)
+    let dy = axisDistance(a.minPoint.1, a.maxPoint.1, b.minPoint.1, b.maxPoint.1)
+    let dz = axisDistance(a.minPoint.2, a.maxPoint.2, b.minPoint.2, b.maxPoint.2)
+    return dx * dx + dy * dy + dz * dz
+}
+
+func centroidDistanceSquared(_ a: TriangleNearMetrics, _ b: TriangleNearMetrics) -> Double {
+    let dx = Double(a.centroid.0 - b.centroid.0)
+    let dy = Double(a.centroid.1 - b.centroid.1)
+    let dz = Double(a.centroid.2 - b.centroid.2)
+    return dx * dx + dy * dy + dz * dz
+}
+
+func buildNearPairList(geom: Geometry, threshold: Double) throws -> NearPairList {
+    let imageMasks: [Int]
+    if geom.symmetryPlane == nil {
+        imageMasks = [0]
+    } else {
+        imageMasks = [0] + symmetryImageMasks(geom.symmetryPlane)
+    }
+    var metricsByMask: [Int: [TriangleNearMetrics]] = [:]
+    for mask in imageMasks {
+        var metrics: [TriangleNearMetrics] = []
+        metrics.reserveCapacity(geom.nTriangles)
+        for tri in 0..<geom.nTriangles {
+            metrics.append(try triangleNearMetrics(geom: geom, triangle: tri, mask: mask))
+        }
+        metricsByMask[mask] = metrics
+    }
+
+    let lock = NSLock()
+    var pairs: [NearPair] = []
+    pairs.reserveCapacity(geom.nTriangles * imageMasks.count * imageMasks.count)
+
+    // Parallel brute force is enough for the current correction sizes; a
+    // spatial grid is the next step if this pair-list build shows up in profiles.
+    DispatchQueue.concurrentPerform(iterations: geom.nTriangles) { trial in
+        var localPairs: [NearPair] = []
+        for trialImageMask in imageMasks {
+            guard let trialMetrics = metricsByMask[trialImageMask] else {
+                continue
+            }
+            let trialMetric = trialMetrics[trial]
+            for testImageMask in imageMasks {
+                guard let testMetrics = metricsByMask[testImageMask] else {
+                    continue
+                }
+                for test in 0..<geom.nTriangles {
+                    let testMetric = testMetrics[test]
+                    let cutoff = threshold * Double(
+                        max(testMetric.longestEdge, trialMetric.longestEdge)
+                    )
+                    let cutoffSquared = cutoff * cutoff
+                    if bboxDistanceSquared(testMetric, trialMetric) > cutoffSquared {
+                        continue
+                    }
+                    if centroidDistanceSquared(testMetric, trialMetric) >= cutoffSquared {
+                        continue
+                    }
+                    let shared = imageSharedLocalIds(
+                        geom,
+                        test: test,
+                        trial: trial,
+                        testImageMask: testImageMask,
+                        trialImageMask: trialImageMask
+                    )
+                    if shared.count > 0 {
+                        continue
+                    }
+                    localPairs.append(
+                        NearPair(
+                            test: test,
+                            trial: trial,
+                            testImageMask: testImageMask,
+                            trialImageMask: trialImageMask
+                        )
+                    )
+                }
+            }
+        }
+        if !localPairs.isEmpty {
+            lock.lock()
+            pairs.append(contentsOf: localPairs)
+            lock.unlock()
+        }
+    }
+
+    pairs.sort {
+        if $0.trial != $1.trial {
+            return $0.trial < $1.trial
+        }
+        if $0.trialImageMask != $1.trialImageMask {
+            return $0.trialImageMask < $1.trialImageMask
+        }
+        if $0.testImageMask != $1.testImageMask {
+            return $0.testImageMask < $1.testImageMask
+        }
+        return $0.test < $1.test
+    }
+    return NearPairList(pairs: pairs)
+}
+
 func buildDuffyReductionPlan(geom: Geometry, pairList: DuffyPairList) -> DuffyReductionPlan {
     let n = geom.p1DofCount
     let pairCount = pairList.pairs.count
@@ -1631,6 +1831,57 @@ func remapSingular(_ point: DuffyPoint, kind: Int, local1: Int, local2: Int)
     return (point.x, 1.0 - point.x - point.y)
 }
 
+struct ReferenceSubtriangle {
+    let a: (Float, Float)
+    let b: (Float, Float)
+    let c: (Float, Float)
+
+    var det: Float {
+        abs((b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0))
+    }
+}
+
+func midpoint(_ a: (Float, Float), _ b: (Float, Float)) -> (Float, Float) {
+    ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5)
+}
+
+func referenceSubtriangles(level: Int) -> [ReferenceSubtriangle] {
+    var triangles = [
+        ReferenceSubtriangle(a: (0.0, 0.0), b: (1.0, 0.0), c: (0.0, 1.0))
+    ]
+    if level <= 0 {
+        return triangles
+    }
+    for _ in 0..<level {
+        var next: [ReferenceSubtriangle] = []
+        next.reserveCapacity(triangles.count * 4)
+        for tri in triangles {
+            let ab = midpoint(tri.a, tri.b)
+            let bc = midpoint(tri.b, tri.c)
+            let ca = midpoint(tri.c, tri.a)
+            next.append(ReferenceSubtriangle(a: tri.a, b: ab, c: ca))
+            next.append(ReferenceSubtriangle(a: ab, b: tri.b, c: bc))
+            next.append(ReferenceSubtriangle(a: ca, b: bc, c: tri.c))
+            next.append(ReferenceSubtriangle(a: ab, b: bc, c: ca))
+        }
+        triangles = next
+    }
+    return triangles
+}
+
+func pointInSubtriangle(
+    _ subtriangle: ReferenceSubtriangle,
+    _ xi: Float,
+    _ eta: Float
+) -> (Float, Float) {
+    (
+        subtriangle.a.0 + xi * (subtriangle.b.0 - subtriangle.a.0)
+            + eta * (subtriangle.c.0 - subtriangle.a.0),
+        subtriangle.a.1 + xi * (subtriangle.b.1 - subtriangle.a.1)
+            + eta * (subtriangle.c.1 - subtriangle.a.1)
+    )
+}
+
 func regularPairBlocks(
     geom: Geometry,
     test: Int,
@@ -1676,6 +1927,78 @@ func regularPairBlocks(
                 slp[i] = slp[i] + g * (tbasis[i] * w)
                 for j in 0..<3 {
                     dlp[i * 3 + j] = dlp[i * 3 + j] + d * (tbasis[i] * sbasis[j] * w)
+                }
+            }
+        }
+    }
+    return (slp, dlp)
+}
+
+func subdividedPairBlocks(
+    geom: Geometry,
+    test: Int,
+    trial: Int,
+    testImageMask: Int,
+    trialImageMask: Int,
+    k: Float,
+    kImag: Float = 0.0,
+    level: Int
+) -> (slp: [Complex32], dlp: [Complex32]) {
+    let (qx, qy, qw) = triangleRule6()
+    let subtriangles = referenceSubtriangles(level: level)
+    let normal = mirrorNormal(
+        (geom.normal(trial, 0), geom.normal(trial, 1), geom.normal(trial, 2)),
+        mask: trialImageMask
+    )
+    let testJac = 2.0 * geom.areas[test]
+    let trialJac = 2.0 * geom.areas[trial]
+    var slp = Array(repeating: Complex32.zero, count: 3)
+    var dlp = Array(repeating: Complex32.zero, count: 9)
+
+    for testSub in subtriangles {
+        let testSubJac = testJac * testSub.det
+        for trialSub in subtriangles {
+            let jac = testSubJac * trialJac * trialSub.det
+            for qa in 0..<qw.count {
+                let testImageRef = pointInSubtriangle(testSub, qx[qa], qy[qa])
+                let (testXi, testEta) = imageRefToOriginalRef(
+                    testImageRef.0,
+                    testImageRef.1,
+                    mask: testImageMask
+                )
+                let realTestPoint = pointOnTriangle(geom, test, testXi, testEta)
+                let (tx, ty, tz) = mirrorPoint(realTestPoint, mask: testImageMask)
+                let tb = localBasis(testXi, testEta)
+                let tbasis = [tb.0, tb.1, tb.2]
+                for qb in 0..<qw.count {
+                    let trialImageRef = pointInSubtriangle(trialSub, qx[qb], qy[qb])
+                    let (trialXi, trialEta) = imageRefToOriginalRef(
+                        trialImageRef.0,
+                        trialImageRef.1,
+                        mask: trialImageMask
+                    )
+                    let realTrialPoint = pointOnTriangle(geom, trial, trialXi, trialEta)
+                    let (sx, sy, sz) = mirrorPoint(realTrialPoint, mask: trialImageMask)
+                    let sb = localBasis(trialXi, trialEta)
+                    let sbasis = [sb.0, sb.1, sb.2]
+                    let dx = sx - tx
+                    let dy = sy - ty
+                    let dz = sz - tz
+                    let g = helmholtzGComplex(dx, dy, dz, kReal: k, kImag: kImag)
+                    let d = helmholtzDlpComplex(
+                        dx, dy, dz,
+                        normal.0, normal.1, normal.2,
+                        kReal: k,
+                        kImag: kImag
+                    )
+                    let w = qw[qa] * qw[qb] * jac
+                    for i in 0..<3 {
+                        slp[i] = slp[i] + g * (tbasis[i] * w)
+                        for j in 0..<3 {
+                            dlp[i * 3 + j] = dlp[i * 3 + j]
+                                + d * (tbasis[i] * sbasis[j] * w)
+                        }
+                    }
                 }
             }
         }
@@ -1841,6 +2164,120 @@ func applyDuffyCorrectionsCPU(
         AssemblyArrays(aRe: aRe, aIm: aIm, rhsRe: rhsRe, rhsIm: rhsIm),
         stats
     )
+}
+
+func applyNearFieldCorrectionsCPU(
+    to arrays: AssemblyArrays,
+    geom: Geometry,
+    neumann: [Complex32],
+    k: Float,
+    kImag: Float = 0.0,
+    robinBetas: [Complex32]? = nil,
+    config: NearQuadratureConfig
+) throws -> (AssemblyArrays, NearQuadratureStats) {
+    let start = CFAbsoluteTimeGetCurrent()
+    let pairList = try buildNearPairList(geom: geom, threshold: config.threshold)
+    let n = geom.p1DofCount
+    var aRe = arrays.aRe
+    var aIm = arrays.aIm
+    var rhsRe = arrays.rhsRe
+    var rhsIm = arrays.rhsIm
+    var triplets: [Int64: (Double, Double)] = [:]
+    triplets.reserveCapacity(pairList.pairs.count * 9)
+    let iK = Complex32(re: -kImag, im: k)
+
+    for pair in pairList.pairs {
+        let regular = regularPairBlocks(
+            geom: geom,
+            test: pair.test,
+            trial: pair.trial,
+            testImageMask: pair.testImageMask,
+            trialImageMask: pair.trialImageMask,
+            k: k,
+            kImag: kImag
+        )
+        let subdivided = subdividedPairBlocks(
+            geom: geom,
+            test: pair.test,
+            trial: pair.trial,
+            testImageMask: pair.testImageMask,
+            trialImageMask: pair.trialImageMask,
+            k: k,
+            kImag: kImag,
+            level: config.level
+        )
+        let gTrial = neumann[pair.trial]
+        let betaTrial = robinBetas?[pair.trial] ?? Complex32.zero
+        let robinCoupling = iK * betaTrial
+        let hasRobin = betaTrial.re != 0.0 || betaTrial.im != 0.0
+
+        for i in 0..<3 {
+            let row = geom.p1Dof(pair.test, i)
+            // Weight 1: image-mask pair enumeration already carries the symmetry factor.
+            let rowWeight: Float = 1.0
+            let slpDelta = subdivided.slp[i] - regular.slp[i]
+            let rhsDelta = (slpDelta * gTrial) * rowWeight
+            rhsRe[row] += rhsDelta.re
+            rhsIm[row] += rhsDelta.im
+
+            for j in 0..<3 {
+                let col = geom.p1Dof(pair.trial, j)
+                var delta = (subdivided.dlp[i * 3 + j] - regular.dlp[i * 3 + j])
+                    * rowWeight
+                if hasRobin {
+                    delta = delta - ((slpDelta * robinCoupling) * Float(1.0 / 3.0))
+                }
+                let key = Int64(row) + Int64(col) * Int64(n)
+                let current = triplets[key] ?? (0.0, 0.0)
+                triplets[key] = (
+                    current.0 + Double(delta.re),
+                    current.1 + Double(delta.im)
+                )
+            }
+        }
+    }
+
+    for (key, value) in triplets {
+        let row = Int(key % Int64(n))
+        let col = Int(key / Int64(n))
+        let idx = row * n + col
+        aRe[idx] += Float(value.0)
+        aIm[idx] += Float(value.1)
+    }
+
+    let stats = NearQuadratureStats(
+        level: config.level,
+        threshold: config.threshold,
+        pairCount: pairList.pairs.count,
+        seconds: CFAbsoluteTimeGetCurrent() - start
+    )
+    return (
+        AssemblyArrays(aRe: aRe, aIm: aIm, rhsRe: rhsRe, rhsIm: rhsIm),
+        stats
+    )
+}
+
+func applyNearFieldCorrectionsIfEnabled(
+    to arrays: AssemblyArrays,
+    geom: Geometry,
+    neumann: [Complex32],
+    k: Float,
+    kImag: Float = 0.0,
+    robinBetas: [Complex32]? = nil
+) throws -> (AssemblyArrays, NearQuadratureStats?) {
+    guard let config = try requestedNearQuadratureConfig() else {
+        return (arrays, nil)
+    }
+    let (corrected, stats) = try applyNearFieldCorrectionsCPU(
+        to: arrays,
+        geom: geom,
+        neumann: neumann,
+        k: k,
+        kImag: kImag,
+        robinBetas: robinBetas,
+        config: config
+    )
+    return (corrected, stats)
 }
 
 func applyDuffyCorrections(
@@ -3143,6 +3580,7 @@ let metalDenseSolveImplementationEnv = "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_IMP
 // 0 (default) disables refinement.
 let metalDenseSolveRefineEnv = "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_REFINE"
 let metalSolveConcurrencyEnv = "HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY"
+let nearQuadratureEnv = "HORNLAB_METAL_BEM_NATIVE_NEAR_QUADRATURE"
 let defaultMetalThreadsPerThreadgroup = 64
 
 func parseMetalThreadsPerGroupEnv(_ envName: String) throws -> Int? {
@@ -3273,6 +3711,39 @@ func requestedDenseSolveRefineIterations() throws -> Int {
         try fail("\(metalDenseSolveRefineEnv) must be an integer in 0...10")
     }
     return value
+}
+
+func requestedNearQuadratureConfig() throws -> NearQuadratureConfig? {
+    guard let raw = ProcessInfo.processInfo.environment[nearQuadratureEnv],
+          !raw.isEmpty,
+          raw != "0" else {
+        return nil
+    }
+
+    func parseLevel(_ value: String) -> Int? {
+        guard let level = Int(value), (1...2).contains(level) else {
+            return nil
+        }
+        return level
+    }
+
+    if let level = parseLevel(raw) {
+        return NearQuadratureConfig(level: level, threshold: 1.5)
+    }
+
+    let parts = raw.split(separator: ":", omittingEmptySubsequences: false)
+    if parts.count == 2,
+       let level = parseLevel(String(parts[0])),
+       let threshold = Double(String(parts[1])),
+       threshold.isFinite,
+       threshold > 0.0 {
+        return NearQuadratureConfig(level: level, threshold: threshold)
+    }
+
+    try fail(
+        "\(nearQuadratureEnv) must be unset, '0', '1', '2', "
+            + "or '<level>:<positive threshold>' with level 1...2"
+    )
 }
 
 func assembleRegularMetalSelected(
@@ -4900,13 +5371,22 @@ func assembleRegular(
                 kImag: kImag,
                 robinBetas: robinBetas
             )
+            let (nearCorrected, nearStats) = try applyNearFieldCorrectionsIfEnabled(
+                to: corrected,
+                geom: geom,
+                neumann: neumann,
+                k: k,
+                kImag: kImag,
+                robinBetas: robinBetas
+            )
             return AssemblyRun(
-                arrays: corrected,
+                arrays: nearCorrected,
                 implementation: "swift_native_reference_complex_robin_quadrature_plus_cpu_duffy",
                 mode: mode,
-                seconds: seconds + stats.seconds,
+                seconds: seconds + stats.seconds + (nearStats?.seconds ?? 0.0),
                 parity: nil,
                 duffyStats: stats,
+                nearStats: nearStats,
                 metalDispatch: nil
             )
         }
@@ -4917,6 +5397,7 @@ func assembleRegular(
             seconds: seconds,
             parity: nil,
             duffyStats: nil,
+            nearStats: nil,
             metalDispatch: nil
         )
     }
@@ -4936,6 +5417,7 @@ func assembleRegular(
             seconds: seconds,
             parity: nil,
             duffyStats: nil,
+            nearStats: nil,
             metalDispatch: output.dispatch
         )
     }
@@ -4955,13 +5437,20 @@ func assembleRegular(
             k: k,
             residentContext: residentContext
         )
+        let (nearCorrected, nearStats) = try applyNearFieldCorrectionsIfEnabled(
+            to: corrected,
+            geom: geom,
+            neumann: neumann,
+            k: k
+        )
         return AssemblyRun(
-            arrays: corrected,
+            arrays: nearCorrected,
             implementation: correctedMetalImplementationName(regular, stats: stats),
             mode: mode,
-            seconds: regularSeconds + stats.seconds,
+            seconds: regularSeconds + stats.seconds + (nearStats?.seconds ?? 0.0),
             parity: nil,
             duffyStats: stats,
+            nearStats: nearStats,
             metalDispatch: regular.dispatch
         )
     }
@@ -5005,6 +5494,7 @@ func assembleRegular(
                 "tolerance": 1.0e-4,
             ],
             duffyStats: nil,
+            nearStats: nil,
             metalDispatch: optimized.dispatch
         )
     }
@@ -5125,6 +5615,16 @@ func evaluateExterior(
     try fail("unsupported native field mode: \(mode)")
 }
 
+func assemblyCorrectionSeconds(_ run: AssemblyRun) -> Double {
+    (run.duffyStats?.seconds ?? 0.0) + (run.nearStats?.seconds ?? 0.0)
+}
+
+func attachNearQuadratureReport(_ result: inout [String: Any], run: AssemblyRun) {
+    if let stats = run.nearStats {
+        result["near_quadrature"] = stats.toJSON()
+    }
+}
+
 func assembleStandardNeumann(
     sessionManifestPath: String,
     payloadPath: String,
@@ -5154,7 +5654,7 @@ func assembleStandardNeumann(
     try writeF32(try descriptorPath(root: geom.root, descriptor: aImDesc), run.arrays.aIm)
     try writeF32(try descriptorPath(root: geom.root, descriptor: rhsReDesc), run.arrays.rhsRe)
     try writeF32(try descriptorPath(root: geom.root, descriptor: rhsImDesc), run.arrays.rhsIm)
-    let correctionSeconds = run.duffyStats?.seconds ?? 0.0
+    let correctionSeconds = assemblyCorrectionSeconds(run)
     let duffyReport: [String: Any]
     if let stats = run.duffyStats {
         var report = stats.toJSON()
@@ -5197,6 +5697,7 @@ func assembleStandardNeumann(
     if let dispatch = run.metalDispatch {
         result["metal_dispatch"] = dispatch
     }
+    attachNearQuadratureReport(&result, run: run)
     try writeJSON(resultPath, result)
 }
 
@@ -5207,7 +5708,7 @@ func assemblyResultPayload(
     outputs: [String: Any],
     residentContext: ResidentMetalContext? = nil
 ) throws -> [String: Any] {
-    let correctionSeconds = run.duffyStats?.seconds ?? 0.0
+    let correctionSeconds = assemblyCorrectionSeconds(run)
     let duffyReport: [String: Any]
     if let stats = run.duffyStats {
         var report = stats.toJSON()
@@ -5262,6 +5763,7 @@ func assemblyResultPayload(
     if let dispatch = run.metalDispatch {
         result["metal_dispatch"] = dispatch
     }
+    attachNearQuadratureReport(&result, run: run)
     return result
 }
 
@@ -5324,7 +5826,7 @@ func assembleStandardNeumannBatch(
         )
         caseResults.append(caseResult)
         totalAssemblySeconds += run.seconds
-        totalRegularSeconds += max(0.0, run.seconds - (run.duffyStats?.seconds ?? 0.0))
+        totalRegularSeconds += max(0.0, run.seconds - assemblyCorrectionSeconds(run))
     }
     let result: [String: Any] = [
         "schema": schema,
@@ -5415,7 +5917,7 @@ func assembleSolveStandardNeumannBatch(
             solve.pressure.map { $0.im }
         )
 
-        let correctionSeconds = run.duffyStats?.seconds ?? 0.0
+        let correctionSeconds = assemblyCorrectionSeconds(run)
         var caseResult: [String: Any] = [
             "schema": schema,
             "op": "assemble_solve_standard_neumann_result",
@@ -5460,6 +5962,7 @@ func assembleSolveStandardNeumannBatch(
         if let dispatch = run.metalDispatch {
             caseResult["metal_dispatch"] = dispatch
         }
+        attachNearQuadratureReport(&caseResult, run: run)
         caseResults.append(caseResult)
         totalAssemblySeconds += run.seconds
         totalRegularSeconds += max(0.0, run.seconds - correctionSeconds)
@@ -5689,6 +6192,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
                 seconds: finished.regularGpuSeconds + finished.readbackSeconds,
                 parity: nil,
                 duffyStats: nil,
+                nearStats: nil,
                 metalDispatch: finished.regular.dispatch
             )
         }
@@ -5710,13 +6214,21 @@ func assembleSolveEvaluateStandardNeumannBatch(
             reductionPrecomputed: true,
             reductionPlanBuildSeconds: context.duffyReductionPlanBuildSeconds
         )
+        let (nearCorrected, nearStats) = try applyNearFieldCorrectionsIfEnabled(
+            to: correctedArrays,
+            geom: geom,
+            neumann: caseNeumanns[caseIndex],
+            k: caseKs[caseIndex]
+        )
         return AssemblyRun(
-            arrays: correctedArrays,
+            arrays: nearCorrected,
             implementation: correctedMetalImplementationName(finished.regular, stats: stats),
             mode: assemblyMode,
-            seconds: finished.regularGpuSeconds + finished.readbackSeconds + stats.seconds,
+            seconds: finished.regularGpuSeconds + finished.readbackSeconds
+                + stats.seconds + (nearStats?.seconds ?? 0.0),
             parity: nil,
             duffyStats: stats,
+            nearStats: nearStats,
             metalDispatch: finished.regular.dispatch
         )
     }
@@ -5918,7 +6430,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
             )
         }
 
-        let correctionSeconds = assembly.duffyStats?.seconds ?? 0.0
+        let correctionSeconds = assemblyCorrectionSeconds(assembly)
         var caseResult: [String: Any] = [
             "schema": schema,
             "op": "assemble_solve_evaluate_standard_neumann_result",
@@ -6014,6 +6526,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
         if let dispatch = field.metalDispatch {
             caseResult["field_metal_dispatch"] = dispatch
         }
+        attachNearQuadratureReport(&caseResult, run: assembly)
         if let caseResultsDir {
             var streamedResult = caseResult
             streamedResult["case_index"] = caseIndex

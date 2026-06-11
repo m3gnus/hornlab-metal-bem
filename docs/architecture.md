@@ -175,6 +175,17 @@ float32 assembly and quadrature error survive, and it is not an
 interior-resonance (CHIEF/Burton-Miller) mitigation; pair it with the
 `dense_solve_rcond` suspect flag when sweeping through chamber resonances.
 
+`HORNLAB_METAL_BEM_NATIVE_NEAR_QUADRATURE` (default off) enables a CPU
+post-correction pass for close-but-not-touching triangle pairs, mirroring the
+Duffy delta pattern: pairs with centroid separation below
+`threshold * max(longest edge)` (grammar `level` or `level:threshold`,
+threshold default 1.5, level 1 or 2) are re-integrated with the 6-point rule
+on `4^level` congruent sub-triangles per side and the delta is applied as
+triplets. Shares the complex-k path and symmetry image handling with the
+Duffy corrections; per-case diagnostics gain a `near_quadrature` dict
+(`level`, `threshold`, `pair_count`, `seconds`). This targets near-singular
+integration error in narrow chamber/port/slot geometry.
+
 In the combined assemble/solve/field batch op the per-case CPU work (Duffy
 delta reduction, Accelerate dense solve, cgecon condition estimate) runs on a
 bounded worker pool sized by `HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY`

@@ -68,6 +68,154 @@ def _tiny_geometry_buffers():
     )
 
 
+def _near_quadrature_geometry_buffers():
+    grid = SimpleNamespace(
+        vertices=np.array(
+            [
+                [0.0, 1.0, 0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0, 0.05, 0.05, 0.05],
+            ],
+            dtype=np.float64,
+        ),
+        elements=np.array([[0, 3], [1, 4], [2, 5]], dtype=np.int64),
+        number_of_elements=2,
+    )
+    p1 = SimpleNamespace(
+        local2global=np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64),
+        global_dof_count=6,
+    )
+    return build_metal_geometry_buffers(
+        grid,
+        np.array([1, 2], dtype=np.int32),
+        p1,
+        SimpleNamespace(global_dof_count=2),
+    )
+
+
+_TRIANGLE_QX = np.array(
+    [
+        0.4459484909159651,
+        0.0915762135097710,
+        0.1081030181680700,
+        0.4459484909159651,
+        0.8168475729804590,
+        0.0915762135097710,
+    ],
+    dtype=np.float64,
+)
+_TRIANGLE_QY = np.array(
+    [
+        0.4459484909159651,
+        0.0915762135097700,
+        0.4459484909159651,
+        0.1081030181680700,
+        0.0915762135097700,
+        0.8168475729804580,
+    ],
+    dtype=np.float64,
+)
+_TRIANGLE_QW = 0.5 * np.array(
+    [
+        0.2233815896780110,
+        0.1099517436553220,
+        0.2233815896780110,
+        0.2233815896780110,
+        0.1099517436553220,
+        0.1099517436553220,
+    ],
+    dtype=np.float64,
+)
+
+
+def _reference_subtriangles(level: int) -> np.ndarray:
+    triangles = np.array(
+        [[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]],
+        dtype=np.float64,
+    )
+    for _ in range(level):
+        a = triangles[:, 0, :]
+        b = triangles[:, 1, :]
+        c = triangles[:, 2, :]
+        ab = 0.5 * (a + b)
+        bc = 0.5 * (b + c)
+        ca = 0.5 * (c + a)
+        triangles = np.concatenate(
+            [
+                np.stack([a, ab, ca], axis=1),
+                np.stack([ab, b, bc], axis=1),
+                np.stack([ca, bc, c], axis=1),
+                np.stack([ab, bc, ca], axis=1),
+            ],
+            axis=0,
+        )
+    return triangles
+
+
+def _subtriangle_quadrature(level: int) -> tuple[np.ndarray, np.ndarray]:
+    subtriangles = _reference_subtriangles(level)
+    q = np.stack([_TRIANGLE_QX, _TRIANGLE_QY], axis=1)
+    a = subtriangles[:, None, 0, :]
+    b = subtriangles[:, None, 1, :]
+    c = subtriangles[:, None, 2, :]
+    points = a + q[None, :, 0, None] * (b - a) + q[None, :, 1, None] * (c - a)
+    det = np.abs(
+        (subtriangles[:, 1, 0] - subtriangles[:, 0, 0])
+        * (subtriangles[:, 2, 1] - subtriangles[:, 0, 1])
+        - (subtriangles[:, 1, 1] - subtriangles[:, 0, 1])
+        * (subtriangles[:, 2, 0] - subtriangles[:, 0, 0])
+    )
+    weights = det[:, None] * _TRIANGLE_QW[None, :]
+    return points.reshape(-1, 2), weights.reshape(-1)
+
+
+def _parent_basis(ref_points: np.ndarray) -> np.ndarray:
+    return np.column_stack(
+        [1.0 - ref_points[:, 0] - ref_points[:, 1], ref_points[:, 0], ref_points[:, 1]]
+    )
+
+
+def _reference_pair_blocks(buffers, test: int, trial: int, k: float, level: int):
+    triangles = buffers.triangles_3xm_i32.T
+    vertices = np.asarray(buffers.vertices_3xn_f32, dtype=np.float64)
+    test_vertices = vertices[:, triangles[test]].T
+    trial_vertices = vertices[:, triangles[trial]].T
+    test_ref, test_weights = _subtriangle_quadrature(level)
+    trial_ref, trial_weights = _subtriangle_quadrature(level)
+    test_basis = _parent_basis(test_ref)
+    trial_basis = _parent_basis(trial_ref)
+    test_points = test_basis @ test_vertices
+    trial_points = trial_basis @ trial_vertices
+    dx = trial_points[None, :, 0] - test_points[:, None, 0]
+    dy = trial_points[None, :, 1] - test_points[:, None, 1]
+    dz = trial_points[None, :, 2] - test_points[:, None, 2]
+    r = np.sqrt(dx * dx + dy * dy + dz * dz)
+    g = np.exp(1j * k * r) / (4.0 * np.pi * r)
+    normal = np.asarray(buffers.triangle_normals_3xm_f32[:, trial], dtype=np.float64)
+    projection = (dx * normal[0] + dy * normal[1] + dz * normal[2]) / r
+    dlp_kernel = g * (-1.0 / r + 1j * k) * projection
+    jac = (
+        2.0
+        * float(buffers.triangle_areas_f32[test])
+        * 2.0
+        * float(buffers.triangle_areas_f32[trial])
+    )
+    pair_weights = test_weights[:, None] * trial_weights[None, :] * jac
+    weighted_g = g * pair_weights
+    weighted_dlp = dlp_kernel * pair_weights
+    slp = np.array(
+        [np.sum(weighted_g * test_basis[:, i, None]) for i in range(3)],
+        dtype=np.complex128,
+    )
+    dlp = np.empty((3, 3), dtype=np.complex128)
+    for i in range(3):
+        for j in range(3):
+            dlp[i, j] = np.sum(
+                weighted_dlp * test_basis[:, i, None] * trial_basis[None, :, j]
+            )
+    return SimpleNamespace(slp=slp, dlp=dlp)
+
+
 def _tiny_robin_geometry_buffers():
     grid = SimpleNamespace(
         vertices=np.array(
@@ -1377,6 +1525,164 @@ def test_native_executable_corrected_mode_applies_duffy_on_tiny_mesh(
     assert np.all(np.isfinite(rhs))
     assert np.linalg.norm(matrix) > 0.0
     assert np.linalg.norm(rhs) > 0.0
+
+
+def test_native_near_quadrature_default_off_matches_zero_env(
+    monkeypatch,
+    tmp_path,
+):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", "cpu")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_REGULAR_ASSEMBLY_IMPL", "entrywise")
+    neumann = np.array([1.0 + 0.0j, 0.0 + 0.5j], dtype=np.complex64)
+
+    def run_case(name: str, env_value: str | None):
+        if env_value is None:
+            monkeypatch.delenv(
+                "HORNLAB_METAL_BEM_NATIVE_NEAR_QUADRATURE",
+                raising=False,
+            )
+        else:
+            monkeypatch.setenv(
+                "HORNLAB_METAL_BEM_NATIVE_NEAR_QUADRATURE",
+                env_value,
+            )
+        with MetalNativeStandardSession.create_session(
+            geometry_buffers=_tiny_geometry_buffers(),
+            work_dir=tmp_path / f"native-near-default-{name}-session",
+            session_id=f"native-near-default-{name}-test",
+        ) as session:
+            assembly = session.assemble_standard_neumann(
+                100.0,
+                1.8318326,
+                neumann,
+                operation_id=f"native-near-default-{name}-assembly",
+            )
+        result = json.loads(
+            (
+                tmp_path
+                / f"native-near-default-{name}-session"
+                / f"native-near-default-{name}-assembly"
+                / "assembly-result.json"
+            ).read_text(encoding="utf-8")
+        )
+        matrix, rhs = _read_complex_assembly(assembly)
+        return result, matrix, rhs
+
+    unset_result, unset_matrix, unset_rhs = run_case("unset", None)
+    zero_result, zero_matrix, zero_rhs = run_case("zero", "0")
+
+    assert "near_quadrature" not in unset_result
+    assert "near_quadrature" not in zero_result
+    assert np.array_equal(unset_matrix, zero_matrix)
+    assert np.array_equal(unset_rhs, zero_rhs)
+
+
+def test_native_near_quadrature_corrects_close_non_touching_pair(
+    monkeypatch,
+    tmp_path,
+):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", "cpu")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_REGULAR_ASSEMBLY_IMPL", "entrywise")
+    buffers = _near_quadrature_geometry_buffers()
+    neumann = np.array([1.0 + 0.0j, 0.0 + 0.0j], dtype=np.complex64)
+    k_real = 1.8318326
+
+    def run_case(name: str, env_value: str | None):
+        if env_value is None:
+            monkeypatch.delenv(
+                "HORNLAB_METAL_BEM_NATIVE_NEAR_QUADRATURE",
+                raising=False,
+            )
+        else:
+            monkeypatch.setenv(
+                "HORNLAB_METAL_BEM_NATIVE_NEAR_QUADRATURE",
+                env_value,
+            )
+        with MetalNativeStandardSession.create_session(
+            geometry_buffers=buffers,
+            work_dir=tmp_path / f"native-near-{name}-session",
+            session_id=f"native-near-{name}-test",
+        ) as session:
+            assembly = session.assemble_standard_neumann(
+                100.0,
+                k_real,
+                neumann,
+                operation_id=f"native-near-{name}-assembly",
+            )
+        result = json.loads(
+            (
+                tmp_path
+                / f"native-near-{name}-session"
+                / f"native-near-{name}-assembly"
+                / "assembly-result.json"
+            ).read_text(encoding="utf-8")
+        )
+        matrix, _ = _read_complex_assembly(assembly)
+        return result, matrix
+
+    base_result, base_matrix = run_case("base", None)
+    near_result, near_matrix = run_case("enabled", "2:1.5")
+
+    assert "near_quadrature" not in base_result
+    assert near_result["near_quadrature"]["level"] == 2
+    assert near_result["near_quadrature"]["threshold"] == pytest.approx(1.5)
+    assert near_result["near_quadrature"]["pair_count"] >= 1
+    assert near_result["near_quadrature"]["seconds"] >= 0.0
+
+    base_block = base_matrix[np.ix_([0, 1, 2], [3, 4, 5])]
+    near_block = near_matrix[np.ix_([0, 1, 2], [3, 4, 5])]
+    high_reference = _reference_pair_blocks(buffers, 0, 1, k_real, level=4).dlp
+
+    assert np.linalg.norm(near_block - base_block) > 0.0
+    base_error = np.linalg.norm(base_block - high_reference)
+    near_error = np.linalg.norm(near_block - high_reference)
+    assert near_error < base_error
+
+
+def test_native_near_quadrature_junk_env_fails(monkeypatch, tmp_path):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", "cpu")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_REGULAR_ASSEMBLY_IMPL", "entrywise")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_NEAR_QUADRATURE", "junk")
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_geometry_buffers(),
+        work_dir=tmp_path / "native-near-junk-session",
+        session_id="native-near-junk-test",
+    ) as session:
+        with pytest.raises(
+            RuntimeError,
+            match="HORNLAB_METAL_BEM_NATIVE_NEAR_QUADRATURE",
+        ):
+            session.assemble_standard_neumann(
+                100.0,
+                1.8318326,
+                np.array([1.0 + 0.0j, 0.0 + 0.5j], dtype=np.complex64),
+                operation_id="native-near-junk-assembly",
+            )
 
 
 def test_native_executable_yz_symmetry_matches_even_full_domain_solve(
