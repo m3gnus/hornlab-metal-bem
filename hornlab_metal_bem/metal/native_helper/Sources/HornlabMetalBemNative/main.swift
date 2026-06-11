@@ -2688,6 +2688,100 @@ func specializedAssemblyMetalSource(symmetryPlaneCode: Int32) -> String {
     )
 }
 
+final class MetalWarmup: @unchecked Sendable {
+    static let shared = MetalWarmup()
+
+    private let lock = NSLock()
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var started = false
+    private var completed = false
+    private var cachedDevice: MTLDevice?
+
+    func begin() {
+        lock.lock()
+        if started {
+            lock.unlock()
+            return
+        }
+        started = true
+        lock.unlock()
+
+        Thread.detachNewThread { [self] in
+            let device = MTLCreateSystemDefaultDevice()
+            lock.lock()
+            cachedDevice = device
+            completed = true
+            lock.unlock()
+            semaphore.signal()
+        }
+    }
+
+    func device() throws -> MTLDevice {
+        lock.lock()
+        if let cachedDevice {
+            lock.unlock()
+            return cachedDevice
+        }
+        if started {
+            if completed {
+                lock.unlock()
+                try fail("Metal device unavailable")
+            }
+            lock.unlock()
+            semaphore.wait()
+            semaphore.signal()
+            lock.lock()
+            let device = cachedDevice
+            lock.unlock()
+            guard let device else {
+                try fail("Metal device unavailable")
+            }
+            return device
+        }
+        started = true
+        lock.unlock()
+
+        let device = MTLCreateSystemDefaultDevice()
+        lock.lock()
+        cachedDevice = device
+        completed = true
+        lock.unlock()
+        semaphore.signal()
+        guard let device else {
+            try fail("Metal device unavailable")
+        }
+        return device
+    }
+}
+
+final class AssemblyLibraryCache: @unchecked Sendable {
+    static let shared = AssemblyLibraryCache()
+
+    private let lock = NSLock()
+    private var libraries: [Int32: MTLLibrary] = [:]
+
+    func library(device: MTLDevice, symmetryPlaneCode: Int32) throws -> MTLLibrary {
+        lock.lock()
+        defer {
+            lock.unlock()
+        }
+        if let library = libraries[symmetryPlaneCode] {
+            return library
+        }
+
+        let library = try device.makeLibrary(
+            source: specializedAssemblyMetalSource(symmetryPlaneCode: symmetryPlaneCode),
+            options: nil
+        )
+        libraries[symmetryPlaneCode] = library
+        return library
+    }
+}
+
+func assemblyLibrary(device: MTLDevice, symmetryPlaneCode: Int32) throws -> MTLLibrary {
+    try AssemblyLibraryCache.shared.library(device: device, symmetryPlaneCode: symmetryPlaneCode)
+}
+
 func makeBuffer<T>(_ device: MTLDevice, _ values: [T], label: String) throws -> MTLBuffer {
     let byteCount = values.count * MemoryLayout<T>.stride
     if byteCount <= 0 {
@@ -2740,13 +2834,11 @@ func computeDuffyDeltaBlocksMetal(
             ]
         )
     }
-    guard let device = MTLCreateSystemDefaultDevice() else {
-        try fail("Metal device unavailable")
-    }
+    let device = try MetalWarmup.shared.device()
     guard let commandQueue = device.makeCommandQueue() else {
         try fail("failed to create Metal command queue")
     }
-    let library = try device.makeLibrary(source: specializedAssemblyMetalSource(symmetryPlaneCode: geom.symmetryPlaneCode), options: nil)
+    let library = try assemblyLibrary(device: device, symmetryPlaneCode: geom.symmetryPlaneCode)
     guard let function = library.makeFunction(name: "duffy_delta_blocks") else {
         try fail("failed to load Metal Duffy kernel")
     }
@@ -3050,6 +3142,20 @@ func correctedMetalImplementationName(_ output: MetalAssemblyOutput, stats: Duff
     return "\(regularPrefix)_plus_cpu_duffy"
 }
 
+struct ResidentMetalPipelines {
+    let library: MTLLibrary
+    let matrixPipeline: MTLComputePipelineState
+    let pairAtomicPipeline: MTLComputePipelineState
+    let rhsPipeline: MTLComputePipelineState
+    let pairBlockPipeline: MTLComputePipelineState
+    let fieldPipeline: MTLComputePipelineState
+    let duffyPipeline: MTLComputePipelineState
+}
+
+final class ResidentMetalPipelineBox: @unchecked Sendable {
+    var result: Result<ResidentMetalPipelines, Error>?
+}
+
 final class ResidentMetalContext {
     let geom: Geometry
     let device: MTLDevice
@@ -3107,55 +3213,48 @@ final class ResidentMetalContext {
 
     init(geom: Geometry) throws {
         self.geom = geom
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            try fail("Metal device unavailable")
+        let pipelineBox = ResidentMetalPipelineBox()
+        let pipelineSemaphore = DispatchSemaphore(value: 0)
+        let symmetryPlaneCode = geom.symmetryPlaneCode
+        Thread.detachNewThread {
+            do {
+                let device = try MetalWarmup.shared.device()
+                let library = try assemblyLibrary(
+                    device: device,
+                    symmetryPlaneCode: symmetryPlaneCode
+                )
+                guard let matrixFunction = library.makeFunction(name: "assemble_matrix_regular"),
+                      let pairAtomicFunction = library.makeFunction(name: "assemble_matrix_pair_atomic"),
+                      let rhsFunction = library.makeFunction(name: "assemble_rhs_source_regular"),
+                      let pairBlockFunction = library.makeFunction(name: "assemble_pair_blocks_regular"),
+                      let fieldFunction = library.makeFunction(name: "evaluate_field_regular"),
+                      let duffyFunction = library.makeFunction(name: "duffy_delta_blocks") else {
+                    try fail("failed to load resident Metal kernels")
+                }
+                pipelineBox.result = .success(ResidentMetalPipelines(
+                    library: library,
+                    matrixPipeline: try device.makeComputePipelineState(function: matrixFunction),
+                    pairAtomicPipeline: try device.makeComputePipelineState(function: pairAtomicFunction),
+                    rhsPipeline: try device.makeComputePipelineState(function: rhsFunction),
+                    pairBlockPipeline: try device.makeComputePipelineState(function: pairBlockFunction),
+                    fieldPipeline: try device.makeComputePipelineState(function: fieldFunction),
+                    duffyPipeline: try device.makeComputePipelineState(function: duffyFunction)
+                ))
+            } catch {
+                pipelineBox.result = .failure(error)
+            }
+            pipelineSemaphore.signal()
         }
-        self.device = device
-        guard let commandQueue = device.makeCommandQueue() else {
-            try fail("failed to create Metal command queue")
-        }
-        self.commandQueue = commandQueue
-        self.library = try device.makeLibrary(source: specializedAssemblyMetalSource(symmetryPlaneCode: geom.symmetryPlaneCode), options: nil)
-        guard let matrixFunction = library.makeFunction(name: "assemble_matrix_regular"),
-              let pairAtomicFunction = library.makeFunction(name: "assemble_matrix_pair_atomic"),
-              let rhsFunction = library.makeFunction(name: "assemble_rhs_source_regular"),
-              let pairBlockFunction = library.makeFunction(name: "assemble_pair_blocks_regular"),
-              let fieldFunction = library.makeFunction(name: "evaluate_field_regular"),
-              let duffyFunction = library.makeFunction(name: "duffy_delta_blocks") else {
-            try fail("failed to load resident Metal kernels")
-        }
-        self.matrixPipeline = try device.makeComputePipelineState(function: matrixFunction)
-        self.pairAtomicPipeline = try device.makeComputePipelineState(function: pairAtomicFunction)
-        self.rhsPipeline = try device.makeComputePipelineState(function: rhsFunction)
-        self.pairBlockPipeline = try device.makeComputePipelineState(function: pairBlockFunction)
-        self.fieldPipeline = try device.makeComputePipelineState(function: fieldFunction)
-        self.duffyPipeline = try device.makeComputePipelineState(function: duffyFunction)
-        self.incidence = try buildP1Incidence(geom)
-        self.pairList = try buildDuffyPairList(geom)
+        let incidence = try buildP1Incidence(geom)
+        let pairList = try buildDuffyPairList(geom)
         let reductionPlanStart = CFAbsoluteTimeGetCurrent()
-        self.duffyReductionPlan = buildDuffyReductionPlan(geom: geom, pairList: self.pairList)
-        self.duffyReductionPlanBuildSeconds = CFAbsoluteTimeGetCurrent() - reductionPlanStart
-        self.rules = [
+        let duffyReductionPlan = buildDuffyReductionPlan(geom: geom, pairList: pairList)
+        let duffyReductionPlanBuildSeconds = CFAbsoluteTimeGetCurrent() - reductionPlanStart
+        let rules = [
             1: try duffyRule(kind: 1),
             2: try duffyRule(kind: 2),
             3: try duffyRule(kind: 3),
         ]
-        self.px = try makeBuffer(device, geom.px, label: "resident_px")
-        self.py = try makeBuffer(device, geom.py, label: "resident_py")
-        self.pz = try makeBuffer(device, geom.pz, label: "resident_pz")
-        self.triangles = try makeBuffer(device, geom.triangles, label: "resident_triangles")
-        self.p1Local2Global = try makeBuffer(device, geom.p1Local2Global, label: "resident_p1_local2global")
-        self.normals = try makeBuffer(device, geom.normals, label: "resident_normals")
-        self.areas = try makeBuffer(device, geom.areas, label: "resident_areas")
-        self.incTri = try makeBuffer(device, incidence.incTri, label: "resident_inc_tri")
-        self.incLoc = try makeBuffer(device, incidence.incLoc, label: "resident_inc_loc")
-        self.counts = try makeBuffer(device, incidence.counts, label: "resident_counts")
-        let n = geom.p1DofCount
-        self.aRe = try makeOutputBuffer(device, count: n * n, label: "resident_A_re")
-        self.aIm = try makeOutputBuffer(device, count: n * n, label: "resident_A_im")
-        self.rhsRe = try makeOutputBuffer(device, count: n, label: "resident_rhs_re")
-        self.rhsIm = try makeOutputBuffer(device, count: n, label: "resident_rhs_im")
-
         var ruleTestX: [Float] = []
         var ruleTestY: [Float] = []
         var ruleTrialX: [Float] = []
@@ -3177,6 +3276,33 @@ final class ResidentMetalContext {
                 ruleWeights.append(rule.weights[idx])
             }
         }
+
+        let device = try MetalWarmup.shared.device()
+        self.device = device
+        guard let commandQueue = device.makeCommandQueue() else {
+            try fail("failed to create Metal command queue")
+        }
+        self.commandQueue = commandQueue
+        self.incidence = incidence
+        self.pairList = pairList
+        self.duffyReductionPlan = duffyReductionPlan
+        self.duffyReductionPlanBuildSeconds = duffyReductionPlanBuildSeconds
+        self.rules = rules
+        self.px = try makeBuffer(device, geom.px, label: "resident_px")
+        self.py = try makeBuffer(device, geom.py, label: "resident_py")
+        self.pz = try makeBuffer(device, geom.pz, label: "resident_pz")
+        self.triangles = try makeBuffer(device, geom.triangles, label: "resident_triangles")
+        self.p1Local2Global = try makeBuffer(device, geom.p1Local2Global, label: "resident_p1_local2global")
+        self.normals = try makeBuffer(device, geom.normals, label: "resident_normals")
+        self.areas = try makeBuffer(device, geom.areas, label: "resident_areas")
+        self.incTri = try makeBuffer(device, incidence.incTri, label: "resident_inc_tri")
+        self.incLoc = try makeBuffer(device, incidence.incLoc, label: "resident_inc_loc")
+        self.counts = try makeBuffer(device, incidence.counts, label: "resident_counts")
+        let n = geom.p1DofCount
+        self.aRe = try makeOutputBuffer(device, count: n * n, label: "resident_A_re")
+        self.aIm = try makeOutputBuffer(device, count: n * n, label: "resident_A_im")
+        self.rhsRe = try makeOutputBuffer(device, count: n, label: "resident_rhs_re")
+        self.rhsIm = try makeOutputBuffer(device, count: n, label: "resident_rhs_im")
         self.ruleTestXBuffer = try makeBuffer(device, ruleTestX, label: "resident_duffy_rule_test_x")
         self.ruleTestYBuffer = try makeBuffer(device, ruleTestY, label: "resident_duffy_rule_test_y")
         self.ruleTrialXBuffer = try makeBuffer(device, ruleTrialX, label: "resident_duffy_rule_trial_x")
@@ -3215,6 +3341,18 @@ final class ResidentMetalContext {
             self.duffyDlpRe = try makeOutputBuffer(device, count: pairCount * 9, label: "resident_duffy_dlp_re")
             self.duffyDlpIm = try makeOutputBuffer(device, count: pairCount * 9, label: "resident_duffy_dlp_im")
         }
+        pipelineSemaphore.wait()
+        guard let pipelineResult = pipelineBox.result else {
+            try fail("failed to load resident Metal kernels")
+        }
+        let pipelines = try pipelineResult.get()
+        self.library = pipelines.library
+        self.matrixPipeline = pipelines.matrixPipeline
+        self.pairAtomicPipeline = pipelines.pairAtomicPipeline
+        self.rhsPipeline = pipelines.rhsPipeline
+        self.pairBlockPipeline = pipelines.pairBlockPipeline
+        self.fieldPipeline = pipelines.fieldPipeline
+        self.duffyPipeline = pipelines.duffyPipeline
     }
 
     struct AssemblyOutputSlot {
@@ -3963,13 +4101,11 @@ final class ResidentMetalContext {
 }
 
 func assembleRegularMetal(geom: Geometry, neumann: [Complex32], k: Float) throws -> MetalAssemblyOutput {
-    guard let device = MTLCreateSystemDefaultDevice() else {
-        try fail("Metal device unavailable")
-    }
+    let device = try MetalWarmup.shared.device()
     guard let commandQueue = device.makeCommandQueue() else {
         try fail("failed to create Metal command queue")
     }
-    let library = try device.makeLibrary(source: specializedAssemblyMetalSource(symmetryPlaneCode: geom.symmetryPlaneCode), options: nil)
+    let library = try assemblyLibrary(device: device, symmetryPlaneCode: geom.symmetryPlaneCode)
     guard let matrixFunction = library.makeFunction(name: "assemble_matrix_regular"),
           let rhsFunction = library.makeFunction(name: "assemble_rhs_source_regular") else {
         try fail("failed to load Metal regular assembly kernels")
@@ -4110,13 +4246,11 @@ func evaluateExteriorMetal(
     observationPoints: [(Float, Float, Float)],
     k: Float
 ) throws -> MetalFieldOutput {
-    guard let device = MTLCreateSystemDefaultDevice() else {
-        try fail("Metal device unavailable")
-    }
+    let device = try MetalWarmup.shared.device()
     guard let commandQueue = device.makeCommandQueue() else {
         try fail("failed to create Metal command queue")
     }
-    let library = try device.makeLibrary(source: specializedAssemblyMetalSource(symmetryPlaneCode: geom.symmetryPlaneCode), options: nil)
+    let library = try assemblyLibrary(device: device, symmetryPlaneCode: geom.symmetryPlaneCode)
     guard let fieldFunction = library.makeFunction(name: "evaluate_field_regular") else {
         try fail("failed to load Metal field kernel")
     }
@@ -5602,19 +5736,21 @@ func evaluateStandardExteriorBatch(
 }
 
 func smoke() throws {
-    guard let device = MTLCreateSystemDefaultDevice() else {
-        try fail("Metal device unavailable")
-    }
+    let device = try MetalWarmup.shared.device()
     print("hornlab-metal-bem native Metal helper smoke ok: \(device.name)")
 }
 
 func main(_ args: [String]) throws {
     if args.count == 1 && args[0] == "--smoke" {
+        MetalWarmup.shared.begin()
         try smoke()
         return
     }
     guard let op = args.first else {
         try fail("usage: HornlabMetalBemNative <operation> <session.json> [<payload.json>] <result.json>")
+    }
+    if op != "validate_session" {
+        MetalWarmup.shared.begin()
     }
     if op == "validate_session" {
         guard args.count == 3 else {
