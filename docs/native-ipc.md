@@ -107,10 +107,12 @@ single row-major `(case_count, n_obs)` field array pair.
   onto DP0 triangles, adds the Robin LHS term `-i*k*V*diag(beta)*P1_to_DP0`,
   and reconstructs total Neumann data for field evaluation.
 
-When `k_imag_f32` is nonzero or `impedance_sources` is present, the helper uses
-the Swift reference assembly path plus CPU Duffy singular corrections for that
-case and disables pipelined Metal assembly for the batch. These corrected
-experimental cases report implementation label
+When `k_imag_f32` is nonzero or `impedance_sources` is present, the optimized
+Metal assembly kernels handle those terms in `optimized`/`corrected` modes, so
+the resident batch can still use pair-atomic assembly, GPU Duffy blocks, and
+pipelined assembly/solve overlap. Explicit assembly mode `reference` keeps the
+Swift reference assembly path plus CPU Duffy singular corrections available as
+the cross-check and reports implementation label
 `swift_native_reference_complex_robin_quadrature_plus_cpu_duffy`.
 
 ## Streamed Per-Case Results

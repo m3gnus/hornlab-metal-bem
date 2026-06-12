@@ -2285,13 +2285,22 @@ func applyDuffyCorrections(
     geom: Geometry,
     neumann: [Complex32],
     k: Float,
+    kImag: Float = 0.0,
+    robinBetas: [Complex32]? = nil,
     residentContext: ResidentMetalContext? = nil
 ) throws -> (AssemblyArrays, DuffyCorrectionStats) {
     let mode = ProcessInfo.processInfo.environment[
         "HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE"
     ] ?? "gpu_blocks"
     if mode == "cpu" {
-        return try applyDuffyCorrectionsCPU(to: arrays, geom: geom, neumann: neumann, k: k)
+        return try applyDuffyCorrectionsCPU(
+            to: arrays,
+            geom: geom,
+            neumann: neumann,
+            k: k,
+            kImag: kImag,
+            robinBetas: robinBetas
+        )
     }
     if mode != "gpu_blocks" {
         try fail("unsupported native Duffy mode: \(mode)")
@@ -2307,7 +2316,7 @@ func applyDuffyCorrections(
     let blockStart = CFAbsoluteTimeGetCurrent()
     let blocks: MetalDuffyBlockOutput
     if let residentContext {
-        blocks = try residentContext.computeDuffyDeltaBlocksMetal(k: k)
+        blocks = try residentContext.computeDuffyDeltaBlocksMetal(k: k, kImag: kImag)
     } else {
         let rules = [
             1: try duffyRule(kind: 1),
@@ -2318,7 +2327,8 @@ func applyDuffyCorrections(
             geom: geom,
             pairList: pairList,
             rules: rules,
-            k: k
+            k: k,
+            kImag: kImag
         )
     }
     let blockSeconds = CFAbsoluteTimeGetCurrent() - blockStart
@@ -2331,7 +2341,10 @@ func applyDuffyCorrections(
         (correctedArrays, reductionSeconds) = residentContext.reduceDuffyDeltaBlocks(
             to: arrays,
             neumann: neumann,
-            blocks: blocks
+            blocks: blocks,
+            k: k,
+            kImag: kImag,
+            robinBetas: robinBetas
         )
         uniqueTriplets = residentContext.duffyReductionPlan.matrixIndices.count
         imagePairs = residentContext.duffyReductionPlan.imagePairs
@@ -2345,10 +2358,14 @@ func applyDuffyCorrections(
         var rhsIm = arrays.rhsIm
         var triplets: [Int64: (Double, Double)] = [:]
         triplets.reserveCapacity(pairList.plan.total * 3)
+        let iK = Complex32(re: -kImag, im: k)
 
         for pairIndex in pairList.pairs.indices {
             let pair = pairList.pairs[pairIndex]
             let gTrial = neumann[pair.trial]
+            let betaTrial = robinBetas?[pair.trial] ?? Complex32.zero
+            let robinCoupling = iK * betaTrial
+            let hasRobin = betaTrial.re != 0.0 || betaTrial.im != 0.0
             for i in 0..<3 {
                 let row = geom.p1Dof(pair.test, i)
                 // Weight 1: image-mask pair enumeration already carries the symmetry factor.
@@ -2364,11 +2381,19 @@ func applyDuffyCorrections(
                 for j in 0..<3 {
                     let col = geom.p1Dof(pair.trial, j)
                     let deltaIndex = pairIndex + (i * 3 + j) * pairCount
+                    var delta = Complex32(
+                        re: blocks.dlpRe[deltaIndex],
+                        im: blocks.dlpIm[deltaIndex]
+                    )
+                    if hasRobin {
+                        delta = delta - ((slpDelta * robinCoupling) * Float(1.0 / 3.0))
+                    }
+                    delta = delta * rowWeight
                     let key = Int64(row) + Int64(col) * Int64(n)
                     let current = triplets[key] ?? (0.0, 0.0)
                     triplets[key] = (
-                        current.0 + Double(blocks.dlpRe[deltaIndex] * rowWeight),
-                        current.1 + Double(blocks.dlpIm[deltaIndex] * rowWeight)
+                        current.0 + Double(delta.re),
+                        current.1 + Double(delta.im)
                     )
                 }
             }
@@ -2412,6 +2437,8 @@ struct MetalKernelParams {
     var maxInc: Int32
     var symmetryPlane: Int32
     var k: Float
+    var kImag: Float
+    var hasRobin: Int32
 }
 
 let regularAssemblyMetalSource = """
@@ -2429,6 +2456,8 @@ struct Params {
     int maxInc;
     int symmetryPlane; // unused by kernels (see SYMMETRY_PLANE); kept for layout
     float k;
+    float kImag;
+    int hasRobin;
 };
 
 constant float qx[6] = {
@@ -2490,7 +2519,7 @@ inline float2 c_mul(float2 a, float2 b) {
     return float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
 
-inline float2 helmholtz_g(float3 delta, float k) {
+inline float2 helmholtz_g(float3 delta, float k, float kImag) {
     float r2 = dot(delta, delta);
     if (r2 <= 1.0e-14f) {
         return float2(0.0f, 0.0f);
@@ -2498,10 +2527,13 @@ inline float2 helmholtz_g(float3 delta, float k) {
     float r = sqrt(r2);
     float phase = k * r;
     float scale = 0.07957747154594767f / r;
+    if (kImag != 0.0f) {
+        scale *= exp(-kImag * r);
+    }
     return float2(cos(phase) * scale, sin(phase) * scale);
 }
 
-inline float2 helmholtz_dlp(float3 delta, float3 normal, float k) {
+inline float2 helmholtz_dlp(float3 delta, float3 normal, float k, float kImag) {
     float r2 = dot(delta, delta);
     if (r2 <= 1.0e-14f) {
         return float2(0.0f, 0.0f);
@@ -2509,10 +2541,16 @@ inline float2 helmholtz_dlp(float3 delta, float3 normal, float k) {
     float r = sqrt(r2);
     float phase = k * r;
     float scale = 0.07957747154594767f / r;
+    if (kImag != 0.0f) {
+        scale *= exp(-kImag * r);
+    }
     float gre = cos(phase) * scale;
     float gim = sin(phase) * scale;
     float projection = dot(delta, normal) / r;
     float fre = -1.0f / r;
+    if (kImag != 0.0f) {
+        fre -= kImag;
+    }
     float fim = k;
     return float2(
         (gre * fre - gim * fim) * projection,
@@ -2588,7 +2626,8 @@ inline float2 regular_dlp_entry(
     int testLocal,
     int trialLocal,
     int symmetryPlane,
-    float k
+    float k,
+    float kImag
 ) {
     float jac = (2.0f * areas[testTri]) * (2.0f * areas[trialTri]);
     float3 normal = float3(
@@ -2609,7 +2648,7 @@ inline float2 regular_dlp_entry(
             // Coincident self-point excluded by index; see
             // assemble_matrix_pair_atomic for why the r2 guard is not enough.
             if (testTri != trialTri || a != b) {
-                acc += helmholtz_dlp(trialPoint - testPoint, normal, k) * weight;
+                acc += helmholtz_dlp(trialPoint - testPoint, normal, k, kImag) * weight;
             }
             if (symmetryPlane != 0) {
                 for (int mask = 1; mask <= 7; ++mask) {
@@ -2619,7 +2658,8 @@ inline float2 regular_dlp_entry(
                     acc += helmholtz_dlp(
                         mirror_point(trialPoint, mask) - testPoint,
                         mirror_normal(normal, mask),
-                        k
+                        k,
+                        kImag
                     ) * weight;
                 }
             }
@@ -2639,7 +2679,8 @@ inline float2 regular_slp_entry(
     int trialTri,
     int testLocal,
     int symmetryPlane,
-    float k
+    float k,
+    float kImag
 ) {
     float jac = (2.0f * areas[testTri]) * (2.0f * areas[trialTri]);
     float2 acc = float2(0.0f, 0.0f);
@@ -2654,7 +2695,7 @@ inline float2 regular_slp_entry(
             // Coincident self-point excluded by index; see
             // assemble_matrix_pair_atomic for why the r2 guard is not enough.
             if (testTri != trialTri || a != b) {
-                acc += helmholtz_g(trialPoint - testPoint, k) * weight;
+                acc += helmholtz_g(trialPoint - testPoint, k, kImag) * weight;
             }
             if (symmetryPlane != 0) {
                 for (int mask = 1; mask <= 7; ++mask) {
@@ -2663,7 +2704,8 @@ inline float2 regular_slp_entry(
                     }
                     acc += helmholtz_g(
                         mirror_point(trialPoint, mask) - testPoint,
-                        k
+                        k,
+                        kImag
                     ) * weight;
                 }
             }
@@ -2686,6 +2728,8 @@ kernel void assemble_matrix_regular(
     device const int *incLoc [[buffer(10)]],
     device const int *counts [[buffer(11)]],
     constant Params &params [[buffer(12)]],
+    device const float *robinBetaRe [[buffer(13)]],
+    device const float *robinBetaIm [[buffer(14)]],
     uint gid [[thread_position_in_grid]]
 ) {
     int total = params.nDof * params.nDof;
@@ -2707,7 +2751,19 @@ kernel void assemble_matrix_regular(
             acc += regular_dlp_entry(
                 px, py, pz, triangles, normals, areas, params.nTriangles,
                 testTri, trialTri, testLocal, trialLocal,
-                SYMMETRY_PLANE, params.k);
+                SYMMETRY_PLANE, params.k, params.kImag);
+            if (params.hasRobin != 0) {
+                float2 beta = float2(robinBetaRe[trialTri], robinBetaIm[trialTri]);
+                if (beta.x != 0.0f || beta.y != 0.0f) {
+                    float2 iK = float2(-params.kImag, params.k);
+                    float2 robinFactor = c_mul(iK, beta) * (-0.33333333333333333f);
+                    float2 slp = regular_slp_entry(
+                        px, py, pz, triangles, areas, params.nTriangles,
+                        testTri, trialTri, testLocal, SYMMETRY_PLANE,
+                        params.k, params.kImag);
+                    acc += c_mul(robinFactor, slp);
+                }
+            }
             if (testTri == trialTri) {
                 float mass = areas[testTri] * (testLocal == trialLocal ? 0.16666666666666666f : 0.08333333333333333f);
                 acc.x -= 0.5f * mass;
@@ -2750,7 +2806,7 @@ kernel void assemble_rhs_source_regular(
             int trialTri = sourceTris[src];
             float2 slp = regular_slp_entry(
                 px, py, pz, triangles, areas, params.nTriangles,
-                testTri, trialTri, testLocal, SYMMETRY_PLANE, params.k);
+                testTri, trialTri, testLocal, SYMMETRY_PLANE, params.k, params.kImag);
             acc += c_mul(slp, float2(sourceRe[src], sourceIm[src]));
         }
     }
@@ -2771,6 +2827,8 @@ kernel void assemble_pair_blocks_regular(
     device const float *areas [[buffer(9)]],
     constant Params &params [[buffer(10)]],
     constant int &pairCount [[buffer(11)]],
+    device const float *robinBetaRe [[buffer(12)]],
+    device const float *robinBetaIm [[buffer(13)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= uint(pairCount)) {
@@ -2798,6 +2856,12 @@ kernel void assemble_pair_blocks_regular(
     float2 localDlp20 = float2(0.0f, 0.0f);
     float2 localDlp21 = float2(0.0f, 0.0f);
     float2 localDlp22 = float2(0.0f, 0.0f);
+    float2 beta = float2(0.0f, 0.0f);
+    bool pairHasRobin = false;
+    if (params.hasRobin != 0) {
+        beta = float2(robinBetaRe[trialTri], robinBetaIm[trialTri]);
+        pairHasRobin = (beta.x != 0.0f || beta.y != 0.0f);
+    }
 
     for (int a = 0; a < 6; ++a) {
         float3 testPoint = point_on_triangle(
@@ -2817,8 +2881,8 @@ kernel void assemble_pair_blocks_regular(
             float2 g = float2(0.0f, 0.0f);
             float2 d = float2(0.0f, 0.0f);
             if (testTri != trialTri || a != b) {
-                g = helmholtz_g(trialPoint - testPoint, params.k) * weight;
-                d = helmholtz_dlp(trialPoint - testPoint, normal, params.k) * weight;
+                g = helmholtz_g(trialPoint - testPoint, params.k, params.kImag) * weight;
+                d = helmholtz_dlp(trialPoint - testPoint, normal, params.k, params.kImag) * weight;
             }
             localSlp0 += g * tb0;
             localSlp1 += g * tb1;
@@ -2839,8 +2903,8 @@ kernel void assemble_pair_blocks_regular(
                     }
                     float3 imagePoint = mirror_point(trialPoint, mask);
                     float3 imageNormal = mirror_normal(normal, mask);
-                    float2 imageG = helmholtz_g(imagePoint - testPoint, params.k) * weight;
-                    float2 imageD = helmholtz_dlp(imagePoint - testPoint, imageNormal, params.k) * weight;
+                    float2 imageG = helmholtz_g(imagePoint - testPoint, params.k, params.kImag) * weight;
+                    float2 imageD = helmholtz_dlp(imagePoint - testPoint, imageNormal, params.k, params.kImag) * weight;
                     localSlp0 += imageG * tb0;
                     localSlp1 += imageG * tb1;
                     localSlp2 += imageG * tb2;
@@ -2856,6 +2920,38 @@ kernel void assemble_pair_blocks_regular(
                 }
             }
         }
+    }
+
+    if (pairHasRobin) {
+        float2 iK = float2(-params.kImag, params.k);
+        float2 robinFactor = c_mul(iK, beta) * (-0.33333333333333333f);
+        float2 slpValues[3] = { localSlp0, localSlp1, localSlp2 };
+        float2 localDlp[9] = {
+            localDlp00,
+            localDlp01,
+            localDlp02,
+            localDlp10,
+            localDlp11,
+            localDlp12,
+            localDlp20,
+            localDlp21,
+            localDlp22
+        };
+        for (int i = 0; i < 3; ++i) {
+            float2 contrib = c_mul(robinFactor, slpValues[i]);
+            for (int j = 0; j < 3; ++j) {
+                localDlp[i * 3 + j] += contrib;
+            }
+        }
+        localDlp00 = localDlp[0];
+        localDlp01 = localDlp[1];
+        localDlp02 = localDlp[2];
+        localDlp10 = localDlp[3];
+        localDlp11 = localDlp[4];
+        localDlp12 = localDlp[5];
+        localDlp20 = localDlp[6];
+        localDlp21 = localDlp[7];
+        localDlp22 = localDlp[8];
     }
 
     slpRe[pairIndex] = localSlp0.x;
@@ -2914,6 +3010,8 @@ kernel void assemble_matrix_pair_atomic(
     device const float *areas [[buffer(8)]],
     constant Params &params [[buffer(9)]],
     constant int &pairCount [[buffer(10)]],
+    device const float *robinBetaRe [[buffer(11)]],
+    device const float *robinBetaIm [[buffer(12)]],
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= uint(pairCount)) {
@@ -2932,6 +3030,16 @@ kernel void assemble_matrix_pair_atomic(
     float2 dlp[9];
     for (int i = 0; i < 9; ++i) {
         dlp[i] = float2(0.0f, 0.0f);
+    }
+    float2 slp[3];
+    for (int i = 0; i < 3; ++i) {
+        slp[i] = float2(0.0f, 0.0f);
+    }
+    float2 beta = float2(0.0f, 0.0f);
+    bool pairHasRobin = false;
+    if (params.hasRobin != 0) {
+        beta = float2(robinBetaRe[trialTri], robinBetaIm[trialTri]);
+        pairHasRobin = (beta.x != 0.0f || beta.y != 0.0f);
     }
     for (int a = 0; a < 6; ++a) {
         float3 testPoint = point_on_triangle(
@@ -2960,8 +3068,12 @@ kernel void assemble_matrix_pair_atomic(
             // identical arithmetic, get an exactly-zero delta, and return
             // zero from the guard, so skipping the evaluation matches them.
             float2 d = float2(0.0f, 0.0f);
+            float2 g = float2(0.0f, 0.0f);
             if (testTri != trialTri || a != b) {
-                d = helmholtz_dlp(trialPoint - testPoint, normal, params.k) * weight;
+                d = helmholtz_dlp(trialPoint - testPoint, normal, params.k, params.kImag) * weight;
+                if (pairHasRobin) {
+                    g = helmholtz_g(trialPoint - testPoint, params.k, params.kImag) * weight;
+                }
             }
             if (SYMMETRY_PLANE != 0) {
                 for (int mask = 1; mask <= 7; ++mask) {
@@ -2971,14 +3083,36 @@ kernel void assemble_matrix_pair_atomic(
                     d += helmholtz_dlp(
                         mirror_point(trialPoint, mask) - testPoint,
                         mirror_normal(normal, mask),
-                        params.k
+                        params.k,
+                        params.kImag
                     ) * weight;
+                    if (pairHasRobin) {
+                        g += helmholtz_g(
+                            mirror_point(trialPoint, mask) - testPoint,
+                            params.k,
+                            params.kImag
+                        ) * weight;
+                    }
                 }
             }
             for (int i = 0; i < 3; ++i) {
+                if (pairHasRobin) {
+                    slp[i] += g * tb[i];
+                }
                 for (int j = 0; j < 3; ++j) {
                     dlp[i * 3 + j] += d * (tb[i] * sb[j]);
                 }
+            }
+        }
+    }
+
+    if (pairHasRobin) {
+        float2 iK = float2(-params.kImag, params.k);
+        float2 robinFactor = c_mul(iK, beta) * (-0.33333333333333333f);
+        for (int i = 0; i < 3; ++i) {
+            float2 contrib = c_mul(robinFactor, slp[i]);
+            for (int j = 0; j < 3; ++j) {
+                dlp[i * 3 + j] += contrib;
             }
         }
     }
@@ -3054,8 +3188,8 @@ kernel void evaluate_field_regular(
                 b0 * pressureRe[dof0] + b1 * pressureRe[dof1] + b2 * pressureRe[dof2],
                 b0 * pressureIm[dof0] + b1 * pressureIm[dof1] + b2 * pressureIm[dof2]
             );
-            float2 dlp = helmholtz_dlp(sourcePoint - obsPoint, normal, params.k);
-            float2 slp = helmholtz_g(sourcePoint - obsPoint, params.k);
+            float2 dlp = helmholtz_dlp(sourcePoint - obsPoint, normal, params.k, 0.0f);
+            float2 slp = helmholtz_g(sourcePoint - obsPoint, params.k, 0.0f);
             float weight = qw[q] * jac;
             acc += (c_mul(dlp, pressure) - c_mul(slp, gTri)) * weight;
             if (SYMMETRY_PLANE != 0) {
@@ -3065,8 +3199,8 @@ kernel void evaluate_field_regular(
                     }
                     float3 imagePoint = mirror_point(sourcePoint, mask);
                     float3 imageNormal = mirror_normal(normal, mask);
-                    float2 imageDlp = helmholtz_dlp(imagePoint - obsPoint, imageNormal, params.k);
-                    float2 imageSlp = helmholtz_g(imagePoint - obsPoint, params.k);
+                    float2 imageDlp = helmholtz_dlp(imagePoint - obsPoint, imageNormal, params.k, 0.0f);
+                    float2 imageSlp = helmholtz_g(imagePoint - obsPoint, params.k, 0.0f);
                     acc += (c_mul(imageDlp, pressure) - c_mul(imageSlp, gTri)) * weight;
                 }
             }
@@ -3205,8 +3339,8 @@ kernel void duffy_delta_blocks(
             float2 g = float2(0.0f, 0.0f);
             float2 d = float2(0.0f, 0.0f);
             if (testTri != trialTri || testImageMask != trialImageMask || a != b) {
-                g = helmholtz_g(trialPoint - testPoint, params.k) * w;
-                d = helmholtz_dlp(trialPoint - testPoint, normal, params.k) * w;
+                g = helmholtz_g(trialPoint - testPoint, params.k, params.kImag) * w;
+                d = helmholtz_dlp(trialPoint - testPoint, normal, params.k, params.kImag) * w;
             }
             regSlp0 += g * tb0;
             regSlp1 += g * tb1;
@@ -3260,8 +3394,8 @@ kernel void duffy_delta_blocks(
         float sb1 = basis_value(trialOrigRef.x, trialOrigRef.y, 1);
         float sb2 = basis_value(trialOrigRef.x, trialOrigRef.y, 2);
         float w = ruleWeights[idx] * jac;
-        float2 g = helmholtz_g(trialPoint - testPoint, params.k) * w;
-        float2 d = helmholtz_dlp(trialPoint - testPoint, normal, params.k) * w;
+        float2 g = helmholtz_g(trialPoint - testPoint, params.k, params.kImag) * w;
+        float2 d = helmholtz_dlp(trialPoint - testPoint, normal, params.k, params.kImag) * w;
         singSlp0 += g * tb0;
         singSlp1 += g * tb1;
         singSlp2 += g * tb2;
@@ -3440,11 +3574,45 @@ func readFloatBuffer(_ buffer: MTLBuffer, count: Int) -> [Float] {
     return Array(UnsafeBufferPointer(start: ptr, count: count))
 }
 
+func makeRobinBetaBuffers(
+    device: MTLDevice,
+    robinBetas: [Complex32]?,
+    nTriangles: Int,
+    labelPrefix: String
+) throws -> (re: MTLBuffer, im: MTLBuffer, hasRobin: Int32) {
+    guard let robinBetas else {
+        let zero = [Float(0.0)]
+        return (
+            try makeBuffer(device, zero, label: "\(labelPrefix)_robin_beta_re_zero"),
+            try makeBuffer(device, zero, label: "\(labelPrefix)_robin_beta_im_zero"),
+            0
+        )
+    }
+    if robinBetas.count != nTriangles {
+        try fail("robin beta count \(robinBetas.count) does not match triangle count \(nTriangles)")
+    }
+    let hasRobin = robinBetas.contains { $0.re != 0.0 || $0.im != 0.0 }
+    if !hasRobin {
+        let zero = [Float(0.0)]
+        return (
+            try makeBuffer(device, zero, label: "\(labelPrefix)_robin_beta_re_zero"),
+            try makeBuffer(device, zero, label: "\(labelPrefix)_robin_beta_im_zero"),
+            0
+        )
+    }
+    return (
+        try makeBuffer(device, robinBetas.map { $0.re }, label: "\(labelPrefix)_robin_beta_re"),
+        try makeBuffer(device, robinBetas.map { $0.im }, label: "\(labelPrefix)_robin_beta_im"),
+        1
+    )
+}
+
 func computeDuffyDeltaBlocksMetal(
     geom: Geometry,
     pairList: DuffyPairList,
     rules: [Int: DuffyRule],
-    k: Float
+    k: Float,
+    kImag: Float = 0.0
 ) throws -> MetalDuffyBlockOutput {
     guard !pairList.pairs.isEmpty else {
         return MetalDuffyBlockOutput(
@@ -3506,7 +3674,9 @@ func computeDuffyDeltaBlocksMetal(
         nTriangles: Int32(geom.nTriangles),
         maxInc: 0,
         symmetryPlane: geom.symmetryPlaneCode,
-        k: k
+        k: k,
+        kImag: kImag,
+        hasRobin: 0
     )
     var pairCountI32 = Int32(pairCount)
     let slpCount = pairCount * 3
@@ -3784,25 +3954,53 @@ func assembleRegularMetalSelected(
     geom: Geometry,
     neumann: [Complex32],
     k: Float,
+    kImag: Float = 0.0,
+    robinBetas: [Complex32]? = nil,
     residentContext: ResidentMetalContext?
 ) throws -> MetalAssemblyOutput {
     let implementation = try requestedRegularAssemblyImplementation()
     if implementation == "block_staged" {
         if let residentContext {
-            return try residentContext.assembleRegularBlockStagedMetal(neumann: neumann, k: k)
+            return try residentContext.assembleRegularBlockStagedMetal(
+                neumann: neumann,
+                k: k,
+                kImag: kImag,
+                robinBetas: robinBetas
+            )
         }
         let context = try ResidentMetalContext(geom: geom)
-        return try context.assembleRegularBlockStagedMetal(neumann: neumann, k: k)
+        return try context.assembleRegularBlockStagedMetal(
+            neumann: neumann,
+            k: k,
+            kImag: kImag,
+            robinBetas: robinBetas
+        )
     }
     // entrywise and pair_atomic are both encoded by the resident context.
     if let residentContext {
-        return try residentContext.assembleRegularMetal(neumann: neumann, k: k)
+        return try residentContext.assembleRegularMetal(
+            neumann: neumann,
+            k: k,
+            kImag: kImag,
+            robinBetas: robinBetas
+        )
     }
     if implementation == "pair_atomic" {
         let context = try ResidentMetalContext(geom: geom)
-        return try context.assembleRegularMetal(neumann: neumann, k: k)
+        return try context.assembleRegularMetal(
+            neumann: neumann,
+            k: k,
+            kImag: kImag,
+            robinBetas: robinBetas
+        )
     }
-    return try assembleRegularMetal(geom: geom, neumann: neumann, k: k)
+    return try assembleRegularMetal(
+        geom: geom,
+        neumann: neumann,
+        k: k,
+        kImag: kImag,
+        robinBetas: robinBetas
+    )
 }
 
 func regularMetalImplementationName(_ output: MetalAssemblyOutput) -> String {
@@ -4114,7 +4312,9 @@ final class ResidentMetalContext {
         commandBuffer: MTLCommandBuffer,
         slot: AssemblyOutputSlot,
         neumann: [Complex32],
-        k: Float
+        k: Float,
+        kImag: Float = 0.0,
+        robinBetas: [Complex32]? = nil
     ) throws -> (implementation: String, matrix: [String: Any], rhs: [String: Any]) {
         let requested = try requestedRegularAssemblyImplementation()
         // block_staged is routed to assembleRegularBlockStagedMetal before
@@ -4125,8 +4325,17 @@ final class ResidentMetalContext {
             nTriangles: Int32(geom.nTriangles),
             maxInc: Int32(incidence.maxInc),
             symmetryPlane: geom.symmetryPlaneCode,
-            k: k
+            k: k,
+            kImag: kImag,
+            hasRobin: 0
         )
+        let robinBuffers = try makeRobinBetaBuffers(
+            device: device,
+            robinBetas: robinBetas,
+            nTriangles: geom.nTriangles,
+            labelPrefix: "resident"
+        )
+        params.hasRobin = robinBuffers.hasRobin
         let n = geom.p1DofCount
         let matrixCount = n * n
         var sourceTrisArray: [Int32] = []
@@ -4182,6 +4391,8 @@ final class ResidentMetalContext {
             matrixEncoder.setBuffer(areas, offset: 0, index: 8)
             matrixEncoder.setBytes(&params, length: MemoryLayout<MetalKernelParams>.stride, index: 9)
             matrixEncoder.setBytes(&pairCount, length: MemoryLayout<Int32>.stride, index: 10)
+            matrixEncoder.setBuffer(robinBuffers.re, offset: 0, index: 11)
+            matrixEncoder.setBuffer(robinBuffers.im, offset: 0, index: 12)
             var dispatch = try dispatch1D(
                 encoder: matrixEncoder,
                 pipeline: pairAtomicPipeline,
@@ -4209,6 +4420,8 @@ final class ResidentMetalContext {
             matrixEncoder.setBuffer(incLoc, offset: 0, index: 10)
             matrixEncoder.setBuffer(counts, offset: 0, index: 11)
             matrixEncoder.setBytes(&params, length: MemoryLayout<MetalKernelParams>.stride, index: 12)
+            matrixEncoder.setBuffer(robinBuffers.re, offset: 0, index: 13)
+            matrixEncoder.setBuffer(robinBuffers.im, offset: 0, index: 14)
             matrixDispatch = try dispatch1D(
                 encoder: matrixEncoder,
                 pipeline: matrixPipeline,
@@ -4247,7 +4460,12 @@ final class ResidentMetalContext {
         return (implementation: implementation, matrix: matrixDispatch, rhs: rhsDispatch)
     }
 
-    func assembleRegularMetal(neumann: [Complex32], k: Float) throws -> MetalAssemblyOutput {
+    func assembleRegularMetal(
+        neumann: [Complex32],
+        k: Float,
+        kImag: Float = 0.0,
+        robinBetas: [Complex32]? = nil
+    ) throws -> MetalAssemblyOutput {
         let slot = try outputSlot(0)
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             try fail("failed to create Metal command buffer")
@@ -4257,7 +4475,9 @@ final class ResidentMetalContext {
             commandBuffer: commandBuffer,
             slot: slot,
             neumann: neumann,
-            k: k
+            k: k,
+            kImag: kImag,
+            robinBetas: robinBetas
         )
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
@@ -4274,7 +4494,12 @@ final class ResidentMetalContext {
         )
     }
 
-    func assembleRegularBlockStagedMetal(neumann: [Complex32], k: Float) throws -> MetalAssemblyOutput {
+    func assembleRegularBlockStagedMetal(
+        neumann: [Complex32],
+        k: Float,
+        kImag: Float = 0.0,
+        robinBetas: [Complex32]? = nil
+    ) throws -> MetalAssemblyOutput {
         let n = geom.p1DofCount
         let nTri = geom.nTriangles
         let pairCount = nTri * nTri
@@ -4290,8 +4515,17 @@ final class ResidentMetalContext {
             nTriangles: Int32(nTri),
             maxInc: Int32(incidence.maxInc),
             symmetryPlane: geom.symmetryPlaneCode,
-            k: k
+            k: k,
+            kImag: kImag,
+            hasRobin: 0
         )
+        let robinBuffers = try makeRobinBetaBuffers(
+            device: device,
+            robinBetas: robinBetas,
+            nTriangles: nTri,
+            labelPrefix: "block"
+        )
+        params.hasRobin = robinBuffers.hasRobin
         var pairCountI32 = Int32(pairCount)
 
         let blockStart = CFAbsoluteTimeGetCurrent()
@@ -4315,6 +4549,8 @@ final class ResidentMetalContext {
         encoder.setBuffer(areas, offset: 0, index: 9)
         encoder.setBytes(&params, length: MemoryLayout<MetalKernelParams>.stride, index: 10)
         encoder.setBytes(&pairCountI32, length: MemoryLayout<Int32>.stride, index: 11)
+        encoder.setBuffer(robinBuffers.re, offset: 0, index: 12)
+        encoder.setBuffer(robinBuffers.im, offset: 0, index: 13)
         let blockDispatch = try dispatch1D(
             encoder: encoder,
             pipeline: pairBlockPipeline,
@@ -4394,7 +4630,7 @@ final class ResidentMetalContext {
         )
     }
 
-    func computeDuffyDeltaBlocksMetal(k: Float) throws -> MetalDuffyBlockOutput {
+    func computeDuffyDeltaBlocksMetal(k: Float, kImag: Float = 0.0) throws -> MetalDuffyBlockOutput {
         guard !pairList.pairs.isEmpty else {
             return MetalDuffyBlockOutput(slpRe: [], slpIm: [], dlpRe: [], dlpIm: [], dispatch: ["pairs": 0, "kernel": "duffy_delta_blocks"])
         }
@@ -4406,7 +4642,8 @@ final class ResidentMetalContext {
         let dispatchReport = try encodeDuffyDeltaBlocks(
             commandBuffer: commandBuffer,
             slot: slot,
-            k: k
+            k: k,
+            kImag: kImag
         )
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
@@ -4419,7 +4656,8 @@ final class ResidentMetalContext {
     private func encodeDuffyDeltaBlocks(
         commandBuffer: MTLCommandBuffer,
         slot: AssemblyOutputSlot,
-        k: Float
+        k: Float,
+        kImag: Float = 0.0
     ) throws -> [String: Any] {
         guard let pairTestBuffer,
               let pairTrialBuffer,
@@ -4442,7 +4680,9 @@ final class ResidentMetalContext {
             nTriangles: Int32(geom.nTriangles),
             maxInc: 0,
             symmetryPlane: geom.symmetryPlaneCode,
-            k: k
+            k: k,
+            kImag: kImag,
+            hasRobin: 0
         )
         var pairCountI32 = Int32(pairCount)
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
@@ -4543,6 +4783,8 @@ final class ResidentMetalContext {
         caseIndex: Int,
         neumann: [Complex32],
         k: Float,
+        kImag: Float = 0.0,
+        robinBetas: [Complex32]? = nil,
         includeDuffyBlocks: Bool
     ) throws -> PendingAssembly {
         let slot = try outputSlot(caseIndex % 2)
@@ -4554,7 +4796,9 @@ final class ResidentMetalContext {
             commandBuffer: regularCommandBuffer,
             slot: slot,
             neumann: neumann,
-            k: k
+            k: k,
+            kImag: kImag,
+            robinBetas: robinBetas
         )
         regularCommandBuffer.commit()
 
@@ -4568,7 +4812,8 @@ final class ResidentMetalContext {
             duffyDispatchReport = try encodeDuffyDeltaBlocks(
                 commandBuffer: commandBuffer,
                 slot: slot,
-                k: k
+                k: k,
+                kImag: kImag
             )
             commandBuffer.commit()
             duffyCommandBuffer = commandBuffer
@@ -4642,7 +4887,10 @@ final class ResidentMetalContext {
     func reduceDuffyDeltaBlocks(
         to arrays: AssemblyArrays,
         neumann: [Complex32],
-        blocks: MetalDuffyBlockOutput
+        blocks: MetalDuffyBlockOutput,
+        k: Float,
+        kImag: Float = 0.0,
+        robinBetas: [Complex32]? = nil
     ) -> (AssemblyArrays, Double) {
         let reductionStart = CFAbsoluteTimeGetCurrent()
         let pairCount = pairList.pairs.count
@@ -4652,9 +4900,14 @@ final class ResidentMetalContext {
         var rhsIm = arrays.rhsIm
         var matrixDeltaRe = Array(repeating: 0.0, count: duffyReductionPlan.matrixIndices.count)
         var matrixDeltaIm = Array(repeating: 0.0, count: duffyReductionPlan.matrixIndices.count)
+        let iK = Complex32(re: -kImag, im: k)
 
         for pairIndex in 0..<pairCount {
-            let gTrial = neumann[duffyReductionPlan.pairTrialTriangles[pairIndex]]
+            let trialTri = duffyReductionPlan.pairTrialTriangles[pairIndex]
+            let gTrial = neumann[trialTri]
+            let betaTrial = robinBetas?[trialTri] ?? Complex32.zero
+            let robinCoupling = iK * betaTrial
+            let hasRobin = betaTrial.re != 0.0 || betaTrial.im != 0.0
             for i in 0..<3 {
                 let slpIndex = pairIndex + i * pairCount
                 let row = duffyReductionPlan.rhsRows[slpIndex]
@@ -4670,8 +4923,16 @@ final class ResidentMetalContext {
                 for j in 0..<3 {
                     let deltaIndex = pairIndex + (i * 3 + j) * pairCount
                     let slot = duffyReductionPlan.dlpSlots[deltaIndex]
-                    matrixDeltaRe[slot] += Double(blocks.dlpRe[deltaIndex] * rowWeight)
-                    matrixDeltaIm[slot] += Double(blocks.dlpIm[deltaIndex] * rowWeight)
+                    var delta = Complex32(
+                        re: blocks.dlpRe[deltaIndex],
+                        im: blocks.dlpIm[deltaIndex]
+                    )
+                    if hasRobin {
+                        delta = delta - ((slpDelta * robinCoupling) * Float(1.0 / 3.0))
+                    }
+                    delta = delta * rowWeight
+                    matrixDeltaRe[slot] += Double(delta.re)
+                    matrixDeltaIm[slot] += Double(delta.im)
                 }
             }
         }
@@ -4702,7 +4963,9 @@ final class ResidentMetalContext {
             nTriangles: Int32(geom.nTriangles),
             maxInc: 1,
             symmetryPlane: geom.symmetryPlaneCode,
-            k: k
+            k: k,
+            kImag: 0.0,
+            hasRobin: 0
         )
         var nObs = Int32(observationCount)
         if fieldOutCount != observationCount {
@@ -4790,7 +5053,13 @@ final class ResidentMetalContext {
     }
 }
 
-func assembleRegularMetal(geom: Geometry, neumann: [Complex32], k: Float) throws -> MetalAssemblyOutput {
+func assembleRegularMetal(
+    geom: Geometry,
+    neumann: [Complex32],
+    k: Float,
+    kImag: Float = 0.0,
+    robinBetas: [Complex32]? = nil
+) throws -> MetalAssemblyOutput {
     let device = try MetalWarmup.shared.device()
     guard let commandQueue = device.makeCommandQueue() else {
         try fail("failed to create Metal command queue")
@@ -4808,8 +5077,17 @@ func assembleRegularMetal(geom: Geometry, neumann: [Complex32], k: Float) throws
         nTriangles: Int32(geom.nTriangles),
         maxInc: Int32(incidence.maxInc),
         symmetryPlane: geom.symmetryPlaneCode,
-        k: k
+        k: k,
+        kImag: kImag,
+        hasRobin: 0
     )
+    let robinBuffers = try makeRobinBetaBuffers(
+        device: device,
+        robinBetas: robinBetas,
+        nTriangles: geom.nTriangles,
+        labelPrefix: "entrywise"
+    )
+    params.hasRobin = robinBuffers.hasRobin
     let n = geom.p1DofCount
     let matrixCount = n * n
 
@@ -4873,6 +5151,8 @@ func assembleRegularMetal(geom: Geometry, neumann: [Complex32], k: Float) throws
     matrixEncoder.setBuffer(incLoc, offset: 0, index: 10)
     matrixEncoder.setBuffer(counts, offset: 0, index: 11)
     matrixEncoder.setBytes(&params, length: MemoryLayout<MetalKernelParams>.stride, index: 12)
+    matrixEncoder.setBuffer(robinBuffers.re, offset: 0, index: 13)
+    matrixEncoder.setBuffer(robinBuffers.im, offset: 0, index: 14)
     let matrixDispatch = try dispatch1D(
         encoder: matrixEncoder,
         pipeline: matrixPipeline,
@@ -4950,7 +5230,9 @@ func evaluateExteriorMetal(
         nTriangles: Int32(geom.nTriangles),
         maxInc: 1,
         symmetryPlane: geom.symmetryPlaneCode,
-        k: k
+        k: k,
+        kImag: 0.0,
+        hasRobin: 0
     )
     var nObs = Int32(observationPoints.count)
     var obs = Array(repeating: Float(0), count: observationPoints.count * 3)
@@ -5380,12 +5662,9 @@ func assembleRegular(
     robinBetas: [Complex32]? = nil,
     residentContext: ResidentMetalContext? = nil
 ) throws -> AssemblyRun {
-    var mode = ProcessInfo.processInfo.environment[
+    let mode = ProcessInfo.processInfo.environment[
         "HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE"
     ] ?? "optimized"
-    if kImag != 0.0 || robinBetas != nil {
-        mode = "reference"
-    }
     if mode == "reference" {
         let (arrays, seconds) = timedRun {
             assembleRegularReference(
@@ -5441,17 +5720,27 @@ func assembleRegular(
                 geom: geom,
                 neumann: neumann,
                 k: k,
+                kImag: kImag,
+                robinBetas: robinBetas,
                 residentContext: residentContext
             )
         }
+        let (nearCorrected, nearStats) = try applyNearFieldCorrectionsIfEnabled(
+            to: output.arrays,
+            geom: geom,
+            neumann: neumann,
+            k: k,
+            kImag: kImag,
+            robinBetas: robinBetas
+        )
         return AssemblyRun(
-            arrays: output.arrays,
+            arrays: nearCorrected,
             implementation: regularMetalImplementationName(output),
             mode: mode,
-            seconds: seconds,
+            seconds: seconds + (nearStats?.seconds ?? 0.0),
             parity: nil,
             duffyStats: nil,
-            nearStats: nil,
+            nearStats: nearStats,
             metalDispatch: output.dispatch
         )
     }
@@ -5461,6 +5750,8 @@ func assembleRegular(
                 geom: geom,
                 neumann: neumann,
                 k: k,
+                kImag: kImag,
+                robinBetas: robinBetas,
                 residentContext: residentContext
             )
         }
@@ -5469,13 +5760,17 @@ func assembleRegular(
             geom: geom,
             neumann: neumann,
             k: k,
+            kImag: kImag,
+            robinBetas: robinBetas,
             residentContext: residentContext
         )
         let (nearCorrected, nearStats) = try applyNearFieldCorrectionsIfEnabled(
             to: corrected,
             geom: geom,
             neumann: neumann,
-            k: k
+            k: k,
+            kImag: kImag,
+            robinBetas: robinBetas
         )
         return AssemblyRun(
             arrays: nearCorrected,
@@ -5490,13 +5785,21 @@ func assembleRegular(
     }
     if mode == "parity" {
         let (reference, referenceSeconds) = timedRun {
-            assembleRegularReference(geom: geom, neumann: neumann, k: k)
+            assembleRegularReference(
+                geom: geom,
+                neumann: neumann,
+                k: k,
+                kImag: kImag,
+                robinBetas: robinBetas
+            )
         }
         let (optimized, optimizedSeconds) = try timedRun {
             try assembleRegularMetalSelected(
                 geom: geom,
                 neumann: neumann,
                 k: k,
+                kImag: kImag,
+                robinBetas: robinBetas,
                 residentContext: residentContext
             )
         }
@@ -6155,7 +6458,6 @@ func assembleSolveEvaluateStandardNeumannBatch(
     caseFieldKs.reserveCapacity(cases.count)
     caseNeumanns.reserveCapacity(cases.count)
     caseRobinBetas.reserveCapacity(cases.count)
-    var requiresReferenceAssembly = false
     for casePayload in cases {
         let kReal = Float(try requireDouble(casePayload, "k_real_f32"))
         let kImag = Float(try optionalDouble(casePayload, "k_imag_f32", default: 0.0))
@@ -6165,9 +6467,6 @@ func assembleSolveEvaluateStandardNeumannBatch(
             default: Double(kReal)
         ))
         let robinBetas = try robinBetasByTriangle(geom: geom, casePayload: casePayload)
-        if kImag != 0.0 || robinBetas != nil {
-            requiresReferenceAssembly = true
-        }
         caseKs.append(kReal)
         caseKImag.append(kImag)
         caseFieldKs.append(fieldK)
@@ -6192,8 +6491,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
     // corrections keep the strictly sequential path: they exist to
     // cross-check the optimized kernels, not to be fast.
     let regularImplementation = try requestedRegularAssemblyImplementation()
-    let pipelineAssembly = !requiresReferenceAssembly
-        && (regularImplementation == "entrywise"
+    let pipelineAssembly = (regularImplementation == "entrywise"
             || regularImplementation == "pair_atomic")
         && (assemblyMode == "optimized"
             || (assemblyMode == "corrected" && duffyMode == "gpu_blocks"))
@@ -6219,21 +6517,33 @@ func assembleSolveEvaluateStandardNeumannBatch(
         caseIndex: Int
     ) throws -> AssemblyRun {
         guard let blocks = finished.duffyBlocks else {
+            let (nearCorrected, nearStats) = try applyNearFieldCorrectionsIfEnabled(
+                to: finished.regular.arrays,
+                geom: geom,
+                neumann: caseNeumanns[caseIndex],
+                k: caseKs[caseIndex],
+                kImag: caseKImag[caseIndex],
+                robinBetas: caseRobinBetas[caseIndex]
+            )
             return AssemblyRun(
-                arrays: finished.regular.arrays,
+                arrays: nearCorrected,
                 implementation: regularMetalImplementationName(finished.regular),
                 mode: assemblyMode,
-                seconds: finished.regularGpuSeconds + finished.readbackSeconds,
+                seconds: finished.regularGpuSeconds + finished.readbackSeconds
+                    + (nearStats?.seconds ?? 0.0),
                 parity: nil,
                 duffyStats: nil,
-                nearStats: nil,
+                nearStats: nearStats,
                 metalDispatch: finished.regular.dispatch
             )
         }
         let (correctedArrays, reductionSeconds) = context.reduceDuffyDeltaBlocks(
             to: finished.regular.arrays,
             neumann: caseNeumanns[caseIndex],
-            blocks: blocks
+            blocks: blocks,
+            k: caseKs[caseIndex],
+            kImag: caseKImag[caseIndex],
+            robinBetas: caseRobinBetas[caseIndex]
         )
         let stats = DuffyCorrectionStats(
             plan: context.pairList.plan,
@@ -6252,7 +6562,9 @@ func assembleSolveEvaluateStandardNeumannBatch(
             to: correctedArrays,
             geom: geom,
             neumann: caseNeumanns[caseIndex],
-            k: caseKs[caseIndex]
+            k: caseKs[caseIndex],
+            kImag: caseKImag[caseIndex],
+            robinBetas: caseRobinBetas[caseIndex]
         )
         return AssemblyRun(
             arrays: nearCorrected,
@@ -6277,6 +6589,8 @@ func assembleSolveEvaluateStandardNeumannBatch(
                 caseIndex: caseIndex + 1,
                 neumann: caseNeumanns[caseIndex + 1],
                 k: caseKs[caseIndex + 1],
+                kImag: caseKImag[caseIndex + 1],
+                robinBetas: caseRobinBetas[caseIndex + 1],
                 includeDuffyBlocks: includeDuffyBlocks
             )
             : nil
@@ -6326,6 +6640,8 @@ func assembleSolveEvaluateStandardNeumannBatch(
                     caseIndex: nextToSubmit + 1,
                     neumann: caseNeumanns[nextToSubmit + 1],
                     k: caseKs[nextToSubmit + 1],
+                    kImag: caseKImag[nextToSubmit + 1],
+                    robinBetas: caseRobinBetas[nextToSubmit + 1],
                     includeDuffyBlocks: includeDuffyBlocks
                 )
                 : nil
@@ -6341,6 +6657,8 @@ func assembleSolveEvaluateStandardNeumannBatch(
             caseIndex: 0,
             neumann: caseNeumanns[0],
             k: caseKs[0],
+            kImag: caseKImag[0],
+            robinBetas: caseRobinBetas[0],
             includeDuffyBlocks: includeDuffyBlocks
         )
     }

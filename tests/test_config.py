@@ -154,7 +154,7 @@ def test_solve_config_mesh_loading_options_default_off():
 
 def test_solve_config_rejects_unknown_metal_native_assembly_mode():
     with pytest.raises(ValueError, match="metal_native_assembly_mode"):
-        SolveConfig(metal_native_assembly_mode="parity")  # type: ignore[arg-type]
+        SolveConfig(metal_native_assembly_mode="unknown")  # type: ignore[arg-type]
 
 
 def test_solve_config_accepts_metal_native_assembly_modes():
@@ -163,6 +163,16 @@ def test_solve_config_accepts_metal_native_assembly_modes():
         SolveConfig(metal_native_assembly_mode="optimized")
         .metal_native_assembly_mode
         == "optimized"
+    )
+    assert (
+        SolveConfig(metal_native_assembly_mode="reference")
+        .metal_native_assembly_mode
+        == "reference"
+    )
+    assert (
+        SolveConfig(metal_native_assembly_mode="parity")
+        .metal_native_assembly_mode
+        == "parity"
     )
 
 

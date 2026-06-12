@@ -236,9 +236,9 @@ def test_pair_atomic_regular_sphere3_assembly_stays_well_conditioned():
             metal_native_assembly_mode="optimized",
         ),
     )
-    # impedance_sources={8: 0.0} forces the Swift reference-quadrature path;
-    # the mesh has no tag-8 elements, so the problem stays physically
-    # identical to the rigid corrected/optimized solves.
+    # Explicit reference mode uses Swift reference quadrature. The tag-8
+    # impedance source stays inactive on this mesh, so the problem remains
+    # physically identical to the rigid corrected/optimized solves.
     reference = metal_bem.solve_frequencies(
         mesh,
         [100.0],
@@ -246,6 +246,7 @@ def test_pair_atomic_regular_sphere3_assembly_stays_well_conditioned():
             velocity_sources={2: 1.0},
             impedance_sources={8: 0.0},
             observation=observation,
+            metal_native_assembly_mode="reference",
         ),
     )
     assert reference.native_diagnostics[0]["assembly_implementation"].startswith(

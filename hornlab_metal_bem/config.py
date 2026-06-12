@@ -20,7 +20,7 @@ class BIEFormulation:
 
 
 NativeSymmetryPlane = Literal["yz", "xz", "xy", "yz+xz"]
-MetalNativeAssemblyMode = Literal["corrected", "optimized"]
+MetalNativeAssemblyMode = Literal["corrected", "optimized", "reference", "parity"]
 
 # Single source of truth for the supported native symmetry planes. Used by
 # config validation, native routing, and geometry validation so the lists
@@ -155,9 +155,15 @@ class SolveConfig:
             raise ValueError(
                 "native_symmetry_plane must be None, 'yz', 'xz', 'xy', or 'yz+xz'"
             )
-        if self.metal_native_assembly_mode not in {"corrected", "optimized"}:
+        if self.metal_native_assembly_mode not in {
+            "corrected",
+            "optimized",
+            "reference",
+            "parity",
+        }:
             raise ValueError(
-                "metal_native_assembly_mode must be 'corrected' or 'optimized'"
+                "metal_native_assembly_mode must be 'corrected', 'optimized', "
+                "'reference', or 'parity'"
             )
         if (
             self.metal_native_threads_per_group is not None

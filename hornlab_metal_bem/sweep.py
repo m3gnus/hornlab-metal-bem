@@ -101,16 +101,8 @@ def _native_env_overrides(config: SolveConfig) -> dict[str, str]:
     concurrent solves on different threads cannot race on each other's
     assembly mode or threadgroup overrides.
     """
-    experimental_complex_or_robin = (
-        config.formulation == BIEFormulation.COMPLEX_K
-        or bool(config.impedance_sources)
-    )
     overrides: dict[str, str] = {
-        "HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE": (
-            "reference"
-            if experimental_complex_or_robin
-            else config.metal_native_assembly_mode
-        ),
+        "HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE": config.metal_native_assembly_mode,
     }
     if os.environ.get("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE") is None:
         overrides["HORNLAB_METAL_BEM_NATIVE_FIELD_MODE"] = "optimized"

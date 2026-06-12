@@ -78,11 +78,14 @@ experimental and maps physical tags to normalized admittance
 `dp/dn = i*k*beta*p` on those tags, omits prescribed velocity data on the same
 tags, and evaluates the exterior field with the reconstructed total Neumann
 data. While these flags are active, Python sends extra case metadata and the
-helper routes assembly through the Swift reference quadrature path plus CPU
-Duffy singular corrections so the existing optimized Metal real-k rigid
-numerics remain unchanged when flags are off. Python also fails fast if the
-helper result diagnostics do not acknowledge the experimental `complex_k` or
-`robin_boundary` fields that were sent.
+optimized Metal assembly kernels handle the complex-k damping and Robin
+matrix term in `optimized`/`corrected` modes. The Swift reference quadrature
+path plus CPU Duffy singular corrections remains available via assembly mode
+`reference` as the numerical cross-check, and `parity` mode compares the
+regular-only Metal and reference assemblies for the same experimental
+parameters. Python also fails fast if the helper result diagnostics do not
+acknowledge the experimental `complex_k` or `robin_boundary` fields that were
+sent.
 
 When `on_frequency_result` is unset, `sweep.py` sends the full frequency batch
 and may request a single batched field output. When `on_frequency_result` is
@@ -201,10 +204,14 @@ M-series GPUs — the kernel is throughput-saturated independent of that
 geometry, and multi-wavenumber accumulator state collapses occupancy (see
 branch `experiment/multik-assembly`).
 
-For experimental `complex_k` and Robin cases the combined op disables pipelined
-Metal assembly, uses Swift reference quadrature plus CPU Duffy singular
-corrections, and reports the per-case flags in native diagnostics: `complex_k`,
-`assembly_k_imag_f32`, `robin_boundary`, and `field_uses_total_neumann`.
+For experimental `complex_k` and Robin cases the combined op uses the
+optimized Metal kernels in `optimized`/`corrected` modes, including the
+pair-atomic regular assembly, GPU Duffy delta blocks, and pipelined
+assembly/solve overlap when those modes are selected. Explicit assembly mode
+`reference` still uses Swift reference quadrature plus CPU Duffy singular
+corrections. The helper reports the per-case flags in native diagnostics:
+`complex_k`, `assembly_k_imag_f32`, `robin_boundary`, and
+`field_uses_total_neumann`.
 Python requires the `complex_k` / `robin_boundary` acknowledgements whenever it
 sent the corresponding inputs and fails loudly if a stale helper omits them.
 The existing `dense_solve_rcond` and `dense_solve_condition_1norm` diagnostics

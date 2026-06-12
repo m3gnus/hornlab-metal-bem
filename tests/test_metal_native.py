@@ -2709,6 +2709,8 @@ def test_native_executable_resident_assembly_solve_field_matches_split_path(
         )
 
     monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", "gpu_blocks")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_REGULAR_ASSEMBLY_IMPL", "pair_atomic")
     monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
     monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", raising=False)
     neumann = np.array([[1.0 + 0.0j, 0.0 + 0.5j]], dtype=np.complex64)
@@ -2891,6 +2893,58 @@ def test_native_executable_complex_k_robin_tags_8_9_solve_field(
     assert solved.lapack_info == 0
     assert np.all(np.isfinite(pressure))
     assert np.all(np.isfinite(field))
+    assert solved.diagnostics["assembly_mode"] == "corrected"
+    assert solved.diagnostics["assembly_implementation"] == (
+        "swift_native_metal_pair_atomic_regular_plus_metal_duffy_blocks"
+    )
+    assert solved.diagnostics["complex_k"] is True
+    assert solved.diagnostics["robin_boundary"] is True
+    assert solved.diagnostics["field_uses_total_neumann"] is True
+    assert 0.0 < solved.diagnostics["dense_solve_rcond"] <= 1.0
+    assert solved.diagnostics["dense_solve_condition_1norm"] >= 1.0
+
+
+def test_native_executable_complex_k_robin_reference_mode(
+    monkeypatch,
+    tmp_path,
+):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "reference")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_REGULAR_ASSEMBLY_IMPL", "pair_atomic")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
+    neumann = np.array([[1.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j]], dtype=np.complex64)
+    frequency_hz = np.array([172.0], dtype=np.float64)
+    k_real = np.array([np.float32(2.0 * np.pi * 172.0 / 343.0)], dtype=np.float32)
+    k_imag = (k_real * np.float32(0.005)).astype(np.float32)
+    observation_points = np.array(
+        [[0.0, 0.0, 0.7], [0.2, 0.0, 0.8]],
+        dtype=np.float32,
+    )
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_robin_geometry_buffers(),
+        work_dir=tmp_path / "native-complex-robin-reference-session",
+        session_id="native-complex-robin-reference-test",
+    ) as session:
+        solved = session.assemble_solve_evaluate_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            neumann,
+            observation_points,
+            k_imag_f32=k_imag,
+            impedance_sources={8: 0.05 + 0.0j, 9: 0.02 + 0.01j},
+            operation_id="resident-complex-robin-reference",
+            source_tags=[2],
+            impedance_source_tag=2,
+        )[0]
+
+    assert solved.lapack_info == 0
     assert solved.diagnostics["assembly_mode"] == "reference"
     assert solved.diagnostics["assembly_implementation"] == (
         "swift_native_reference_complex_robin_quadrature_plus_cpu_duffy"
@@ -2899,7 +2953,6 @@ def test_native_executable_complex_k_robin_tags_8_9_solve_field(
     assert solved.diagnostics["robin_boundary"] is True
     assert solved.diagnostics["field_uses_total_neumann"] is True
     assert 0.0 < solved.diagnostics["dense_solve_rcond"] <= 1.0
-    assert solved.diagnostics["dense_solve_condition_1norm"] >= 1.0
 
 
 def test_native_executable_streams_per_case_results(monkeypatch, tmp_path):
