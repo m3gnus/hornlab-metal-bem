@@ -10,3 +10,4 @@ dist/
 *.egg-info/
 hornlab_metal_bem/metal/native_helper/.build/
 runs/
+artifacts/

@@ -7,6 +7,10 @@ name = "hornlab-metal-bem"
 version = "0.1.0"
 description = "Apple Metal accelerated acoustic BEM solver for waveguide and loudspeaker meshes"
 requires-python = ">=3.10"
+license = { text = "AGPL-3.0-or-later" }
+classifiers = [
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+]
 dependencies = [
     "numpy",
     "scipy",
