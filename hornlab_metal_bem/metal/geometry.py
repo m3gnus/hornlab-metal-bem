@@ -16,6 +16,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ..config import NATIVE_SYMMETRY_PLANES
+from ..mesh import open_boundary_edges
 
 
 class MetalGeometryError(ValueError):
@@ -143,6 +144,7 @@ def validate_native_symmetry_plane(
     symmetry_plane: str | None,
     *,
     tolerance: float = 1.0e-7,
+    check_open_edges: bool = True,
 ) -> str | None:
     """Validate the narrow native reduced-domain symmetry contract.
 
@@ -150,6 +152,13 @@ def validate_native_symmetry_plane(
     meshes mirrored across YZ (X symmetry), XZ (Y symmetry), XY (Z symmetry),
     or YZ+XZ. Symmetry planes are not real BEM boundaries, so triangles lying
     entirely on a requested plane are rejected.
+
+    With ``check_open_edges`` (the default) every open boundary edge must lie
+    on a requested symmetry plane: a closed surface reduced by mirror cuts has
+    its entire rim on the cut planes, so an off-plane open edge means the mesh
+    was cut along an unrequested plane and the mirrored solve would be wrong.
+    Pass ``check_open_edges=False`` only for open shells whose rim is a real
+    free edge of the full (reduced + mirrored) geometry.
     """
     if symmetry_plane is None:
         return None
@@ -198,7 +207,51 @@ def validate_native_symmetry_plane(
         _validate_axis(1, "y", "Y=0")
     if plane == "xy":
         _validate_axis(2, "z", "Z=0")
+    if check_open_edges:
+        _validate_open_edges_on_symmetry_planes(coords, triangles, plane)
     return plane
+
+
+def _validate_open_edges_on_symmetry_planes(
+    coords_3xn: NDArray[np.float64],
+    triangles_nx3: NDArray[np.int32],
+    symmetry_plane: str,
+) -> None:
+    edges = open_boundary_edges(triangles_nx3)
+    if edges.size == 0:
+        return
+
+    components: list[int] = []
+    labels: list[str] = []
+    if "yz" in symmetry_plane:
+        components.append(0)
+        labels.append("X=0")
+    if "xz" in symmetry_plane:
+        components.append(1)
+        labels.append("Y=0")
+    if symmetry_plane == "xy":
+        components.append(2)
+        labels.append("Z=0")
+
+    on_requested_plane = np.zeros(edges.shape[0], dtype=bool)
+    for component in components:
+        edge_values = coords_3xn[component, edges]
+        on_requested_plane |= np.all(
+            np.abs(edge_values) <= _PLANE_SNAP_TOLERANCE,
+            axis=1,
+        )
+
+    if np.all(on_requested_plane):
+        return
+
+    first = int(np.flatnonzero(~on_requested_plane)[0])
+    edge = tuple(int(v) for v in edges[first])
+    requested = " or ".join(labels)
+    raise MetalGeometryError(
+        f"native_symmetry_plane={symmetry_plane!r} requires every open boundary "
+        f"edge to lie on {requested}; boundary edge {first} with vertices {edge} "
+        "is off the requested symmetry plane(s)"
+    )
 
 
 def _require_vertices_3xn(grid: Any) -> NDArray[np.float64]:

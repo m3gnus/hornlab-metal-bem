@@ -255,24 +255,55 @@ def _tiny_yz_half_buffers():
     grid = SimpleNamespace(
         vertices=np.array(
             [
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0, 0.2],
+                [0.0, 0.0, 1.0, 0.3],
             ],
             dtype=np.float64,
         ),
-        elements=np.array([[0], [1], [2]], dtype=np.int64),
-        number_of_elements=1,
+        elements=np.array([[0, 0, 1], [1, 3, 2], [3, 2, 3]], dtype=np.int64),
+        number_of_elements=3,
     )
     p1 = SimpleNamespace(
-        local2global=np.array([[0, 1, 2]], dtype=np.int64),
-        global_dof_count=3,
+        local2global=np.array(
+            [[0, 1, 3], [0, 3, 2], [1, 2, 3]],
+            dtype=np.int64,
+        ),
+        global_dof_count=4,
     )
     return build_metal_geometry_buffers(
         grid,
-        np.array([2], dtype=np.int32),
+        np.array([2, 2, 2], dtype=np.int32),
         p1,
-        SimpleNamespace(global_dof_count=1),
+        SimpleNamespace(global_dof_count=3),
+    )
+
+
+def _tiny_xz_half_buffers():
+    grid = SimpleNamespace(
+        vertices=np.array(
+            [
+                [0.0, 1.0, 0.0, 0.2],
+                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0, 0.3],
+            ],
+            dtype=np.float64,
+        ),
+        elements=np.array([[0, 0, 1], [1, 3, 2], [3, 2, 3]], dtype=np.int64),
+        number_of_elements=3,
+    )
+    p1 = SimpleNamespace(
+        local2global=np.array(
+            [[0, 1, 3], [0, 3, 2], [1, 2, 3]],
+            dtype=np.int64,
+        ),
+        global_dof_count=4,
+    )
+    return build_metal_geometry_buffers(
+        grid,
+        np.array([2, 2, 2], dtype=np.int32),
+        p1,
+        SimpleNamespace(global_dof_count=3),
     )
 
 
@@ -305,24 +336,24 @@ def _tiny_yz_xz_quarter_buffers():
     grid = SimpleNamespace(
         vertices=np.array(
             [
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-                [0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
             ],
             dtype=np.float64,
         ),
-        elements=np.array([[0], [1], [2]], dtype=np.int64),
-        number_of_elements=1,
+        elements=np.array([[0, 1], [1, 3], [2, 2]], dtype=np.int64),
+        number_of_elements=2,
     )
     p1 = SimpleNamespace(
-        local2global=np.array([[0, 1, 2]], dtype=np.int64),
-        global_dof_count=3,
+        local2global=np.array([[0, 1, 2], [1, 3, 2]], dtype=np.int64),
+        global_dof_count=4,
     )
     return build_metal_geometry_buffers(
         grid,
-        np.array([2], dtype=np.int32),
+        np.array([2, 2], dtype=np.int32),
         p1,
-        SimpleNamespace(global_dof_count=1),
+        SimpleNamespace(global_dof_count=2),
     )
 
 
@@ -370,24 +401,27 @@ def _tiny_xy_half_buffers():
     grid = SimpleNamespace(
         vertices=np.array(
             [
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-                [0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0, 0.2],
+                [0.0, 0.0, 1.0, 0.3],
+                [0.0, 0.0, 0.0, 1.0],
             ],
             dtype=np.float64,
         ),
-        elements=np.array([[0], [1], [2]], dtype=np.int64),
-        number_of_elements=1,
+        elements=np.array([[0, 0, 1], [1, 3, 2], [3, 2, 3]], dtype=np.int64),
+        number_of_elements=3,
     )
     p1 = SimpleNamespace(
-        local2global=np.array([[0, 1, 2]], dtype=np.int64),
-        global_dof_count=3,
+        local2global=np.array(
+            [[0, 1, 3], [0, 3, 2], [1, 2, 3]],
+            dtype=np.int64,
+        ),
+        global_dof_count=4,
     )
     return build_metal_geometry_buffers(
         grid,
-        np.array([2], dtype=np.int32),
+        np.array([2, 2, 2], dtype=np.int32),
         p1,
-        SimpleNamespace(global_dof_count=1),
+        SimpleNamespace(global_dof_count=3),
     )
 
 
@@ -918,11 +952,23 @@ def test_native_symmetry_manifest_and_half_domain_guard(monkeypatch, tmp_path):
     finally:
         xy_session.close()
 
-    assert validate_native_symmetry_plane(_tiny_yz_xz_quarter_buffers(), "xz") == "xz"
+    assert validate_native_symmetry_plane(_tiny_xz_half_buffers(), "xz") == "xz"
     assert validate_native_symmetry_plane(_tiny_xy_half_buffers(), "xy") == "xy"
     assert (
         validate_native_symmetry_plane(_tiny_yz_xz_quarter_buffers(), "yz+xz")
         == "yz+xz"
+    )
+
+    with pytest.raises(MetalGeometryError, match="every open boundary edge"):
+        validate_native_symmetry_plane(_tiny_yz_xz_quarter_buffers(), "yz")
+
+    assert (
+        validate_native_symmetry_plane(
+            _tiny_yz_xz_quarter_buffers(),
+            "yz",
+            check_open_edges=False,
+        )
+        == "yz"
     )
 
     with pytest.raises(MetalGeometryError, match="positive-x reduced-domain"):

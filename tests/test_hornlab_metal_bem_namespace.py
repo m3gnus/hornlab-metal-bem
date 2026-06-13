@@ -36,9 +36,18 @@ def test_hornlab_metal_bem_solve_defaults_to_pure_native_dispatch(monkeypatch):
     sentinel = object()
     calls = {}
 
-    def fake_load_mesh(mesh, *, scale, validate=True, merge_tol=1e-9, repair_normals=False):
+    def fake_load_mesh(
+        mesh,
+        *,
+        scale,
+        validate=True,
+        merge_tol=1e-9,
+        repair_normals=False,
+        native_symmetry_plane=None,
+    ):
         calls["mesh"] = mesh
         calls["scale"] = scale
+        calls["native_symmetry_plane"] = native_symmetry_plane
         return loaded
 
     monkeypatch.setattr("hornlab_metal_bem.load_mesh", fake_load_mesh)
@@ -55,6 +64,7 @@ def test_hornlab_metal_bem_solve_defaults_to_pure_native_dispatch(monkeypatch):
     assert calls == {
         "mesh": "waveguide.msh",
         "scale": 1.0,
+        "native_symmetry_plane": None,
     }
 
 
