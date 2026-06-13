@@ -1076,6 +1076,23 @@ def test_native_symmetry_manifest_and_half_domain_guard(monkeypatch, tmp_path):
         validate_native_symmetry_plane(_tiny_yz_half_buffers(), "zx")
 
 
+def test_open_mouth_reduced_mesh_needs_check_open_edges_disabled():
+    # A bare horn radiating from an open mouth is a mirror-reduced OPEN shell:
+    # its mouth rim is a real free edge that does not lie on any symmetry plane,
+    # so the default strict guard rejects it even when every cut plane is
+    # requested. The single-triangle quarter fixture reproduces this (its
+    # hypotenuse is off both X=0 and Y=0). Production opts these out via
+    # SolveConfig.native_check_open_edges=False; the strict default still
+    # protects closed meshes cut along an unrequested plane.
+    buffers = _tiny_yz_xz_parity_quarter_buffers()
+    with pytest.raises(MetalGeometryError, match="every open boundary edge"):
+        validate_native_symmetry_plane(buffers, "yz+xz")
+    assert (
+        validate_native_symmetry_plane(buffers, "yz+xz", check_open_edges=False)
+        == "yz+xz"
+    )
+
+
 def test_native_standard_session_invokes_swift_assembly(monkeypatch, tmp_path):
     _write_native_entrypoint(tmp_path)
     monkeypatch.setattr(native.platform, "system", lambda: "Darwin")

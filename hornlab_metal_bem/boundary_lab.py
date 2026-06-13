@@ -352,6 +352,18 @@ def solve_config_from_boundary_lab(
         "native_symmetry_plane": _coerce_symmetry_plane(
             _first(simulation_config, "symmetry", default="off")
         ),
+        # Open-shell meshes (a bare horn radiating from an open mouth) have a
+        # real free rim off the symmetry planes; the spec opts those out of the
+        # cut-plane open-edge guard. Defaults to the strict check for closed
+        # mirror-reduced meshes.
+        "native_check_open_edges": bool(
+            _first(
+                simulation_config,
+                "native_check_open_edges",
+                "check_open_edges",
+                default=True,
+            )
+        ),
         "observation": observation,
         "metal_native_assembly_mode": "corrected",
     }

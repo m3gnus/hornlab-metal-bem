@@ -497,6 +497,7 @@ def run_sweep_native_metal(
     with MetalNativeStandardSession.create_session(
         geometry_buffers=geometry_buffers,
         symmetry_plane=config.native_symmetry_plane,
+        check_open_edges=config.native_check_open_edges,
         runtime_status=runtime,
         extra_env=_native_env_overrides(config),
     ) as session:

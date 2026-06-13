@@ -49,6 +49,7 @@ def test_solve_config_default_native_metal_controls():
     assert cfg.complex_k_shift == 0.005
     assert cfg.impedance_sources == {}
     assert cfg.native_symmetry_plane is None
+    assert cfg.native_check_open_edges is True
     assert cfg.metal_native_assembly_mode == "corrected"
     assert cfg.return_surface_pressure is False
     assert cfg.metal_native_threads_per_group is None
@@ -107,6 +108,10 @@ def test_solve_config_accepts_native_symmetry_planes():
     assert SolveConfig(native_symmetry_plane="xz").native_symmetry_plane == "xz"
     assert SolveConfig(native_symmetry_plane="xy").native_symmetry_plane == "xy"
     assert SolveConfig(native_symmetry_plane="yz+xz").native_symmetry_plane == "yz+xz"
+
+
+def test_solve_config_accepts_native_check_open_edges_override():
+    assert SolveConfig(native_check_open_edges=False).native_check_open_edges is False
 
 
 @pytest.mark.parametrize(

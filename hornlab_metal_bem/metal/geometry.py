@@ -250,7 +250,10 @@ def _validate_open_edges_on_symmetry_planes(
     raise MetalGeometryError(
         f"native_symmetry_plane={symmetry_plane!r} requires every open boundary "
         f"edge to lie on {requested}; boundary edge {first} with vertices {edge} "
-        "is off the requested symmetry plane(s)"
+        "is off the requested symmetry plane(s). If this rim is a real free edge "
+        "of the full (reduced + mirrored) geometry (e.g. an open horn mouth), set "
+        "SolveConfig.native_check_open_edges=False (or pass check_open_edges=False "
+        "to create_session)."
     )
 
 

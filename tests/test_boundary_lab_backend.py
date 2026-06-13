@@ -32,6 +32,23 @@ def test_boundary_lab_config_defaults_to_native_metal():
     assert config.observation.planes == ["horizontal"]
 
 
+def test_boundary_lab_config_defaults_to_strict_open_edge_check():
+    config, _ = solve_config_from_boundary_lab({"symmetry": "yz+xz"})
+    assert config.native_check_open_edges is True
+
+
+def test_boundary_lab_config_forwards_open_edge_opt_out_for_open_shells():
+    config, _ = solve_config_from_boundary_lab(
+        {"symmetry": "yz+xz", "native_check_open_edges": False}
+    )
+    assert config.native_check_open_edges is False
+    # The validator-level alias is also accepted for spec authors.
+    alias, _ = solve_config_from_boundary_lab(
+        {"symmetry": "yz+xz", "check_open_edges": False}
+    )
+    assert alias.native_check_open_edges is False
+
+
 def test_boundary_lab_config_accepts_explicit_frequencies_and_overrides():
     source = SimpleNamespace(
         frequencies_hz=[1000.0, 1600.0],

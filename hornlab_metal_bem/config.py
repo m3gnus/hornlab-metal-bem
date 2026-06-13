@@ -84,6 +84,15 @@ class SolveConfig:
 
     # Native Metal controls
     native_symmetry_plane: NativeSymmetryPlane | None = None
+    # When True (default), a reduced-domain symmetry mesh must have every open
+    # boundary edge on a requested symmetry plane: a closed surface reduced by
+    # mirror cuts has its whole rim on the cut planes, so an off-plane open edge
+    # signals a mesh cut along an unrequested plane. Set False for open shells
+    # whose rim is a real free edge of the full (reduced + mirrored) geometry,
+    # e.g. a bare horn radiating from an open mouth. The caller that knows the
+    # mesh topology owns this choice; geometry alone cannot distinguish a
+    # legitimate mouth rim from a bad cut.
+    native_check_open_edges: bool = True
     metal_native_assembly_mode: MetalNativeAssemblyMode = "corrected"
     return_surface_pressure: bool = False
     metal_native_threads_per_group: int | None = None
