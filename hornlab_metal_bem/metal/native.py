@@ -1491,63 +1491,68 @@ class MetalNativeStandardSession:
         env = None
         if self._extra_env:
             env = {**os.environ, **self._extra_env}
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=status.backend_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env,
-            )
-        except OSError as exc:
-            raise RuntimeError(
-                f"Failed to launch Swift/Metal native helper: {exc}"
-            ) from exc
+        with tempfile.TemporaryFile(mode="w+b") as stdout_file, tempfile.TemporaryFile(
+            mode="w+b"
+        ) as stderr_file:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=status.backend_dir,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    env=env,
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Failed to launch Swift/Metal native helper: {exc}"
+                ) from exc
 
-        deadline = time.monotonic() + timeout_s if timeout_s is not None else None
-        try:
-            while True:
-                if poll():
-                    process.terminate()
-                    try:
-                        process.wait(timeout=10.0)
-                    except subprocess.TimeoutExpired:
+            deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+            try:
+                while True:
+                    if poll():
+                        process.terminate()
+                        try:
+                            process.wait(timeout=10.0)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+                        return False
+                    if process.poll() is not None:
+                        break
+                    if deadline is not None and time.monotonic() > deadline:
                         process.kill()
                         process.wait()
-                    return False
-                if process.poll() is not None:
-                    break
-                if deadline is not None and time.monotonic() > deadline:
+                        raise RuntimeError(
+                            f"Swift/Metal native helper timed out after {timeout_s}s "
+                            f"during {op}"
+                        )
+                    time.sleep(0.005)
+            except BaseException:
+                if process.poll() is None:
                     process.kill()
                     process.wait()
-                    raise RuntimeError(
-                        f"Swift/Metal native helper timed out after {timeout_s}s "
-                        f"during {op}"
-                    )
-                time.sleep(0.005)
-        except BaseException:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
-            raise
+                raise
 
-        stdout, stderr = process.communicate()
-        if process.returncode != 0:
-            message = (
-                (stderr or "").strip()
-                or (stdout or "").strip()
-                or f"Swift helper exited with {process.returncode}"
-            )
-            raise RuntimeError(
-                f"Swift/Metal native helper failed during {op}: {message}"
-            )
-        if not result_path.is_file():
-            raise RuntimeError(
-                f"Swift/Metal native helper did not write {result_path}"
-            )
-        # Consume case files written between the last poll and process exit.
-        return not poll()
+            if process.returncode != 0:
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                stdout = stdout_file.read().decode("utf-8", errors="replace")
+                stderr = stderr_file.read().decode("utf-8", errors="replace")
+                message = (
+                    stderr.strip()
+                    or stdout.strip()
+                    or f"Swift helper exited with {process.returncode}"
+                )
+                raise RuntimeError(
+                    f"Swift/Metal native helper failed during {op}: {message}"
+                )
+            if not result_path.is_file():
+                raise RuntimeError(
+                    f"Swift/Metal native helper did not write {result_path}"
+                )
+            # Consume case files written between the last poll and process exit.
+            return not poll()
 
 
 def _find_swift(

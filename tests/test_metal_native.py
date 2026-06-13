@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -3224,6 +3225,62 @@ def test_native_executable_streams_per_case_results(monkeypatch, tmp_path):
                 write_batched_field=True,
                 on_case_result=lambda i, solved: None,
             )
+
+
+def test_run_native_helper_streaming_spools_output_without_deadlock(tmp_path):
+    helper = tmp_path / "fake_native_helper.py"
+    helper.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "sys.stdout.write('o' * (2 * 1024 * 1024))\n"
+        "sys.stdout.flush()\n"
+        "sys.stderr.write('e' * (2 * 1024 * 1024))\n"
+        "sys.stderr.flush()\n"
+        "Path(sys.argv[-1]).write_text('{}', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    status = native.MetalNativeRuntimeStatus(
+        available=True,
+        platform_system="Darwin",
+        platform_machine="arm64",
+        is_macos=True,
+        is_apple_silicon=True,
+        swift_path=sys.executable,
+        swift_source="test",
+        helper_executable_path=None,
+        helper_source=None,
+        backend_dir=tmp_path,
+        native_entrypoint=helper,
+        native_package_dir=tmp_path / "native_helper",
+        helper_assets_present=True,
+        smoke_test_ran=False,
+        smoke_test_ok=True,
+        smoke_test_error=None,
+        reasons=(),
+    )
+    session = native.MetalNativeStandardSession(
+        native.MetalNativeSessionInfo(
+            session_id="streaming-output-test",
+            work_dir=tmp_path,
+            manifest_path=tmp_path / "session.json",
+            geometry_dir=tmp_path / "geometry",
+            runtime_status=status,
+        ),
+        geometry_payload=None,
+        owns_work_dir=False,
+        runtime_config=native.MetalNativeRuntimeConfig(operation_timeout_s=3.0),
+    )
+
+    result_path = tmp_path / "result.json"
+    completed = session._run_native_helper_streaming(
+        "assemble_solve_evaluate_standard_neumann_batch",
+        payload_path=tmp_path / "payload.json",
+        result_path=result_path,
+        poll=lambda: False,
+    )
+
+    assert completed is True
+    assert result_path.is_file()
 
 
 def test_native_executable_field_evaluation_on_tiny_mesh(tmp_path):
