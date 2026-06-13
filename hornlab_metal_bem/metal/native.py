@@ -266,6 +266,7 @@ class MetalNativeStandardSession:
         duffy_1d_order: int = 4,
         precision: str = "complex64",
         symmetry_plane: str | None = None,
+        check_open_edges: bool = True,
         runtime_status: MetalNativeRuntimeStatus | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> "MetalNativeStandardSession":
@@ -273,6 +274,12 @@ class MetalNativeStandardSession:
 
         Pass an already-validated ``runtime_status`` to skip the discovery
         smoke test (a helper subprocess) when the caller just ran one.
+
+        ``check_open_edges`` (default ``True``) enforces that every open
+        boundary edge of a symmetry-reduced mesh lies on a requested symmetry
+        plane. Pass ``False`` for open shells whose rim is a real free edge of
+        the full (reduced + mirrored) geometry; see
+        :func:`validate_native_symmetry_plane`.
         """
         from .geometry import build_metal_geometry_buffers
         from .geometry import validate_native_symmetry_plane
@@ -311,6 +318,7 @@ class MetalNativeStandardSession:
         symmetry_plane = validate_native_symmetry_plane(
             geometry_buffers,
             symmetry_plane,
+            check_open_edges=check_open_edges,
         )
 
         session_id = session_id or f"native-metal-{uuid4().hex[:12]}"

@@ -279,6 +279,37 @@ def _tiny_yz_half_buffers():
     )
 
 
+def _tiny_yz_parity_half_buffers():
+    # Single-triangle YZ half mesh whose mirror image across X=0 reconstructs
+    # the real side of _tiny_yz_full_buffers exactly. The even-mode parity
+    # SOLVE tests depend on this exact 1:1 mirror reduction (one DP0 element,
+    # three P1 dofs), so it is kept separate from the multi-triangle
+    # _tiny_yz_half_buffers fixture, which exists to exercise the open-rim
+    # symmetry-cut validation guard.
+    grid = SimpleNamespace(
+        vertices=np.array(
+            [
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=np.float64,
+        ),
+        elements=np.array([[0], [1], [2]], dtype=np.int64),
+        number_of_elements=1,
+    )
+    p1 = SimpleNamespace(
+        local2global=np.array([[0, 1, 2]], dtype=np.int64),
+        global_dof_count=3,
+    )
+    return build_metal_geometry_buffers(
+        grid,
+        np.array([2], dtype=np.int32),
+        p1,
+        SimpleNamespace(global_dof_count=1),
+    )
+
+
 def _tiny_xz_half_buffers():
     grid = SimpleNamespace(
         vertices=np.array(
@@ -357,6 +388,36 @@ def _tiny_yz_xz_quarter_buffers():
     )
 
 
+def _tiny_yz_xz_parity_quarter_buffers():
+    # Single-triangle YZ+XZ quarter mesh whose three mirror images reconstruct
+    # _tiny_yz_xz_full_buffers exactly. The even-mode parity SOLVE tests depend
+    # on this exact 1:1 quadrant reduction (one DP0 element, three P1 dofs), so
+    # it is kept separate from the multi-triangle _tiny_yz_xz_quarter_buffers
+    # fixture used by the symmetry-cut validation guard.
+    grid = SimpleNamespace(
+        vertices=np.array(
+            [
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=np.float64,
+        ),
+        elements=np.array([[0], [1], [2]], dtype=np.int64),
+        number_of_elements=1,
+    )
+    p1 = SimpleNamespace(
+        local2global=np.array([[0, 1, 2]], dtype=np.int64),
+        global_dof_count=3,
+    )
+    return build_metal_geometry_buffers(
+        grid,
+        np.array([2], dtype=np.int32),
+        p1,
+        SimpleNamespace(global_dof_count=1),
+    )
+
+
 def _tiny_yz_xz_full_buffers():
     grid = SimpleNamespace(
         vertices=np.array(
@@ -422,6 +483,37 @@ def _tiny_xy_half_buffers():
         np.array([2, 2, 2], dtype=np.int32),
         p1,
         SimpleNamespace(global_dof_count=3),
+    )
+
+
+def _tiny_xy_parity_half_buffers():
+    # Single-triangle XY half mesh whose mirror image across Z=0 reconstructs
+    # the real side of _tiny_xy_mirror_full_buffers and _tiny_xy_shared_full_buffers.
+    # It also doubles as the snapped-geometry reference for the near-plane-vertex
+    # test (the z=5e-7 vertex must snap onto this clean z=0 mesh). Kept separate
+    # from the multi-triangle _tiny_xy_half_buffers fixture used by the
+    # symmetry-cut validation guard.
+    grid = SimpleNamespace(
+        vertices=np.array(
+            [
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        ),
+        elements=np.array([[0], [1], [2]], dtype=np.int64),
+        number_of_elements=1,
+    )
+    p1 = SimpleNamespace(
+        local2global=np.array([[0, 1, 2]], dtype=np.int64),
+        global_dof_count=3,
+    )
+    return build_metal_geometry_buffers(
+        grid,
+        np.array([2], dtype=np.int32),
+        p1,
+        SimpleNamespace(global_dof_count=1),
     )
 
 
@@ -1436,10 +1528,11 @@ def test_native_executable_pair_atomic_corrected_yz_xz_matches_full_domain(
         )
 
     with MetalNativeStandardSession.create_session(
-        geometry_buffers=_tiny_yz_xz_quarter_buffers(),
+        geometry_buffers=_tiny_yz_xz_parity_quarter_buffers(),
         work_dir=tmp_path / "native-quarter-pair-atomic-yz-xz-session",
         session_id="native-quarter-pair-atomic-yz-xz-test",
         symmetry_plane="yz+xz",
+        check_open_edges=False,
     ) as quarter_session:
         quarter_assembly = quarter_session.assemble_standard_neumann(
             frequency_hz,
@@ -1760,10 +1853,11 @@ def test_native_executable_yz_symmetry_matches_even_full_domain_solve(
         )
 
     with MetalNativeStandardSession.create_session(
-        geometry_buffers=_tiny_yz_half_buffers(),
+        geometry_buffers=_tiny_yz_parity_half_buffers(),
         work_dir=tmp_path / "native-half-yz-session",
         session_id="native-half-yz-test",
         symmetry_plane="yz",
+        check_open_edges=False,
     ) as half_session:
         half_assembly = half_session.assemble_standard_neumann(
             frequency_hz,
@@ -1888,10 +1982,11 @@ def test_native_executable_yz_xz_symmetry_matches_even_full_domain_solve(
         )
 
     with MetalNativeStandardSession.create_session(
-        geometry_buffers=_tiny_yz_xz_quarter_buffers(),
+        geometry_buffers=_tiny_yz_xz_parity_quarter_buffers(),
         work_dir=tmp_path / "native-quarter-yz-xz-session",
         session_id="native-quarter-yz-xz-test",
         symmetry_plane="yz+xz",
+        check_open_edges=False,
     ) as quarter_session:
         quarter_assembly = quarter_session.assemble_standard_neumann(
             frequency_hz,
@@ -2055,10 +2150,11 @@ def test_native_executable_corrected_yz_xz_symmetry_applies_image_duffy(
         )
 
     with MetalNativeStandardSession.create_session(
-        geometry_buffers=_tiny_yz_xz_quarter_buffers(),
+        geometry_buffers=_tiny_yz_xz_parity_quarter_buffers(),
         work_dir=tmp_path / "native-quarter-corrected-yz-xz-session",
         session_id="native-quarter-corrected-yz-xz-test",
         symmetry_plane="yz+xz",
+        check_open_edges=False,
     ) as quarter_session:
         quarter_assembly = quarter_session.assemble_standard_neumann(
             frequency_hz,
@@ -2129,10 +2225,11 @@ def test_native_executable_xy_symmetry_matches_even_full_domain_solve(
         )
 
     with MetalNativeStandardSession.create_session(
-        geometry_buffers=_tiny_xy_half_buffers(),
+        geometry_buffers=_tiny_xy_parity_half_buffers(),
         work_dir=tmp_path / "native-half-xy-session",
         session_id="native-half-xy-test",
         symmetry_plane="xy",
+        check_open_edges=False,
     ) as half_session:
         half_assembly = half_session.assemble_standard_neumann(
             frequency_hz,
@@ -2257,10 +2354,11 @@ def test_native_executable_corrected_xy_symmetry_applies_image_duffy(
         )
 
     with MetalNativeStandardSession.create_session(
-        geometry_buffers=_tiny_xy_half_buffers(),
+        geometry_buffers=_tiny_xy_parity_half_buffers(),
         work_dir=tmp_path / "native-half-corrected-xy-session",
         session_id="native-half-corrected-xy-test",
         symmetry_plane="xy",
+        check_open_edges=False,
     ) as half_session:
         half_assembly = half_session.assemble_standard_neumann(
             frequency_hz,
@@ -2346,7 +2444,7 @@ def test_native_executable_xy_image_duffy_fires_for_near_plane_vertex(
     )
     np.testing.assert_array_equal(
         near_plane_buffers.vertices_3xn_f32,
-        _tiny_xy_half_buffers().vertices_3xn_f32,
+        _tiny_xy_parity_half_buffers().vertices_3xn_f32,
     )
 
     with MetalNativeStandardSession.create_session(
@@ -2354,6 +2452,7 @@ def test_native_executable_xy_image_duffy_fires_for_near_plane_vertex(
         work_dir=tmp_path / "native-near-plane-xy-session",
         session_id="native-near-plane-xy-test",
         symmetry_plane="xy",
+        check_open_edges=False,
     ) as session:
         assembly = session.assemble_standard_neumann(
             100.0,
