@@ -201,8 +201,9 @@ stretched by concurrent command buffers and overstate kernel cost (use the
 sequential assembly-only batch op for kernel A/B), and amortizing the
 k-independent pair geometry across wavenumbers in one kernel does not pay on
 M-series GPUs — the kernel is throughput-saturated independent of that
-geometry, and multi-wavenumber accumulator state collapses occupancy (see
-branch `experiment/multik-assembly`).
+geometry, and multi-wavenumber accumulator state collapses occupancy from K=4
+up (a prototype multi-k assembly kernel was measured at ~2x single-k cost for
+K=4 and rejected; K=2 only broke even).
 
 For experimental `complex_k` and Robin cases the combined op uses the
 optimized Metal kernels in `optimized`/`corrected` modes, including the
