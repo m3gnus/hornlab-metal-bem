@@ -38,13 +38,16 @@ print(result.directivity_db.shape)
 print(result.impedance.shape)
 ```
 
-Recent ASRO2 corrected-quarter benchmark from HornLab:
+Recent ASRO2 corrected-quarter benchmark (HornLab, Apple M-series):
 
 - 40 frequencies
-- 3 planes x 37 angles
-- about 5.14 s wall time
-- pressure/directivity parity exact against the corrected baseline
-- impedance relative L2 max about `8.24e-9`
+- 3 planes x 37 angles (996-dof `yz+xz` quarter mesh)
+- about 2 s end-to-end `solve()` wall time — GPU-assembly-bound, with
+  pipelined GPU assembly overlapping a concurrent dense-solve worker pool
+  (`HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY`, default 6)
+- corrected assembly matches the subdivided-quadrature reference to `< 1e-4`
+  relative L2 (matrix and RHS), and the `yz+xz` quarter matches the
+  full-domain solve
 
 ## Inputs
 
