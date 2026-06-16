@@ -90,6 +90,32 @@ class SolveConfig:
     # Neumann skip set as a safety net, but declaring is the documented rule.)
     impedance_source_callback: Callable[[float], dict[int, complex]] | None = None
 
+    # CHIEF (Combined Helmholtz Interior-integral Equation Formulation) points:
+    # interior overdetermination points placed *inside* the modeled body's
+    # cavities (e.g. an LF front chamber / port volume). Each adds one interior
+    # null-field constraint row; the combined system is solved by least squares
+    # (zgels, complex128), which removes the exterior-BIE fictitious-eigenvalue
+    # non-uniqueness that makes an LF-driven solve blow up at an interior-mode
+    # frequency. Shape (m, 3) in metres, in the SAME frame as the mesh vertices.
+    # None disables CHIEF (the default; bit-unchanged from the plain solve).
+    #
+    # Placement guidance: put points in the interior bulk of each enclosed cavity
+    # that hosts the spurious mode (4-12 total is standard; start with ~6). Stay
+    # strictly inside the watertight surface and ~1 element edge away from the
+    # wall (a point too near the boundary makes G(x_c, y) near-singular and
+    # pollutes the row). With native_symmetry_plane set, the modeled domain is a
+    # reduced wedge and the helper adds analytic images: give points in the
+    # reduced frame, inside the reduced cavity, and OFF the symmetry planes (so a
+    # point is not self-cancelled by its image). CHIEF composes with both the
+    # 'standard' and 'complex_k' formulations. The least-squares path runs in
+    # float64 regardless of dense_solve_dtype.
+    chief_points: NDArray[np.float64] | None = None
+    # Relative weight applied to the CHIEF rows before the least-squares solve.
+    # 1.0 (default) auto-scales each case by ||A||_inf/||C||_inf in the helper so
+    # the collocation CHIEF rows are numerically comparable to the Galerkin
+    # boundary rows; override only to bias the interior constraint harder/softer.
+    chief_weight: float = 1.0
+
     # Observation
     observation: ObservationConfig = field(default_factory=ObservationConfig)
 
@@ -182,6 +208,18 @@ class SolveConfig:
             beta_value = complex(beta)
             if not math.isfinite(beta_value.real) or not math.isfinite(beta_value.imag):
                 raise ValueError("impedance_sources values must be finite complex numbers")
+        if self.chief_points is not None:
+            import numpy as _np
+
+            pts = _np.asarray(self.chief_points, dtype=float)
+            if pts.ndim != 2 or pts.shape[1] != 3:
+                raise ValueError("chief_points must have shape (m, 3)")
+            if pts.shape[0] == 0:
+                raise ValueError("chief_points must be non-empty when set")
+            if not _np.all(_np.isfinite(pts)):
+                raise ValueError("chief_points must be finite")
+        if self.chief_weight <= 0:
+            raise ValueError("chief_weight must be positive")
         if (
             self.native_symmetry_plane is not None
             and self.native_symmetry_plane not in NATIVE_SYMMETRY_PLANES

@@ -151,3 +151,172 @@ def test_impedance_source_callback_passivity_guard_through_solve():
     )
     with pytest.raises(ValueError, match="passive"):
         metal_bem.solve_frequencies(mesh, [180.0], config)
+
+
+# CHIEF interior overdetermination points for the unit-sphere closed cavity:
+# off-axis, off the symmetry planes, in the interior bulk (well away from the
+# r=1 wall). Eight points to avoid all of them landing on a nodal surface of the
+# interior eigenmode.
+_UNIT_SPHERE_CHIEF_POINTS = np.array(
+    [
+        [0.20, 0.15, 0.10],
+        [-0.15, 0.20, -0.10],
+        [0.10, -0.20, 0.15],
+        [-0.10, -0.15, -0.20],
+        [0.25, -0.10, 0.05],
+        [-0.05, 0.10, 0.25],
+        [0.00, 0.30, 0.05],
+        [0.30, 0.00, -0.05],
+    ],
+    dtype=np.float64,
+)
+
+
+def _unit_sphere_fictitious_resonance_hz() -> tuple[float, float, float]:
+    """Locate the strongest exterior-BIE fictitious-eigenvalue dip of the
+    128-triangle unit sphere by the dense-solve rcond minimum over a band, and
+    return (resonance_hz, rcond_min, rcond_median)."""
+    from tests.test_complex_k_resonance import _unit_sphere_mesh
+
+    mesh = _unit_sphere_mesh()
+    observation = metal_bem.ObservationConfig(
+        planes=["probe"],
+        angle_count=2,
+        custom_points={
+            "probe": np.array([[0.0, 0.0, 2.2], [0.6, 0.0, 2.1]], dtype=np.float64)
+        },
+    )
+    freqs = np.linspace(240.0, 265.0, 26)
+    result = metal_bem.solve_frequencies(
+        mesh,
+        freqs,
+        metal_bem.native_config(velocity_sources={2: 1.0}, observation=observation),
+    )
+    rcond = np.array(
+        [d["dense_solve_rcond"] for d in result.native_diagnostics], dtype=np.float64
+    )
+    idx = int(np.argmin(rcond))
+    return float(freqs[idx]), float(rcond[idx]), float(np.median(rcond))
+
+
+@pytest.mark.slow
+def test_chief_matches_complex_k_at_fictitious_resonance():
+    """At the unit sphere's exterior-BIE fictitious eigenfrequency the plain
+    standard solve is contaminated by the spurious interior mode. CHIEF (interior
+    overdetermination -> least squares) and complex_k (the independent
+    wavenumber-shift cure) must both remove that contamination and converge to
+    the SAME physical exterior pressure. Agreement of two unrelated cures is the
+    strong check that the CHIEF row math (Robin fold sign, +G*g_drv RHS, mirror
+    images, real-k kernels) is correct."""
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+    from tests.test_complex_k_resonance import _unit_sphere_mesh
+
+    fres, rcond_min, rcond_median = _unit_sphere_fictitious_resonance_hz()
+    # Confirm there really is a fictitious dip to cure at the located frequency.
+    assert rcond_min < 0.25 * rcond_median
+
+    mesh = _unit_sphere_mesh()
+    observation = metal_bem.ObservationConfig(
+        planes=["probe"],
+        angle_count=2,
+        custom_points={
+            "probe": np.array([[0.0, 0.0, 2.2], [0.6, 0.0, 2.1]], dtype=np.float64)
+        },
+    )
+    base = dict(velocity_sources={2: 1.0}, observation=observation)
+
+    standard = metal_bem.solve_frequencies(
+        mesh, [fres], metal_bem.native_config(**base)
+    )
+    chief = metal_bem.solve_frequencies(
+        mesh,
+        [fres],
+        metal_bem.native_config(**base, chief_points=_UNIT_SPHERE_CHIEF_POINTS),
+    )
+    complex_k = metal_bem.solve_frequencies(
+        mesh,
+        [fres],
+        metal_bem.native_config(
+            **base, formulation="complex_k", complex_k_shift=0.02
+        ),
+    )
+
+    chief_diag = chief.native_diagnostics[0]
+    assert chief_diag["chief_points"] is True
+    assert chief_diag["chief_points_count"] == _UNIT_SPHERE_CHIEF_POINTS.shape[0]
+    assert chief_diag["chief_solver"] == "accelerate_lapack_zgels"
+    assert np.isfinite(chief_diag["chief_residual_rel"])
+    assert np.all(np.isfinite(chief.pressure_complex))
+
+    p_std = complex(standard.pressure_complex[0, 0, 0])
+    p_chief = complex(chief.pressure_complex[0, 0, 0])
+    p_ck = complex(complex_k.pressure_complex[0, 0, 0])
+
+    # The two cures agree closely; the contaminated standard solve is further off.
+    rel_chief_ck = abs(p_chief - p_ck) / abs(p_ck)
+    rel_std_ck = abs(p_std - p_ck) / abs(p_ck)
+    assert rel_chief_ck < 0.05
+    assert rel_chief_ck < rel_std_ck
+
+
+@pytest.mark.slow
+def test_chief_monotonic_in_beta_at_interior_mode():
+    """Cross-feature regression for the documented LF blow-up: on a closed cavity
+    at an exterior-BIE fictitious-eigenvalue frequency, with CHIEF points placed
+    inside the cavity, the on-resonance on-axis pressure magnitude must be
+    NON-INCREASING as a passive wall admittance beta increases. Without the CHIEF
+    cure, increasing beta moves the spurious eigenvalue and produces a
+    non-monotone bump; with CHIEF, more passive admittance can only ever reduce
+    the resonant peak."""
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+    from tests.test_complex_k_resonance import _unit_sphere_mesh
+
+    fres, rcond_min, rcond_median = _unit_sphere_fictitious_resonance_hz()
+    assert rcond_min < 0.25 * rcond_median
+
+    mesh = _unit_sphere_mesh()
+    observation = metal_bem.ObservationConfig(
+        planes=["probe"],
+        angle_count=2,
+        custom_points={
+            "probe": np.array([[0.0, 0.0, 2.2], [0.6, 0.0, 2.1]], dtype=np.float64)
+        },
+    )
+
+    betas = [0.0, 0.02, 0.05, 0.10, 0.20]
+    amplitudes: list[float] = []
+    for beta in betas:
+        result = metal_bem.solve_frequencies(
+            mesh,
+            [fres],
+            metal_bem.native_config(
+                velocity_sources={2: 1.0},
+                observation=observation,
+                # Tag 1 is the rigid bulk of the sphere; make it the passive
+                # lossy wall whose admittance we ramp.
+                impedance_sources={1: beta + 0.0j},
+                chief_points=_UNIT_SPHERE_CHIEF_POINTS,
+            ),
+        )
+        assert result.native_diagnostics[0]["robin_boundary"] is True
+        assert result.native_diagnostics[0]["chief_points"] is True
+        amplitudes.append(float(np.abs(result.pressure_complex[0, 0, 0])))
+
+    # Strictly non-increasing (a tiny positive tolerance absorbs f32 narrowing).
+    diffs = np.diff(np.asarray(amplitudes))
+    assert np.all(diffs <= 1e-6), (
+        f"on-resonance on-axis |p| not non-increasing in beta at {fres:.1f} Hz: "
+        f"betas={betas} -> |p|={amplitudes}"
+    )
+    # And the constraint must actually bite: max admittance reduces the peak.
+    assert amplitudes[-1] < amplitudes[0]

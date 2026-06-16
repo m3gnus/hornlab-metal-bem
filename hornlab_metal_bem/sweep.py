@@ -547,6 +547,14 @@ def run_sweep_native_metal(
     impedance_sources_arg = _impedance_sources_for_frequencies(
         mesh.physical_tags, frequencies, config
     )
+    # CHIEF interior overdetermination points, (m, 3) metres in the mesh frame.
+    # Marshal to the (3, m) float32 layout the helper reader expects (same as the
+    # observation points). None leaves the solve a plain square LU/zgesv solve.
+    chief_points_3xm = None
+    if config.chief_points is not None:
+        chief_points_3xm = np.ascontiguousarray(
+            np.asarray(config.chief_points, dtype=np.float64).T, dtype=np.float32
+        )
     surface_pavg: dict[int, list[complex]] = {tag: [] for tag in source_tags}
     pressure_rows: list[NDArray[np.complex128]] = []
     spl_rows: list[NDArray[np.float64]] = []
@@ -597,6 +605,8 @@ def run_sweep_native_metal(
                 write_surface_pressure=config.return_surface_pressure,
                 write_batched_field=True,
                 dense_solve_dtype=config.dense_solve_dtype,
+                chief_points=chief_points_3xm,
+                chief_weight=config.chief_weight,
             )
             field_batch_complex: NDArray[np.complex128] | None = None
             if systems and systems[0].field_row_index is not None:
@@ -735,6 +745,8 @@ def run_sweep_native_metal(
                 write_surface_pressure=config.return_surface_pressure,
                 on_case_result=_on_case_result,
                 dense_solve_dtype=config.dense_solve_dtype,
+                chief_points=chief_points_3xm,
+                chief_weight=config.chief_weight,
             )
 
     sp_avg: dict[int, np.ndarray] = {}

@@ -745,6 +745,8 @@ class MetalNativeStandardSession:
         write_batched_field: bool = False,
         on_case_result: Any | None = None,
         dense_solve_dtype: str = "float32",
+        chief_points: NDArray[Any] | None = None,
+        chief_weight: float = 1.0,
     ) -> list[Any]:
         """Assemble, solve, and evaluate field in one resident helper run.
 
@@ -865,6 +867,29 @@ class MetalNativeStandardSession:
             dtype=np.float32,
             relative_to=self.info.work_dir,
         )
+        # Shared CHIEF interior overdetermination points (3, m) f32, written once
+        # like obs_points. When present, every case's dense solve becomes an
+        # overdetermined least-squares (zgels) solve in the helper. The kwarg
+        # presence also drives the capability handshake (expect_chief) so a stale
+        # binary that predates CHIEF errors loudly instead of silently ignoring it.
+        chief_desc = None
+        expect_chief = chief_points is not None
+        if expect_chief:
+            chief_arr = np.asarray(chief_points, dtype=np.float32)
+            if chief_arr.ndim != 2 or chief_arr.shape[0] != 3:
+                raise ValueError("chief_points must have shape (3, m)")
+            if chief_arr.shape[1] == 0:
+                raise ValueError("chief_points must be non-empty when set")
+            if not np.all(np.isfinite(chief_arr)):
+                raise ValueError("chief_points must be finite")
+            if float(chief_weight) <= 0:
+                raise ValueError("chief_weight must be positive")
+            chief_desc = write_binary_array(
+                np.ascontiguousarray(chief_arr),
+                inputs_dir / "chief_points_3xm_f32.bin",
+                dtype=np.float32,
+                relative_to=self.info.work_dir,
+            )
         n = self.geometry_payload.p1_dof_count
         batch_outputs: dict[str, Any] | None = None
         if write_batched_field:
@@ -955,6 +980,14 @@ class MetalNativeStandardSession:
                         if impedance_payloads[idx]
                         else {}
                     ),
+                    **(
+                        {
+                            "chief_points": chief_desc.to_manifest(),
+                            "chief_weight": float(chief_weight),
+                        }
+                        if chief_desc is not None
+                        else {}
+                    ),
                 }
             )
 
@@ -986,6 +1019,7 @@ class MetalNativeStandardSession:
                 expect_complex_k=expect_complex_k,
                 expect_robin=expect_robin,
                 expect_float64=expect_float64,
+                expect_chief=expect_chief,
             )
 
         self._run_native_helper(
@@ -1007,6 +1041,7 @@ class MetalNativeStandardSession:
                 expect_complex_k=expect_complex_k,
                 expect_robin=expect_robin,
                 expect_float64=expect_float64,
+                expect_chief=expect_chief,
             )
             for case_result in case_results
         ]
@@ -1018,6 +1053,7 @@ class MetalNativeStandardSession:
         expect_complex_k: bool = False,
         expect_robin: bool = False,
         expect_float64: bool = False,
+        expect_chief: bool = False,
     ) -> Any:
         from .session import DenseSolveFieldResult
 
@@ -1047,6 +1083,14 @@ class MetalNativeStandardSession:
             raise RuntimeError(
                 "native helper acknowledged no float64 dense-solve support; the "
                 "helper binary predates dense_solve_dtype. Rebuild with "
+                "`swift build -c release` in "
+                "hornlab_metal_bem/metal/native_helper or unset "
+                "HORNLAB_METAL_BEM_NATIVE."
+            )
+        if expect_chief and diagnostics.get("chief_points") is not True:
+            raise RuntimeError(
+                "native helper acknowledged no CHIEF support; the helper binary "
+                "predates chief_points. Rebuild with "
                 "`swift build -c release` in "
                 "hornlab_metal_bem/metal/native_helper or unset "
                 "HORNLAB_METAL_BEM_NATIVE."
@@ -1103,6 +1147,7 @@ class MetalNativeStandardSession:
         expect_complex_k: bool = False,
         expect_robin: bool = False,
         expect_float64: bool = False,
+        expect_chief: bool = False,
     ) -> list[Any]:
         """Run one batch helper invocation, firing callbacks per case.
 
@@ -1131,6 +1176,7 @@ class MetalNativeStandardSession:
                     expect_complex_k=expect_complex_k,
                     expect_robin=expect_robin,
                     expect_float64=expect_float64,
+                    expect_chief=expect_chief,
                 )
                 solved_fields.append(solved)
                 if on_case_result(len(solved_fields) - 1, solved) is False:
@@ -1162,6 +1208,7 @@ class MetalNativeStandardSession:
                 expect_complex_k=expect_complex_k,
                 expect_robin=expect_robin,
                 expect_float64=expect_float64,
+                expect_chief=expect_chief,
             )
             solved_fields.append(solved)
             if on_case_result(index, solved) is False:
@@ -1814,6 +1861,10 @@ def _native_case_diagnostics(
         "dense_solve_refine_iterations",
         "dense_solve_refine_residual_rel",
         "dense_solve_dtype",
+        "chief_points",
+        "chief_points_count",
+        "chief_residual_rel",
+        "chief_solver",
         "assembly_k_imag_f32",
         "field_k_real_f32",
         "complex_k",

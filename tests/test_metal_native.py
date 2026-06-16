@@ -2910,6 +2910,122 @@ def test_native_executable_float64_and_float32_dense_solve_agree(
     assert rel < 1e-4
 
 
+def test_native_executable_chief_points_diagnostics(monkeypatch, tmp_path):
+    """CHIEF interior points route through the evaluate batch: the helper solves
+    the overdetermined system by zgels and emits the chief diagnostics. The
+    solved pressure stays finite and the chief residual is reported."""
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
+    neumann = np.array([[1.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j]], dtype=np.complex64)
+    frequency_hz = np.array([172.0], dtype=np.float64)
+    k_real = np.array([np.float32(2.0 * np.pi * 172.0 / 343.0)], dtype=np.float32)
+    observation_points = np.array(
+        [[0.0, 0.0, 0.7], [0.2, 0.0, 0.8]],
+        dtype=np.float32,
+    )
+    # Interior overdetermination points (m, 3) in the mesh frame; marshalled to
+    # the (3, m) f32 layout the helper expects, exactly as sweep.run does.
+    chief_points = np.array(
+        [[0.02, 0.03, 0.05], [-0.03, 0.02, 0.04], [0.01, -0.02, 0.06]],
+        dtype=np.float64,
+    )
+    chief_3xm = np.ascontiguousarray(chief_points.T, dtype=np.float32)
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_robin_geometry_buffers(),
+        work_dir=tmp_path / "native-chief-session",
+        session_id="native-chief-test",
+    ) as session:
+        solved = session.assemble_solve_evaluate_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            neumann,
+            observation_points,
+            operation_id="resident-chief",
+            source_tags=[2],
+            impedance_source_tag=2,
+            chief_points=chief_3xm,
+        )[0]
+
+    pressure = np.fromfile(solved.pressure_real_f32, dtype="<f4") + 1j * np.fromfile(
+        solved.pressure_imag_f32,
+        dtype="<f4",
+    )
+    field = np.fromfile(solved.field_real_f32, dtype="<f4") + 1j * np.fromfile(
+        solved.field_imag_f32,
+        dtype="<f4",
+    )
+
+    assert solved.lapack_info == 0
+    assert np.all(np.isfinite(pressure))
+    assert np.all(np.isfinite(field))
+    assert solved.diagnostics["chief_points"] is True
+    assert solved.diagnostics["chief_points_count"] == 3
+    assert solved.diagnostics["chief_solver"] == "accelerate_lapack_zgels"
+    assert solved.diagnostics["solve_implementation"] == "accelerate_lapack_zgels"
+    # The least-squares path runs in float64 regardless of dense_solve_dtype.
+    assert solved.diagnostics["dense_solve_dtype"] == "float64"
+    assert np.isfinite(solved.diagnostics["chief_residual_rel"])
+    assert solved.diagnostics["chief_residual_rel"] >= 0.0
+
+
+def test_native_executable_chief_off_matches_plain_solve(monkeypatch, tmp_path):
+    """chief_points=None (the default) must leave the solve bit-for-bit identical
+    to the plain square-LU path: same pressure, same square solver, and no chief
+    diagnostic keys."""
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE", "float32")
+    neumann = np.array([[1.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j]], dtype=np.complex64)
+    frequency_hz = np.array([172.0], dtype=np.float64)
+    k_real = np.array([np.float32(2.0 * np.pi * 172.0 / 343.0)], dtype=np.float32)
+    observation_points = np.array(
+        [[0.0, 0.0, 0.7], [0.2, 0.0, 0.8]],
+        dtype=np.float32,
+    )
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_robin_geometry_buffers(),
+        work_dir=tmp_path / "native-chief-off-session",
+        session_id="native-chief-off-test",
+    ) as session:
+        solved = session.assemble_solve_evaluate_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            neumann,
+            observation_points,
+            operation_id="resident-chief-off",
+            source_tags=[2],
+            impedance_source_tag=2,
+        )[0]
+
+    pressure = np.fromfile(solved.pressure_real_f32, dtype="<f4") + 1j * np.fromfile(
+        solved.pressure_imag_f32,
+        dtype="<f4",
+    )
+    assert solved.lapack_info == 0
+    assert np.all(np.isfinite(pressure))
+    # The default square-LU path (cgesv), not the CHIEF least-squares path.
+    assert solved.diagnostics["solve_implementation"] == "accelerate_lapack_cgesv"
+    assert "chief_points" not in solved.diagnostics
+    assert "chief_residual_rel" not in solved.diagnostics
+    assert "chief_solver" not in solved.diagnostics
+
+
 def test_native_executable_resident_assembly_solve_lu_factor_variant_matches_python(
     monkeypatch,
     tmp_path,

@@ -452,3 +452,53 @@ def test_dense_solve_dtype_float64_respects_pinned_concurrency(monkeypatch):
     monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY", "6")
     overrides = _native_env_overrides(SolveConfig(dense_solve_dtype="float64"))
     assert "HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY" not in overrides
+
+
+def test_chief_points_default_is_none():
+    # CHIEF is opt-in; the default leaves the solve a plain square LU.
+    cfg = SolveConfig()
+    assert cfg.chief_points is None
+    assert cfg.chief_weight == 1.0
+
+
+def test_chief_points_valid_shape_accepted():
+    import numpy as np
+
+    pts = np.array([[0.01, 0.02, 0.03], [-0.01, 0.0, 0.04]], dtype=np.float64)
+    cfg = SolveConfig(chief_points=pts, chief_weight=2.5)
+    assert cfg.chief_points.shape == (2, 3)
+    assert cfg.chief_weight == 2.5
+
+
+def test_chief_points_wrong_shape_rejected():
+    import numpy as np
+
+    with pytest.raises(ValueError, match=r"chief_points must have shape \(m, 3\)"):
+        SolveConfig(chief_points=np.zeros((3, 2), dtype=np.float64))
+    with pytest.raises(ValueError, match=r"chief_points must have shape \(m, 3\)"):
+        SolveConfig(chief_points=np.zeros((4,), dtype=np.float64))
+
+
+def test_chief_points_empty_rejected():
+    import numpy as np
+
+    with pytest.raises(ValueError, match="chief_points must be non-empty"):
+        SolveConfig(chief_points=np.zeros((0, 3), dtype=np.float64))
+
+
+def test_chief_points_non_finite_rejected():
+    import numpy as np
+
+    pts = np.array([[0.0, 0.0, 0.0], [np.nan, 0.0, 0.0]], dtype=np.float64)
+    with pytest.raises(ValueError, match="chief_points must be finite"):
+        SolveConfig(chief_points=pts)
+
+
+def test_chief_weight_non_positive_rejected():
+    import numpy as np
+
+    pts = np.array([[0.01, 0.02, 0.03]], dtype=np.float64)
+    with pytest.raises(ValueError, match="chief_weight must be positive"):
+        SolveConfig(chief_points=pts, chief_weight=0.0)
+    with pytest.raises(ValueError, match="chief_weight must be positive"):
+        SolveConfig(chief_points=pts, chief_weight=-1.0)
