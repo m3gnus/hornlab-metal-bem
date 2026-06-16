@@ -103,9 +103,19 @@ def _native_env_overrides(config: SolveConfig) -> dict[str, str]:
     """
     overrides: dict[str, str] = {
         "HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE": config.metal_native_assembly_mode,
+        "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE": config.dense_solve_dtype,
     }
     if os.environ.get("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE") is None:
         overrides["HORNLAB_METAL_BEM_NATIVE_FIELD_MODE"] = "optimized"
+    # complex128 zgesv holds a doublecomplex column-major copy alongside the
+    # float32 row-major operator, roughly tripling peak solve memory. Lower the
+    # default solve concurrency for the float64 path unless the caller pinned it
+    # (via the env var on os.environ), keeping peak memory bounded.
+    if (
+        config.dense_solve_dtype == "float64"
+        and os.environ.get("HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY") is None
+    ):
+        overrides["HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY"] = "3"
     threadgroup_values = {
         "HORNLAB_METAL_BEM_NATIVE_THREADS_PER_GROUP": (
             config.metal_native_threads_per_group
@@ -586,6 +596,7 @@ def run_sweep_native_metal(
                 impedance_source_tag=impedance_source_tag,
                 write_surface_pressure=config.return_surface_pressure,
                 write_batched_field=True,
+                dense_solve_dtype=config.dense_solve_dtype,
             )
             field_batch_complex: NDArray[np.complex128] | None = None
             if systems and systems[0].field_row_index is not None:
@@ -723,6 +734,7 @@ def run_sweep_native_metal(
                 impedance_source_tag=impedance_source_tag,
                 write_surface_pressure=config.return_surface_pressure,
                 on_case_result=_on_case_result,
+                dense_solve_dtype=config.dense_solve_dtype,
             )
 
     sp_avg: dict[int, np.ndarray] = {}

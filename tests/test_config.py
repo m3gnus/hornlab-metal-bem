@@ -407,3 +407,48 @@ def test_solve_config_callbacks_accept_callables():
     cfg.progress_callback(0, 5, 1000.0)
     assert calls == [("progress", 0)]
     assert cfg.on_frequency_result(0, 1000.0, {}) is True
+
+
+def test_solve_config_dense_solve_dtype_defaults_float32():
+    assert SolveConfig().dense_solve_dtype == "float32"
+
+
+def test_solve_config_dense_solve_dtype_rejects_unknown():
+    with pytest.raises(ValueError, match="dense_solve_dtype"):
+        SolveConfig(dense_solve_dtype="float16")
+
+
+def test_dense_solve_dtype_float32_not_in_native_env(monkeypatch):
+    # The default float32 path must not lower concurrency or otherwise diverge
+    # from the historical env (it still sets the dtype env explicitly, which the
+    # helper treats as its default).
+    from hornlab_metal_bem.sweep import _native_env_overrides
+
+    monkeypatch.delenv(
+        "HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY", raising=False
+    )
+    overrides = _native_env_overrides(SolveConfig())
+    assert overrides["HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE"] == "float32"
+    assert "HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY" not in overrides
+
+
+def test_dense_solve_dtype_float64_plumbs_through_native_env(monkeypatch):
+    # float64 routes via env var and lowers the default solve concurrency to
+    # bound the ~3x complex128 peak memory, unless the caller pinned it.
+    from hornlab_metal_bem.sweep import _native_env_overrides
+
+    monkeypatch.delenv(
+        "HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY", raising=False
+    )
+    overrides = _native_env_overrides(SolveConfig(dense_solve_dtype="float64"))
+    assert overrides["HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE"] == "float64"
+    assert overrides["HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY"] == "3"
+
+
+def test_dense_solve_dtype_float64_respects_pinned_concurrency(monkeypatch):
+    # A caller-pinned concurrency env must win over the float64 auto-lowering.
+    from hornlab_metal_bem.sweep import _native_env_overrides
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY", "6")
+    overrides = _native_env_overrides(SolveConfig(dense_solve_dtype="float64"))
+    assert "HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY" not in overrides

@@ -744,6 +744,7 @@ class MetalNativeStandardSession:
         write_surface_pressure: bool = True,
         write_batched_field: bool = False,
         on_case_result: Any | None = None,
+        dense_solve_dtype: str = "float32",
     ) -> list[Any]:
         """Assemble, solve, and evaluate field in one resident helper run.
 
@@ -835,6 +836,13 @@ class MetalNativeStandardSession:
             impedance_payloads = [shared] * int(frequencies.size)
         expect_complex_k = bool(np.any(k_imag_values != 0.0))
         expect_robin = any(payload is not None for payload in impedance_payloads)
+        if dense_solve_dtype not in {"float32", "float64"}:
+            raise ValueError("dense_solve_dtype must be 'float32' or 'float64'")
+        # The dtype routes to the helper via env var (HORNLAB_METAL_BEM_NATIVE_
+        # DENSE_SOLVE_DTYPE) set sweep-globally in sweep._native_env_overrides;
+        # this kwarg only drives the capability handshake so a stale binary that
+        # predates float64 support errors loudly instead of silently running f32.
+        expect_float64 = dense_solve_dtype == "float64"
 
         points_3xn = _require_observation_points_3xn(observation_points)
         n_obs = int(points_3xn.shape[1])
@@ -977,6 +985,7 @@ class MetalNativeStandardSession:
                 on_case_result=on_case_result,
                 expect_complex_k=expect_complex_k,
                 expect_robin=expect_robin,
+                expect_float64=expect_float64,
             )
 
         self._run_native_helper(
@@ -997,6 +1006,7 @@ class MetalNativeStandardSession:
                 batch_diagnostics,
                 expect_complex_k=expect_complex_k,
                 expect_robin=expect_robin,
+                expect_float64=expect_float64,
             )
             for case_result in case_results
         ]
@@ -1007,6 +1017,7 @@ class MetalNativeStandardSession:
         batch_diagnostics: dict[str, Any],
         expect_complex_k: bool = False,
         expect_robin: bool = False,
+        expect_float64: bool = False,
     ) -> Any:
         from .session import DenseSolveFieldResult
 
@@ -1028,6 +1039,14 @@ class MetalNativeStandardSession:
             raise RuntimeError(
                 "native helper acknowledged no Robin boundary support; the "
                 "helper binary predates impedance_sources. Rebuild with "
+                "`swift build -c release` in "
+                "hornlab_metal_bem/metal/native_helper or unset "
+                "HORNLAB_METAL_BEM_NATIVE."
+            )
+        if expect_float64 and diagnostics.get("dense_solve_dtype") != "float64":
+            raise RuntimeError(
+                "native helper acknowledged no float64 dense-solve support; the "
+                "helper binary predates dense_solve_dtype. Rebuild with "
                 "`swift build -c release` in "
                 "hornlab_metal_bem/metal/native_helper or unset "
                 "HORNLAB_METAL_BEM_NATIVE."
@@ -1083,6 +1102,7 @@ class MetalNativeStandardSession:
         on_case_result: Any,
         expect_complex_k: bool = False,
         expect_robin: bool = False,
+        expect_float64: bool = False,
     ) -> list[Any]:
         """Run one batch helper invocation, firing callbacks per case.
 
@@ -1110,6 +1130,7 @@ class MetalNativeStandardSession:
                     {},
                     expect_complex_k=expect_complex_k,
                     expect_robin=expect_robin,
+                    expect_float64=expect_float64,
                 )
                 solved_fields.append(solved)
                 if on_case_result(len(solved_fields) - 1, solved) is False:
@@ -1140,6 +1161,7 @@ class MetalNativeStandardSession:
                 batch_diagnostics,
                 expect_complex_k=expect_complex_k,
                 expect_robin=expect_robin,
+                expect_float64=expect_float64,
             )
             solved_fields.append(solved)
             if on_case_result(index, solved) is False:
@@ -1791,6 +1813,7 @@ def _native_case_diagnostics(
         "dense_solve_condition_1norm",
         "dense_solve_refine_iterations",
         "dense_solve_refine_residual_rel",
+        "dense_solve_dtype",
         "assembly_k_imag_f32",
         "field_k_real_f32",
         "complex_k",

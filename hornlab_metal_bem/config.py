@@ -110,6 +110,15 @@ class SolveConfig:
     # legitimate mouth rim from a bad cut.
     native_check_open_edges: bool = True
     metal_native_assembly_mode: MetalNativeAssemblyMode = "corrected"
+    # Dense LU precision. "float32" (default) matches the historical Complex32
+    # LU. "float64" factors/solves the float32-assembled system in complex128
+    # (Accelerate zgesv) to recover the 3-4 digits float32 LU loses near a
+    # near-singular system, then narrows the solved pressure back to f32;
+    # assembly and all downstream buffers/outputs stay float32. Mixed precision.
+    # The complex128 buffers roughly triple peak solve memory, so the native
+    # routing lowers the default solve concurrency for the float64 path unless
+    # the caller pinned HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY.
+    dense_solve_dtype: Literal["float32", "float64"] = "float32"
     return_surface_pressure: bool = False
     metal_native_threads_per_group: int | None = None
     metal_native_matrix_threads_per_group: int | None = None
@@ -190,6 +199,8 @@ class SolveConfig:
                 "metal_native_assembly_mode must be 'corrected', 'optimized', "
                 "'reference', or 'parity'"
             )
+        if self.dense_solve_dtype not in {"float32", "float64"}:
+            raise ValueError("dense_solve_dtype must be 'float32' or 'float64'")
         if (
             self.metal_native_threads_per_group is not None
             and self.metal_native_threads_per_group <= 0

@@ -370,6 +370,11 @@ struct DenseSolveRun {
     // only — float32 assembly and quadrature error survive it.
     var refineIterations: Int? = nil
     var refineResidualRel: Double? = nil
+    // Precision of the dense factor/solve. "float32" (default) is the historical
+    // Complex32 LU; "float64" factors/solves the float32-assembled system in
+    // complex128 (zgesv) and narrows the result back to f32. The default keeps
+    // every existing cgesv/cgetrf constructor reporting "float32" automatically.
+    var dtype: String = "float32"
 }
 
 func matrixOneNorm(_ matrix: inout [__CLPK_complex], n: Int) -> __CLPK_real {
@@ -398,6 +403,51 @@ func estimateReciprocalCondition(
     var work = Array(repeating: __CLPK_complex(r: 0.0, i: 0.0), count: 2 * n)
     var rwork = Array(repeating: __CLPK_real(0), count: 2 * n)
     cgecon_(
+        &normChar,
+        &nClpk,
+        &factored,
+        &lda,
+        &anormValue,
+        &rcond,
+        &work,
+        &rwork,
+        &info
+    )
+    if info != 0 {
+        return nil
+    }
+    return Double(rcond)
+}
+
+/// complex128 twin of `matrixOneNorm` (zlange). The work array is
+/// `[__CLPK_doublereal]` (Double), not doublecomplex — zlange's `work` is real,
+/// matching the float32 path's `[__CLPK_real]` work.
+func matrixOneNormZ(_ matrix: inout [__CLPK_doublecomplex], n: Int) -> Double {
+    var normChar = Int8(49) // "1"
+    var mClpk = __CLPK_integer(n)
+    var nClpk = __CLPK_integer(n)
+    var lda = __CLPK_integer(n)
+    var work = [Double(0)] // unused for the 1-norm
+    return Double(zlange_(&normChar, &mClpk, &nClpk, &matrix, &lda, &work))
+}
+
+/// complex128 twin of `estimateReciprocalCondition` (zgecon on LU factors).
+/// `anorm` must be the 1-norm of the original matrix, computed before the
+/// factorization overwrote it.
+func estimateReciprocalConditionZ(
+    factored: inout [__CLPK_doublecomplex],
+    n: Int,
+    anorm: Double
+) -> Double? {
+    var normChar = Int8(49) // "1"
+    var nClpk = __CLPK_integer(n)
+    var lda = __CLPK_integer(n)
+    var anormValue = anorm
+    var rcond = Double(0)
+    var info = __CLPK_integer(0)
+    var work = Array(repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0), count: 2 * n)
+    var rwork = Array(repeating: Double(0), count: 2 * n)
+    zgecon_(
         &normChar,
         &nClpk,
         &factored,
@@ -3784,6 +3834,9 @@ let metalDenseSolveImplementationEnv = "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_IMP
 // 0 (default) disables refinement.
 let metalDenseSolveRefineEnv = "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_REFINE"
 let metalSolveConcurrencyEnv = "HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY"
+// Dense factor/solve precision: "float32" (default, Complex32 LU) or "float64"
+// (complex128 zgesv, result narrowed back to f32). Mixed precision.
+let metalDenseSolveDtypeEnv = "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE"
 let nearQuadratureEnv = "HORNLAB_METAL_BEM_NATIVE_NEAR_QUADRATURE"
 let defaultMetalThreadsPerThreadgroup = 64
 
@@ -3903,6 +3956,16 @@ func requestedDenseSolveImplementation() throws -> String {
         return raw
     }
     try fail("\(metalDenseSolveImplementationEnv) must be 'cgesv' or 'cgetrf_cgetrs'")
+}
+
+func requestedDenseSolveDtype() throws -> String {
+    let raw = ProcessInfo.processInfo.environment[
+        metalDenseSolveDtypeEnv
+    ] ?? "float32"
+    if raw == "float32" || raw == "float64" {
+        return raw
+    }
+    try fail("\(metalDenseSolveDtypeEnv) must be 'float32' or 'float64'")
 }
 
 func requestedDenseSolveRefineIterations() throws -> Int {
@@ -5450,6 +5513,85 @@ func refineDenseSolveSolution(
     return (iterationsApplied, bestRel)
 }
 
+/// Mixed-precision dense solve: float32 row-major operator widened to complex128
+/// column-major, factored/solved with Accelerate `zgesv`, then narrowed back to
+/// Complex32 so the rest of the pipeline (field eval, surface-pressure
+/// reductions, all `[Complex32]` buffers, on-disk f32 outputs) is unchanged.
+/// This recovers the 3-4 digits the float32 LU loses near a near-singular
+/// system. The float32 iterative refinement (`refineDenseSolveSolution`) is
+/// deliberately NOT run here: it corrects only against the float32 operator and
+/// would cap accuracy at the single-precision floor while wasting a widen/narrow
+/// round-trip.
+func solveDenseAccelerateZgesv(
+    aReRowMajor: [Float],
+    aImRowMajor: [Float],
+    rhsRe: [Float],
+    rhsIm: [Float],
+    n: Int
+) throws -> DenseSolveRun {
+    if aReRowMajor.count != n * n || aImRowMajor.count != n * n {
+        try fail("dense solve matrix size mismatch")
+    }
+    if rhsRe.count != n || rhsIm.count != n {
+        try fail("dense solve RHS size mismatch")
+    }
+    let start = CFAbsoluteTimeGetCurrent()
+
+    // Widen float32 row-major -> complex128 column-major (LAPACK layout).
+    var matrix = Array(
+        repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
+        count: n * n
+    )
+    for row in 0..<n {
+        for col in 0..<n {
+            let source = row * n + col
+            let dest = col * n + row
+            matrix[dest] = __CLPK_doublecomplex(
+                r: Double(aReRowMajor[source]),
+                i: Double(aImRowMajor[source])
+            )
+        }
+    }
+
+    var rhs = Array(
+        repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
+        count: n
+    )
+    for i in 0..<n {
+        rhs[i] = __CLPK_doublecomplex(r: Double(rhsRe[i]), i: Double(rhsIm[i]))
+    }
+
+    var nClpk = __CLPK_integer(n)
+    var nrhs = __CLPK_integer(1)
+    var lda = __CLPK_integer(n)
+    var ldb = __CLPK_integer(n)
+    var info = __CLPK_integer(0)
+    var pivots = Array(repeating: __CLPK_integer(0), count: n)
+    let anorm = matrixOneNormZ(&matrix, n: n)
+    zgesv_(&nClpk, &nrhs, &matrix, &lda, &pivots, &rhs, &ldb, &info)
+
+    if info != 0 {
+        return DenseSolveRun(
+            pressure: [],
+            implementation: "accelerate_lapack_zgesv",
+            seconds: CFAbsoluteTimeGetCurrent() - start,
+            lapackInfo: Int32(info),
+            rcond: nil,
+            dtype: "float64"
+        )
+    }
+    let rcond = estimateReciprocalConditionZ(factored: &matrix, n: n, anorm: anorm)
+    // Narrow the complex128 solution back to Complex32 for the f32 pipeline.
+    return DenseSolveRun(
+        pressure: rhs.map { Complex32(re: Float($0.r), im: Float($0.i)) },
+        implementation: "accelerate_lapack_zgesv",
+        seconds: CFAbsoluteTimeGetCurrent() - start,
+        lapackInfo: Int32(info),
+        rcond: rcond,
+        dtype: "float64"
+    )
+}
+
 func solveDenseAccelerateCgesv(
     aReRowMajor: [Float],
     aImRowMajor: [Float],
@@ -5635,6 +5777,15 @@ func solveDenseAccelerate(
     rhsIm: [Float],
     n: Int
 ) throws -> DenseSolveRun {
+    if try requestedDenseSolveDtype() == "float64" {
+        return try solveDenseAccelerateZgesv(
+            aReRowMajor: aReRowMajor,
+            aImRowMajor: aImRowMajor,
+            rhsRe: rhsRe,
+            rhsIm: rhsIm,
+            n: n
+        )
+    }
     let implementation = try requestedDenseSolveImplementation()
     if implementation == "cgetrf_cgetrs" {
         return try solveDenseAccelerateCgetrfCgetrs(
@@ -6285,6 +6436,7 @@ func assembleSolveStandardNeumannBatch(
         if let refineResidualRel = solve.refineResidualRel {
             caseResult["dense_solve_refine_residual_rel"] = refineResidualRel
         }
+        caseResult["dense_solve_dtype"] = solve.dtype
         if let caseId = casePayload["case_id"] as? String {
             caseResult["case_id"] = caseId
         }
@@ -6816,6 +6968,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
         if let refineResidualRel = solve.refineResidualRel {
             caseResult["dense_solve_refine_residual_rel"] = refineResidualRel
         }
+        caseResult["dense_solve_dtype"] = solve.dtype
         if kImag != 0.0 {
             caseResult["assembly_k_imag_f32"] = kImag
             caseResult["complex_k"] = true

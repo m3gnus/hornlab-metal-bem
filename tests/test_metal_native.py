@@ -2791,6 +2791,125 @@ def test_native_executable_dense_solve_iterative_refinement(
     assert np.linalg.norm(pressure - exact) / np.linalg.norm(exact) < 1e-4
 
 
+def test_native_executable_float64_dense_solve_matches_numpy(
+    monkeypatch,
+    tmp_path,
+):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    # float64 (zgesv) factor/solve of the float32-assembled system, narrowed
+    # back to f32. Must match np.linalg.solve in complex128 to a tolerance much
+    # tighter than the float32 path (bounded only by the f32-narrowed output),
+    # and the per-case diagnostics must report dense_solve_dtype == "float64".
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE", "float64")
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_REFINE", raising=False)
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", raising=False)
+    neumann = np.array([[1.0 + 0.0j, 0.0 + 0.5j]], dtype=np.complex64)
+    frequency_hz = np.array([100.0], dtype=np.float64)
+    k_real = np.array([1.8318326], dtype=np.float32)
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_geometry_buffers(),
+        work_dir=tmp_path / "native-float64-session",
+        session_id="native-float64-test",
+    ) as session:
+        assembly = session.assemble_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            neumann,
+            operation_id="float64-batch-assembly",
+        )[0]
+        solved = session.assemble_solve_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            neumann,
+            operation_id="float64-batch-assembly-solve",
+        )[0]
+
+    matrix = np.fromfile(assembly.matrix_real_f32, dtype="<f4").reshape(
+        assembly.matrix_shape
+    ) + 1j * np.fromfile(assembly.matrix_imag_f32, dtype="<f4").reshape(
+        assembly.matrix_shape
+    )
+    rhs = np.fromfile(assembly.rhs_real_f32, dtype="<f4") + 1j * np.fromfile(
+        assembly.rhs_imag_f32,
+        dtype="<f4",
+    )
+    pressure = np.fromfile(solved.pressure_real_f32, dtype="<f4") + 1j * np.fromfile(
+        solved.pressure_imag_f32,
+        dtype="<f4",
+    )
+    result = json.loads(
+        (
+            tmp_path
+            / "native-float64-session"
+            / "float64-batch-assembly-solve"
+            / "assembly-solve-batch-result.json"
+        ).read_text(encoding="utf-8")
+    )
+    case_result = result["cases"][0]
+    assert solved.lapack_info == 0
+    assert case_result["solve_implementation"] == "accelerate_lapack_zgesv"
+    assert case_result["dense_solve_dtype"] == "float64"
+    # No iterative refinement runs on the float64 path; its bookkeeping keys must
+    # be absent (the plan explicitly skips refinement for float64).
+    assert "dense_solve_refine_iterations" not in case_result
+    assert "dense_solve_refine_residual_rel" not in case_result
+    exact = np.linalg.solve(matrix.astype(np.complex128), rhs.astype(np.complex128))
+    assert np.linalg.norm(pressure - exact) / np.linalg.norm(exact) < 1e-5
+
+
+def test_native_executable_float64_and_float32_dense_solve_agree(
+    monkeypatch,
+    tmp_path,
+):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    # The float32 and float64 paths solve the SAME assembled operator; on a
+    # well-conditioned case they must agree to ~f32 tolerance (the float64
+    # output is narrowed back to f32, so the gap is bounded by f32 rounding).
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_REFINE", raising=False)
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", raising=False)
+    neumann = np.array([[1.0 + 0.0j, 0.0 + 0.5j]], dtype=np.complex64)
+    frequency_hz = np.array([100.0], dtype=np.float64)
+    k_real = np.array([1.8318326], dtype=np.float32)
+
+    def _solve(dtype: str, label: str) -> np.ndarray:
+        monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE", dtype)
+        with MetalNativeStandardSession.create_session(
+            geometry_buffers=_tiny_geometry_buffers(),
+            work_dir=tmp_path / f"native-agree-{label}-session",
+            session_id=f"native-agree-{label}-test",
+        ) as session:
+            solved = session.assemble_solve_standard_neumann_batch(
+                frequency_hz,
+                k_real,
+                neumann,
+                operation_id=f"agree-{label}-batch-assembly-solve",
+            )[0]
+        return np.fromfile(
+            solved.pressure_real_f32, dtype="<f4"
+        ) + 1j * np.fromfile(solved.pressure_imag_f32, dtype="<f4")
+
+    pressure_f32 = _solve("float32", "f32")
+    pressure_f64 = _solve("float64", "f64")
+    assert np.all(np.isfinite(pressure_f32))
+    assert np.all(np.isfinite(pressure_f64))
+    rel = np.linalg.norm(pressure_f64 - pressure_f32) / np.linalg.norm(pressure_f32)
+    assert rel < 1e-4
+
+
 def test_native_executable_resident_assembly_solve_lu_factor_variant_matches_python(
     monkeypatch,
     tmp_path,
