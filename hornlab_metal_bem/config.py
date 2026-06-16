@@ -218,8 +218,8 @@ class SolveConfig:
                 raise ValueError("chief_points must be non-empty when set")
             if not _np.all(_np.isfinite(pts)):
                 raise ValueError("chief_points must be finite")
-        if self.chief_weight <= 0:
-            raise ValueError("chief_weight must be positive")
+        if not (math.isfinite(self.chief_weight) and self.chief_weight > 0):
+            raise ValueError("chief_weight must be finite and positive")
         if (
             self.native_symmetry_plane is not None
             and self.native_symmetry_plane not in NATIVE_SYMMETRY_PLANES

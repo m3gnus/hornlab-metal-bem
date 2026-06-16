@@ -232,20 +232,35 @@ def _build_neumann_rows(
     physical_tags: NDArray[np.int32],
     frequencies: NDArray[np.float64],
     config: SolveConfig,
+    impedance_sources: list[dict[int, complex]] | dict[int, complex],
 ) -> NDArray[np.complex64]:
-    return np.stack(
-        [
+    """Stack per-frequency Neumann RHS rows.
+
+    ``impedance_sources`` is the per-frequency Robin payload already resolved by
+    ``_impedance_sources_for_frequencies`` (a single static dict, or one dict per
+    frequency when ``impedance_source_callback`` is set). Its tag set is passed
+    into the Neumann builder as the velocity-skip set, so the callback is NEVER
+    re-evaluated inside ``bie`` and the skipped tags cannot diverge from the
+    Robin tags the solver applies.
+    """
+    per_case_list = isinstance(impedance_sources, list)
+    rows = []
+    for idx, freq in enumerate(frequencies):
+        case_sources = (
+            impedance_sources[idx] if per_case_list else impedance_sources
+        )
+        impedance_tags = {int(tag) for tag in case_sources.keys()}
+        rows.append(
             _build_driver_neumann_coeffs(
                 dp0_space,
                 physical_tags,
                 2.0 * np.pi * float(freq),
                 config,
                 np.complex64,
+                impedance_tags=impedance_tags,
             )
-            for freq in frequencies
-        ],
-        axis=0,
-    )
+        )
+    return np.stack(rows, axis=0)
 
 
 def _field_points_3xn(obs_points: NDArray[np.float64]) -> NDArray[np.float32]:
@@ -585,6 +600,7 @@ def run_sweep_native_metal(
                 mesh.physical_tags,
                 freq_values,
                 config,
+                impedance_sources_arg,
             )
 
             logger.info(
@@ -665,6 +681,7 @@ def run_sweep_native_metal(
                 mesh.physical_tags,
                 freq_values,
                 config,
+                impedance_sources_arg,
             )
             logger.info(
                 "Running %d-frequency native Metal streamed assembly/solve/field batch.",

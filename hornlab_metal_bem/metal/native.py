@@ -882,8 +882,8 @@ class MetalNativeStandardSession:
                 raise ValueError("chief_points must be non-empty when set")
             if not np.all(np.isfinite(chief_arr)):
                 raise ValueError("chief_points must be finite")
-            if float(chief_weight) <= 0:
-                raise ValueError("chief_weight must be positive")
+            if not (np.isfinite(chief_weight) and float(chief_weight) > 0):
+                raise ValueError("chief_weight must be finite and positive")
             chief_desc = write_binary_array(
                 np.ascontiguousarray(chief_arr),
                 inputs_dir / "chief_points_3xm_f32.bin",

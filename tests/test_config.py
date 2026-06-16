@@ -498,7 +498,29 @@ def test_chief_weight_non_positive_rejected():
     import numpy as np
 
     pts = np.array([[0.01, 0.02, 0.03]], dtype=np.float64)
-    with pytest.raises(ValueError, match="chief_weight must be positive"):
+    with pytest.raises(ValueError, match="chief_weight must be finite and positive"):
         SolveConfig(chief_points=pts, chief_weight=0.0)
-    with pytest.raises(ValueError, match="chief_weight must be positive"):
+    with pytest.raises(ValueError, match="chief_weight must be finite and positive"):
         SolveConfig(chief_points=pts, chief_weight=-1.0)
+
+
+def test_chief_weight_non_finite_rejected():
+    """NaN/inf chief_weight must be rejected at the config layer: a non-finite
+    weight would otherwise reach the native LS scaling and produce NaN/inf
+    scaling of the CHIEF rows (it passed when validation only checked <= 0)."""
+    import numpy as np
+
+    pts = np.array([[0.01, 0.02, 0.03]], dtype=np.float64)
+    for bad in (float("nan"), float("inf"), -float("inf")):
+        with pytest.raises(
+            ValueError, match="chief_weight must be finite and positive"
+        ):
+            SolveConfig(chief_points=pts, chief_weight=bad)
+    # chief_weight is validated unconditionally (like the prior <= 0 check), so a
+    # non-finite weight is rejected even with chief_points=None. The default
+    # weight of 1.0 is unaffected, so default solves stay bit-identical.
+    with pytest.raises(
+        ValueError, match="chief_weight must be finite and positive"
+    ):
+        SolveConfig(chief_weight=float("nan"))
+    assert SolveConfig().chief_weight == 1.0

@@ -1326,9 +1326,18 @@ func assembleChiefRows(
         }
     }
 
+    // True matrix infinity norm of the m x n (row-major) CHIEF block: max over
+    // rows of the sum of complex magnitudes, matching ||A||_inf so the auto-scale
+    // ratio is dimensionally consistent.
     var cNormInf: Float = 0
-    for v in c {
-        cNormInf = max(cNormInf, abs(v.re), abs(v.im))
+    for ci in 0..<m {
+        var rowSum: Float = 0
+        let base = ci * n
+        for col in 0..<n {
+            let v = c[base + col]
+            rowSum += Float(hypot(Double(v.re), Double(v.im)))
+        }
+        cNormInf = max(cNormInf, rowSum)
     }
     return (
         c.map { $0.re },
@@ -5749,15 +5758,22 @@ func solveDenseAccelerateZgesv(
     )
 }
 
-/// Max absolute float32 entry of a row-major complex operator (the inf-style
-/// norm the plan uses to auto-scale the CHIEF rows against the boundary block).
-func maxAbsEntry(re: [Float], im: [Float]) -> Float {
-    var maxAbs: Float = 0
-    let count = min(re.count, im.count)
-    for i in 0..<count {
-        maxAbs = max(maxAbs, abs(re[i]), abs(im[i]))
+/// True matrix infinity norm (max row sum of complex magnitudes) of a row-major
+/// (rows x cols) complex operator, the norm the plan uses to auto-scale the CHIEF
+/// rows against the boundary block: ||M||_inf = max_i sum_j |M_ij|. Magnitudes use
+/// the complex absolute value hypot(re, im), not the max scalar component.
+func matrixInfNormRowMajor(re: [Float], im: [Float], rows: Int, cols: Int) -> Float {
+    var maxRowSum: Float = 0
+    for row in 0..<rows {
+        var rowSum: Float = 0
+        let base = row * cols
+        for col in 0..<cols {
+            let idx = base + col
+            rowSum += Float(hypot(Double(re[idx]), Double(im[idx])))
+        }
+        maxRowSum = max(maxRowSum, rowSum)
     }
-    return maxAbs
+    return maxRowSum
 }
 
 /// Solve the CHIEF-overdetermined system in complex128 by least squares (zgels,
@@ -5969,7 +5985,10 @@ func solveCaseDense(
         kImag: kImag,
         robinBetas: robinBetas
     )
-    let aNormInf = maxAbsEntry(re: arrays.aRe, im: arrays.aIm)
+    let n = geom.p1DofCount
+    let aNormInf = matrixInfNormRowMajor(
+        re: arrays.aRe, im: arrays.aIm, rows: n, cols: n
+    )
     return try solveDenseLeastSquaresZgels(
         aReRowMajor: arrays.aRe,
         aImRowMajor: arrays.aIm,
@@ -5982,7 +6001,7 @@ func solveCaseDense(
         weight: chiefWeight,
         cNormInf: chiefRows.cNormInf,
         aNormInf: aNormInf,
-        n: geom.p1DofCount,
+        n: n,
         m: chiefPoints.count
     )
 }
@@ -7003,8 +7022,8 @@ func assembleSolveEvaluateStandardNeumannBatch(
     if let chiefDescriptor = cases[0]["chief_points"] as? [String: Any] {
         chiefPoints = try readChiefPoints(root: geom.root, descriptor: chiefDescriptor)
         chiefWeight = Float(try optionalDouble(cases[0], "chief_weight", default: 1.0))
-        if chiefWeight <= 0 {
-            try fail("chief_weight must be positive")
+        if !(chiefWeight.isFinite && chiefWeight > 0) {
+            try fail("chief_weight must be finite and positive")
         }
     } else {
         chiefPoints = nil
