@@ -164,6 +164,59 @@ def _active_impedance_sources(
     return active
 
 
+def _impedance_sources_for_frequencies(
+    physical_tags: NDArray[np.int32],
+    frequencies: NDArray[np.float64],
+    config: SolveConfig,
+) -> list[dict[int, complex]] | dict[int, complex]:
+    """Per-frequency beta dicts (callback) or one static dict (no callback).
+
+    When ``config.impedance_source_callback`` is None this returns the single
+    static dict from ``_active_impedance_sources`` (back-compat: one dict reused
+    for every case). When a callback is set it is evaluated once per frequency;
+    the returned ``{tag: beta}`` OVERRIDES the static value for tags present in
+    both and EXTENDS it for new tags. Callback tags not present in the mesh are
+    skipped with a warning. Passivity is enforced: any non-finite beta or
+    ``Re(beta) < 0`` raises ``ValueError`` (the documented anti-pattern of using
+    negative admittance to mask the LF blow-up is rejected here).
+    """
+    static = _active_impedance_sources(physical_tags, config)
+    if config.impedance_source_callback is None:
+        return static
+    mesh_tags = {int(tag) for tag in np.unique(physical_tags)}
+    per_case: list[dict[int, complex]] = []
+    for freq in frequencies:
+        f = float(freq)
+        merged = dict(static)
+        callback_betas = config.impedance_source_callback(f)
+        for tag, beta in callback_betas.items():
+            tag_int = int(tag)
+            if tag_int not in mesh_tags:
+                logger.warning(
+                    "impedance_source_callback returned tag %d not in mesh; "
+                    "skipping",
+                    tag_int,
+                )
+                continue
+            beta_value = complex(beta)
+            if not (
+                math.isfinite(beta_value.real) and math.isfinite(beta_value.imag)
+            ):
+                raise ValueError(
+                    f"impedance_source_callback({f:.3f}) returned non-finite "
+                    f"beta for tag {tag_int}"
+                )
+            if beta_value.real < 0.0:
+                raise ValueError(
+                    f"impedance_source_callback({f:.3f}) returned "
+                    f"Re(beta)={beta_value.real:.4g} < 0 for tag {tag_int}; "
+                    "admittance must be passive (Re(beta) >= 0)"
+                )
+            merged[tag_int] = beta_value
+        per_case.append(merged)
+    return per_case
+
+
 def _build_neumann_rows(
     dp0_space,
     physical_tags: NDArray[np.int32],
@@ -478,7 +531,12 @@ def run_sweep_native_metal(
     mesh_max_edge_m = _mesh_max_edge_m(mesh)
 
     source_tags = list(config.velocity_sources.keys())
-    active_impedance_sources = _active_impedance_sources(mesh.physical_tags, config)
+    # Per-frequency beta dicts when impedance_source_callback is set, else a
+    # single static dict. Computed once here (before the streaming/non-streaming
+    # branch split) so both branches send the identical per-case payloads.
+    impedance_sources_arg = _impedance_sources_for_frequencies(
+        mesh.physical_tags, frequencies, config
+    )
     surface_pavg: dict[int, list[complex]] = {tag: [] for tag in source_tags}
     pressure_rows: list[NDArray[np.complex128]] = []
     spl_rows: list[NDArray[np.float64]] = []
@@ -521,7 +579,7 @@ def run_sweep_native_metal(
                 neumann_rows,
                 field_points,
                 k_imag_f32=k_imag_values,
-                impedance_sources=active_impedance_sources,
+                impedance_sources=impedance_sources_arg,
                 batch_id="all_observation_planes",
                 operation_id="assembly-solve-field-resident-batch",
                 source_tags=source_tags,
@@ -658,7 +716,7 @@ def run_sweep_native_metal(
                 neumann_rows,
                 field_points,
                 k_imag_f32=k_imag_values,
-                impedance_sources=active_impedance_sources,
+                impedance_sources=impedance_sources_arg,
                 batch_id="all_observation_planes",
                 operation_id="assembly-solve-field-resident-stream",
                 source_tags=source_tags,

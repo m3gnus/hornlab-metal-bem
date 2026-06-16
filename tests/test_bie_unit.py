@@ -116,6 +116,70 @@ class TestAirDensityInNeumann:
 
 
 # ---------------------------------------------------------------------------
+# impedance-tag skip set (Robin BC suppresses the velocity BC on that tag)
+# ---------------------------------------------------------------------------
+
+
+class TestImpedanceTagSkip:
+
+    def test_static_impedance_tag_skips_velocity(self):
+        from hornlab_metal_bem.bie import _build_driver_neumann_coeffs
+
+        dp0_space = SimpleNamespace(global_dof_count=2)
+        tags = np.array([2, 5], dtype=np.int32)
+        # Tag 5 is both a velocity source and a static impedance source; the
+        # Robin BC must suppress the prescribed velocity there.
+        config = SolveConfig(
+            velocity_sources={2: 1.0, 5: 1.0},
+            impedance_sources={5: 0.05 + 0.0j},
+        )
+
+        coeffs = _build_driver_neumann_coeffs(
+            dp0_space, tags, 2 * np.pi * 1000.0, config, np.complex64
+        )
+
+        assert coeffs[0] != 0.0  # tag 2 still driven
+        assert coeffs[1] == 0.0  # tag 5 skipped (Robin BC carries it)
+
+    def test_callback_only_impedance_tag_skips_velocity(self):
+        """A tag driven by impedance_source_callback alone (absent from the
+        static impedance_sources dict) must still be skipped by the Neumann
+        builder via the tag-set union — otherwise it gets a double BC."""
+        from hornlab_metal_bem.bie import _build_driver_neumann_coeffs
+
+        dp0_space = SimpleNamespace(global_dof_count=2)
+        tags = np.array([2, 5], dtype=np.int32)
+        config = SolveConfig(
+            velocity_sources={2: 1.0, 5: 1.0},
+            impedance_sources={},  # tag 5 NOT declared statically
+            impedance_source_callback=lambda f: {5: 0.05 + 0.0j},
+        )
+
+        coeffs = _build_driver_neumann_coeffs(
+            dp0_space, tags, 2 * np.pi * 1000.0, config, np.complex64
+        )
+
+        assert coeffs[0] != 0.0  # tag 2 still driven
+        assert coeffs[1] == 0.0  # tag 5 skipped via callback tag union
+
+    def test_no_callback_leaves_velocity_tags_untouched(self):
+        """Regression: without a callback the skip set is exactly the static
+        impedance tags (canonical behavior unchanged)."""
+        from hornlab_metal_bem.bie import _build_driver_neumann_coeffs
+
+        dp0_space = SimpleNamespace(global_dof_count=2)
+        tags = np.array([2, 5], dtype=np.int32)
+        config = SolveConfig(velocity_sources={2: 1.0, 5: 1.0})
+
+        coeffs = _build_driver_neumann_coeffs(
+            dp0_space, tags, 2 * np.pi * 1000.0, config, np.complex64
+        )
+
+        assert coeffs[0] != 0.0
+        assert coeffs[1] != 0.0  # tag 5 driven (no Robin, no callback)
+
+
+# ---------------------------------------------------------------------------
 # compute_surface_pressure_avg
 # ---------------------------------------------------------------------------
 

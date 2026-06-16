@@ -23,7 +23,16 @@ def _build_driver_neumann_coeffs(
         if config.velocity_source_callback is not None
         else config.velocity_sources
     )
+    # Skip prescribing a velocity BC on any tag carrying a Robin (impedance)
+    # BC, otherwise the tag would receive a double boundary condition. The skip
+    # set unions the STATIC impedance_sources tags with any tags the
+    # frequency-dependent impedance_source_callback returns for this frequency,
+    # so a callback-only Robin tag (absent from impedance_sources) is still
+    # correctly skipped here.
     impedance_tag_set = set(config.impedance_sources.keys())
+    if config.impedance_source_callback is not None:
+        callback_betas = config.impedance_source_callback(frequency_hz)
+        impedance_tag_set |= {int(tag) for tag in callback_betas.keys()}
     for tag, weight in velocity_sources.items():
         if tag in impedance_tag_set:
             continue

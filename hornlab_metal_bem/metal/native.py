@@ -732,7 +732,11 @@ class MetalNativeStandardSession:
         observation_points: NDArray[Any],
         *,
         k_imag_f32: NDArray[Any] | None = None,
-        impedance_sources: dict[int, complex] | None = None,
+        impedance_sources: (
+            dict[int, complex]
+            | list[dict[int, complex] | None]
+            | None
+        ) = None,
         batch_id: str = "batch",
         operation_id: str = "assembly-solve-field-batch",
         source_tags: list[int] | tuple[int, ...] | None = None,
@@ -795,22 +799,42 @@ class MetalNativeStandardSession:
             raise ValueError("neumann_dp0 must be complex")
         if not np.all(np.isfinite(neumann_values)):
             raise ValueError("neumann_dp0 must contain only finite values")
-        impedance_payload: dict[str, list[float]] | None = None
-        if impedance_sources:
-            impedance_payload = {}
-            for tag, beta in impedance_sources.items():
+        def _beta_payload(
+            sources: dict[int, complex] | None,
+        ) -> dict[str, list[float]] | None:
+            if not sources:
+                return None
+            out: dict[str, list[float]] = {}
+            for tag, beta in sources.items():
                 tag_value = int(tag)
                 beta_value = complex(beta)
                 if tag_value < 0:
                     raise ValueError("impedance_sources tags must be non-negative")
-                if not np.isfinite(beta_value.real) or not np.isfinite(beta_value.imag):
+                if not np.isfinite(beta_value.real) or not np.isfinite(
+                    beta_value.imag
+                ):
                     raise ValueError("impedance_sources values must be finite")
-                impedance_payload[str(tag_value)] = [
+                out[str(tag_value)] = [
                     float(np.float32(beta_value.real)),
                     float(np.float32(beta_value.imag)),
                 ]
+            return out
+
+        # Accept either a single dict (back-compat: one Robin payload reused
+        # for every case) or a per-frequency list of dicts (one per case, for
+        # impedance_source_callback / beta(f)). Build one payload per case.
+        if isinstance(impedance_sources, list):
+            if len(impedance_sources) != frequencies.size:
+                raise ValueError(
+                    "impedance_sources list must have one dict per frequency "
+                    f"({frequencies.size}), got {len(impedance_sources)}"
+                )
+            impedance_payloads = [_beta_payload(d) for d in impedance_sources]
+        else:
+            shared = _beta_payload(impedance_sources)
+            impedance_payloads = [shared] * int(frequencies.size)
         expect_complex_k = bool(np.any(k_imag_values != 0.0))
-        expect_robin = impedance_payload is not None
+        expect_robin = any(payload is not None for payload in impedance_payloads)
 
         points_3xn = _require_observation_points_3xn(observation_points)
         n_obs = int(points_3xn.shape[1])
@@ -919,8 +943,8 @@ class MetalNativeStandardSession:
                         else {}
                     ),
                     **(
-                        {"impedance_sources": impedance_payload}
-                        if impedance_payload
+                        {"impedance_sources": impedance_payloads[idx]}
+                        if impedance_payloads[idx]
                         else {}
                     ),
                 }

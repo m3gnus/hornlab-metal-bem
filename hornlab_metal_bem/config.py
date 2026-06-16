@@ -73,6 +73,22 @@ class SolveConfig:
     # Experimental Robin boundary condition. Maps physical tag to normalized
     # surface admittance beta = rho*c/Zs; beta=0 is rigid, beta=1 air-matched.
     impedance_sources: dict[int, complex] = field(default_factory=dict)
+    # Frequency-dependent wall admittance. Mirrors velocity_source_callback:
+    # called once per solve frequency, returns {tag: beta} that OVERRIDES (for
+    # tags also in impedance_sources) and EXTENDS (for new tags) the static
+    # impedance_sources for that frequency. beta = rho*c/Zs (normalized
+    # admittance). Passivity requires Re(beta) >= 0; the sweep rejects any
+    # violation with ValueError.
+    #
+    # GOTCHA: the driver-Neumann builder only skips applying a prescribed
+    # velocity on tags present in the *static* impedance_sources dict
+    # (bie.py). A tag driven by the callback ALONE (absent from
+    # impedance_sources) would receive both a velocity BC and a Robin BC — a
+    # double boundary condition. Always declare every tag the callback can
+    # return in impedance_sources (any value, e.g. 0.0+0j), so the Neumann
+    # builder skips it. (The sweep also unions the callback tags into the
+    # Neumann skip set as a safety net, but declaring is the documented rule.)
+    impedance_source_callback: Callable[[float], dict[int, complex]] | None = None
 
     # Observation
     observation: ObservationConfig = field(default_factory=ObservationConfig)

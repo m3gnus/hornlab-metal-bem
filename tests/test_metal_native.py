@@ -3592,3 +3592,172 @@ def test_metal_bem_backend_wraps_native_session_without_routing(monkeypatch):
         context.close()
 
     assert fake_session.closed is True
+
+
+def _solve_robin_surface_pressure(
+    session,
+    *,
+    impedance_sources,
+    frequency_hz,
+    k_real,
+    k_imag,
+    operation_id,
+):
+    neumann = np.array(
+        [[1.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j]] * len(frequency_hz),
+        dtype=np.complex64,
+    )
+    observation_points = np.array(
+        [[0.0, 0.0, 0.7], [0.2, 0.0, 0.8]],
+        dtype=np.float32,
+    )
+    return session.assemble_solve_evaluate_standard_neumann_batch(
+        frequency_hz,
+        k_real,
+        neumann,
+        observation_points,
+        k_imag_f32=k_imag,
+        impedance_sources=impedance_sources,
+        operation_id=operation_id,
+        source_tags=[2],
+        impedance_source_tag=2,
+        write_surface_pressure=True,
+    )
+
+
+def _read_surface_pressure(solved):
+    return np.fromfile(solved.pressure_real_f32, dtype="<f4") + 1j * np.fromfile(
+        solved.pressure_imag_f32,
+        dtype="<f4",
+    )
+
+
+def test_impedance_source_callback_per_frequency_beta(monkeypatch, tmp_path):
+    """A per-frequency list of Robin betas must reach the helper as distinct
+    per-case payloads: two frequencies with different beta on tag 8 produce
+    different surface pressure, and both cases are flagged robin_boundary."""
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
+    # Two frequencies. The Robin beta on tag 8 differs between them; the only
+    # difference between the two cases is the per-case impedance_sources dict.
+    frequency_hz = np.array([172.0, 172.0], dtype=np.float64)
+    k_real = np.array(
+        [np.float32(2.0 * np.pi * 172.0 / 343.0)] * 2,
+        dtype=np.float32,
+    )
+    k_imag = (k_real * np.float32(0.005)).astype(np.float32)
+    per_case_beta = [
+        {8: 0.05 + 0.0j},
+        {8: 0.20 + 0.0j},
+    ]
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_robin_geometry_buffers(),
+        work_dir=tmp_path / "native-callback-beta-session",
+        session_id="native-callback-beta-test",
+    ) as session:
+        solved = _solve_robin_surface_pressure(
+            session,
+            impedance_sources=per_case_beta,
+            frequency_hz=frequency_hz,
+            k_real=k_real,
+            k_imag=k_imag,
+            operation_id="resident-callback-beta",
+        )
+
+    assert len(solved) == 2
+    p0 = _read_surface_pressure(solved[0])
+    p1 = _read_surface_pressure(solved[1])
+    assert np.all(np.isfinite(p0))
+    assert np.all(np.isfinite(p1))
+    # Both cases carry a Robin boundary.
+    assert solved[0].diagnostics["robin_boundary"] is True
+    assert solved[1].diagnostics["robin_boundary"] is True
+    # Distinct per-frequency beta -> distinct surface pressure (proves the
+    # per-case dict reached the helper rather than a single shared payload).
+    assert not np.allclose(p0, p1)
+
+
+def test_impedance_source_callback_equals_static_dict(monkeypatch, tmp_path):
+    """A per-case list of identical dicts must produce bit-for-bit the same
+    surface pressure as passing that single dict statically (callback ==
+    static-dict equivalence)."""
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
+    frequency_hz = np.array([172.0, 250.0], dtype=np.float64)
+    k_real = (2.0 * np.pi * frequency_hz / 343.0).astype(np.float32)
+    k_imag = (k_real * np.float32(0.005)).astype(np.float32)
+    static_beta = {8: 0.05 + 0.0j, 9: 0.02 + 0.01j}
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_robin_geometry_buffers(),
+        work_dir=tmp_path / "native-callback-static-session",
+        session_id="native-callback-static-test",
+    ) as session:
+        solved_static = _solve_robin_surface_pressure(
+            session,
+            impedance_sources=static_beta,
+            frequency_hz=frequency_hz,
+            k_real=k_real,
+            k_imag=k_imag,
+            operation_id="resident-static-beta",
+        )
+        solved_list = _solve_robin_surface_pressure(
+            session,
+            impedance_sources=[dict(static_beta), dict(static_beta)],
+            frequency_hz=frequency_hz,
+            k_real=k_real,
+            k_imag=k_imag,
+            operation_id="resident-list-beta",
+        )
+
+    assert len(solved_static) == len(solved_list) == 2
+    for case_static, case_list in zip(solved_static, solved_list):
+        assert case_static.diagnostics["robin_boundary"] is True
+        assert case_list.diagnostics["robin_boundary"] is True
+        p_static = _read_surface_pressure(case_static)
+        p_list = _read_surface_pressure(case_list)
+        np.testing.assert_array_equal(p_static, p_list)
+
+
+def test_impedance_sources_list_length_must_match_frequencies(tmp_path):
+    """A per-case impedance_sources list of the wrong length is rejected before
+    the helper runs (no native runtime required)."""
+    frequency_hz = np.array([172.0, 250.0], dtype=np.float64)
+    k_real = (2.0 * np.pi * frequency_hz / 343.0).astype(np.float32)
+    neumann = np.array(
+        [[1.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j]] * 2,
+        dtype=np.complex64,
+    )
+    observation_points = np.array([[0.0, 0.0, 0.7]], dtype=np.float32)
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_robin_geometry_buffers(),
+        work_dir=tmp_path / "native-list-length-session",
+        session_id="native-list-length-test",
+    ) as session:
+        with pytest.raises(ValueError, match="one dict per frequency"):
+            session.assemble_solve_evaluate_standard_neumann_batch(
+                frequency_hz,
+                k_real,
+                neumann,
+                observation_points,
+                impedance_sources=[{8: 0.05 + 0.0j}],  # only 1, need 2
+                operation_id="resident-list-length",
+                source_tags=[2],
+                impedance_source_tag=2,
+            )

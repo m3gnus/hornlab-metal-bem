@@ -84,6 +84,109 @@ def test_solve_config_accepts_experimental_complex_k_and_robin():
     assert cfg.impedance_sources[9] == 0.02 + 0.0j
 
 
+def test_solve_config_impedance_source_callback_defaults_none():
+    assert SolveConfig().impedance_source_callback is None
+
+
+def test_impedance_source_callback_per_frequency_overrides_static():
+    import numpy as np
+
+    from hornlab_metal_bem.sweep import _impedance_sources_for_frequencies
+
+    tags = np.array([2, 8, 9], dtype=np.int32)
+    cfg = SolveConfig(
+        impedance_sources={8: 0.10 + 0.0j},
+        impedance_source_callback=lambda f: {8: (0.05 if f < 650 else 0.20) + 0j},
+    )
+    result = _impedance_sources_for_frequencies(
+        tags, np.array([600.0, 700.0], dtype=np.float64), cfg
+    )
+    # Callback set -> per-frequency list, callback overrides the static value.
+    assert isinstance(result, list)
+    assert result[0][8] == 0.05 + 0.0j
+    assert result[1][8] == 0.20 + 0.0j
+
+
+def test_impedance_source_callback_extends_static_tags():
+    import numpy as np
+
+    from hornlab_metal_bem.sweep import _impedance_sources_for_frequencies
+
+    tags = np.array([2, 8, 9], dtype=np.int32)
+    cfg = SolveConfig(
+        impedance_sources={9: 0.02 + 0.0j},
+        impedance_source_callback=lambda f: {8: 0.07 + 0.0j},
+    )
+    result = _impedance_sources_for_frequencies(
+        tags, np.array([500.0], dtype=np.float64), cfg
+    )
+    # Static tag 9 survives; callback tag 8 is added on top.
+    assert result[0] == {9: 0.02 + 0.0j, 8: 0.07 + 0.0j}
+
+
+def test_impedance_source_callback_no_callback_returns_static_dict():
+    import numpy as np
+
+    from hornlab_metal_bem.sweep import _impedance_sources_for_frequencies
+
+    tags = np.array([2, 8], dtype=np.int32)
+    cfg = SolveConfig(impedance_sources={8: 0.05 + 0.0j})
+    result = _impedance_sources_for_frequencies(
+        tags, np.array([500.0, 600.0], dtype=np.float64), cfg
+    )
+    # No callback -> single static dict (not a per-frequency list).
+    assert result == {8: 0.05 + 0.0j}
+
+
+def test_impedance_source_callback_passivity_guard():
+    import numpy as np
+
+    from hornlab_metal_bem.sweep import _impedance_sources_for_frequencies
+
+    tags = np.array([2, 8], dtype=np.int32)
+    cfg = SolveConfig(
+        impedance_sources={8: 0.0 + 0.0j},
+        impedance_source_callback=lambda f: {8: -0.1 + 0.0j},
+    )
+    with pytest.raises(ValueError, match="passive"):
+        _impedance_sources_for_frequencies(
+            tags, np.array([500.0], dtype=np.float64), cfg
+        )
+
+
+def test_impedance_source_callback_rejects_nonfinite_beta():
+    import numpy as np
+
+    from hornlab_metal_bem.sweep import _impedance_sources_for_frequencies
+
+    tags = np.array([2, 8], dtype=np.int32)
+    cfg = SolveConfig(
+        impedance_sources={8: 0.0 + 0.0j},
+        impedance_source_callback=lambda f: {8: complex(float("nan"), 0.0)},
+    )
+    with pytest.raises(ValueError, match="non-finite"):
+        _impedance_sources_for_frequencies(
+            tags, np.array([500.0], dtype=np.float64), cfg
+        )
+
+
+def test_impedance_source_callback_skips_unknown_mesh_tag():
+    import numpy as np
+
+    from hornlab_metal_bem.sweep import _impedance_sources_for_frequencies
+
+    tags = np.array([2, 8], dtype=np.int32)
+    cfg = SolveConfig(
+        impedance_sources={8: 0.05 + 0.0j},
+        impedance_source_callback=lambda f: {99: 0.30 + 0.0j},  # tag not in mesh
+    )
+    result = _impedance_sources_for_frequencies(
+        tags, np.array([500.0], dtype=np.float64), cfg
+    )
+    # Unknown tag 99 is dropped; static tag 8 remains.
+    assert result[0] == {8: 0.05 + 0.0j}
+
+
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
