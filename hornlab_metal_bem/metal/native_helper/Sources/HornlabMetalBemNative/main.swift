@@ -1247,7 +1247,8 @@ func evaluateExteriorReference(
 ///     full interior field from points given in the reduced frame.
 ///
 /// Returns the row-major m x n coefficient matrix (cRe, cIm), the RHS (dRe,
-/// dIm), and ||C||_inf (max abs entry) for auto-scaling against ||A||_inf.
+/// dIm), and ||C||_inf (max row sum of complex magnitudes) for auto-scaling
+/// against ||A||_inf.
 func assembleChiefRows(
     geom: Geometry,
     chiefPoints: [(Float, Float, Float)],

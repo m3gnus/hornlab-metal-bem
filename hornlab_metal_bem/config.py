@@ -80,14 +80,13 @@ class SolveConfig:
     # admittance). Passivity requires Re(beta) >= 0; the sweep rejects any
     # violation with ValueError.
     #
-    # GOTCHA: the driver-Neumann builder only skips applying a prescribed
-    # velocity on tags present in the *static* impedance_sources dict
-    # (bie.py). A tag driven by the callback ALONE (absent from
-    # impedance_sources) would receive both a velocity BC and a Robin BC — a
-    # double boundary condition. Always declare every tag the callback can
-    # return in impedance_sources (any value, e.g. 0.0+0j), so the Neumann
-    # builder skips it. (The sweep also unions the callback tags into the
-    # Neumann skip set as a safety net, but declaring is the documented rule.)
+    # Callback-only Robin tags are fully supported: the sweep resolves the
+    # impedance sources exactly once per frequency and threads that resolved
+    # tag set into the driver-Neumann builder, so a tag driven by the callback
+    # ALONE (absent from the static impedance_sources dict) is correctly
+    # skipped for the prescribed-velocity BC — no double boundary condition.
+    # Use the static impedance_sources dict only for tags that should always
+    # carry a Robin BC at every frequency.
     impedance_source_callback: Callable[[float], dict[int, complex]] | None = None
 
     # CHIEF (Combined Helmholtz Interior-integral Equation Formulation) points:
