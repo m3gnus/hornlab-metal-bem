@@ -103,9 +103,19 @@ def _native_env_overrides(config: SolveConfig) -> dict[str, str]:
     """
     overrides: dict[str, str] = {
         "HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE": config.metal_native_assembly_mode,
+        "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE": config.dense_solve_dtype,
     }
     if os.environ.get("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE") is None:
         overrides["HORNLAB_METAL_BEM_NATIVE_FIELD_MODE"] = "optimized"
+    # complex128 zgesv holds a doublecomplex column-major copy alongside the
+    # float32 row-major operator, roughly tripling peak solve memory. Lower the
+    # default solve concurrency for the float64 path unless the caller pinned it
+    # (via the env var on os.environ), keeping peak memory bounded.
+    if (
+        config.dense_solve_dtype == "float64"
+        and os.environ.get("HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY") is None
+    ):
+        overrides["HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY"] = "3"
     threadgroup_values = {
         "HORNLAB_METAL_BEM_NATIVE_THREADS_PER_GROUP": (
             config.metal_native_threads_per_group
@@ -164,25 +174,93 @@ def _active_impedance_sources(
     return active
 
 
+def _impedance_sources_for_frequencies(
+    physical_tags: NDArray[np.int32],
+    frequencies: NDArray[np.float64],
+    config: SolveConfig,
+) -> list[dict[int, complex]] | dict[int, complex]:
+    """Per-frequency beta dicts (callback) or one static dict (no callback).
+
+    When ``config.impedance_source_callback`` is None this returns the single
+    static dict from ``_active_impedance_sources`` (back-compat: one dict reused
+    for every case). When a callback is set it is evaluated once per frequency;
+    the returned ``{tag: beta}`` OVERRIDES the static value for tags present in
+    both and EXTENDS it for new tags. Callback tags not present in the mesh are
+    skipped with a warning. Passivity is enforced: any non-finite beta or
+    ``Re(beta) < 0`` raises ``ValueError`` (the documented anti-pattern of using
+    negative admittance to mask the LF blow-up is rejected here).
+    """
+    static = _active_impedance_sources(physical_tags, config)
+    if config.impedance_source_callback is None:
+        return static
+    mesh_tags = {int(tag) for tag in np.unique(physical_tags)}
+    per_case: list[dict[int, complex]] = []
+    for freq in frequencies:
+        f = float(freq)
+        merged = dict(static)
+        callback_betas = config.impedance_source_callback(f)
+        for tag, beta in callback_betas.items():
+            tag_int = int(tag)
+            if tag_int not in mesh_tags:
+                logger.warning(
+                    "impedance_source_callback returned tag %d not in mesh; "
+                    "skipping",
+                    tag_int,
+                )
+                continue
+            beta_value = complex(beta)
+            if not (
+                math.isfinite(beta_value.real) and math.isfinite(beta_value.imag)
+            ):
+                raise ValueError(
+                    f"impedance_source_callback({f:.3f}) returned non-finite "
+                    f"beta for tag {tag_int}"
+                )
+            if beta_value.real < 0.0:
+                raise ValueError(
+                    f"impedance_source_callback({f:.3f}) returned "
+                    f"Re(beta)={beta_value.real:.4g} < 0 for tag {tag_int}; "
+                    "admittance must be passive (Re(beta) >= 0)"
+                )
+            merged[tag_int] = beta_value
+        per_case.append(merged)
+    return per_case
+
+
 def _build_neumann_rows(
     dp0_space,
     physical_tags: NDArray[np.int32],
     frequencies: NDArray[np.float64],
     config: SolveConfig,
+    impedance_sources: list[dict[int, complex]] | dict[int, complex],
 ) -> NDArray[np.complex64]:
-    return np.stack(
-        [
+    """Stack per-frequency Neumann RHS rows.
+
+    ``impedance_sources`` is the per-frequency Robin payload already resolved by
+    ``_impedance_sources_for_frequencies`` (a single static dict, or one dict per
+    frequency when ``impedance_source_callback`` is set). Its tag set is passed
+    into the Neumann builder as the velocity-skip set, so the callback is NEVER
+    re-evaluated inside ``bie`` and the skipped tags cannot diverge from the
+    Robin tags the solver applies.
+    """
+    per_case_list = isinstance(impedance_sources, list)
+    rows = []
+    for idx, freq in enumerate(frequencies):
+        case_sources = (
+            impedance_sources[idx] if per_case_list else impedance_sources
+        )
+        impedance_tags = {int(tag) for tag in case_sources.keys()}
+        rows.append(
             _build_driver_neumann_coeffs(
                 dp0_space,
                 physical_tags,
                 2.0 * np.pi * float(freq),
                 config,
                 np.complex64,
+                impedance_tags=impedance_tags,
             )
-            for freq in frequencies
-        ],
-        axis=0,
-    )
+        )
+    return np.stack(rows, axis=0)
 
 
 def _field_points_3xn(obs_points: NDArray[np.float64]) -> NDArray[np.float32]:
@@ -478,7 +556,20 @@ def run_sweep_native_metal(
     mesh_max_edge_m = _mesh_max_edge_m(mesh)
 
     source_tags = list(config.velocity_sources.keys())
-    active_impedance_sources = _active_impedance_sources(mesh.physical_tags, config)
+    # Per-frequency beta dicts when impedance_source_callback is set, else a
+    # single static dict. Computed once here (before the streaming/non-streaming
+    # branch split) so both branches send the identical per-case payloads.
+    impedance_sources_arg = _impedance_sources_for_frequencies(
+        mesh.physical_tags, frequencies, config
+    )
+    # CHIEF interior overdetermination points, (m, 3) metres in the mesh frame.
+    # Marshal to the (3, m) float32 layout the helper reader expects (same as the
+    # observation points). None leaves the solve a plain square LU/zgesv solve.
+    chief_points_3xm = None
+    if config.chief_points is not None:
+        chief_points_3xm = np.ascontiguousarray(
+            np.asarray(config.chief_points, dtype=np.float64).T, dtype=np.float32
+        )
     surface_pavg: dict[int, list[complex]] = {tag: [] for tag in source_tags}
     pressure_rows: list[NDArray[np.complex128]] = []
     spl_rows: list[NDArray[np.float64]] = []
@@ -509,6 +600,7 @@ def run_sweep_native_metal(
                 mesh.physical_tags,
                 freq_values,
                 config,
+                impedance_sources_arg,
             )
 
             logger.info(
@@ -521,13 +613,16 @@ def run_sweep_native_metal(
                 neumann_rows,
                 field_points,
                 k_imag_f32=k_imag_values,
-                impedance_sources=active_impedance_sources,
+                impedance_sources=impedance_sources_arg,
                 batch_id="all_observation_planes",
                 operation_id="assembly-solve-field-resident-batch",
                 source_tags=source_tags,
                 impedance_source_tag=impedance_source_tag,
                 write_surface_pressure=config.return_surface_pressure,
                 write_batched_field=True,
+                dense_solve_dtype=config.dense_solve_dtype,
+                chief_points=chief_points_3xm,
+                chief_weight=config.chief_weight,
             )
             field_batch_complex: NDArray[np.complex128] | None = None
             if systems and systems[0].field_row_index is not None:
@@ -586,6 +681,7 @@ def run_sweep_native_metal(
                 mesh.physical_tags,
                 freq_values,
                 config,
+                impedance_sources_arg,
             )
             logger.info(
                 "Running %d-frequency native Metal streamed assembly/solve/field batch.",
@@ -658,13 +754,16 @@ def run_sweep_native_metal(
                 neumann_rows,
                 field_points,
                 k_imag_f32=k_imag_values,
-                impedance_sources=active_impedance_sources,
+                impedance_sources=impedance_sources_arg,
                 batch_id="all_observation_planes",
                 operation_id="assembly-solve-field-resident-stream",
                 source_tags=source_tags,
                 impedance_source_tag=impedance_source_tag,
                 write_surface_pressure=config.return_surface_pressure,
                 on_case_result=_on_case_result,
+                dense_solve_dtype=config.dense_solve_dtype,
+                chief_points=chief_points_3xm,
+                chief_weight=config.chief_weight,
             )
 
     sp_avg: dict[int, np.ndarray] = {}

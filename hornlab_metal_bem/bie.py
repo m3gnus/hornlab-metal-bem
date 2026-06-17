@@ -13,8 +13,20 @@ def _build_driver_neumann_coeffs(
     omega: float,
     config: SolveConfig,
     dtype: type,
+    impedance_tags: set[int] | None = None,
 ) -> NDArray:
-    """Build DP0 Neumann coefficients for velocity source tags."""
+    """Build DP0 Neumann coefficients for velocity source tags.
+
+    ``impedance_tags`` is the resolved set of tags carrying a Robin (impedance)
+    BC at this frequency. The caller (``sweep._build_neumann_rows``) evaluates
+    ``impedance_source_callback`` EXACTLY ONCE per frequency upstream and passes
+    the resolved tags here, so the skip set used to suppress the velocity BC is
+    guaranteed identical to the Robin payload the solver actually applies — a
+    stateful or non-repeatable callback can no longer make the two diverge into
+    a double BC or an undriven tag. When ``None`` (back-compat: a direct call
+    that did not resolve the tags upstream) the set is reconstructed locally from
+    the static ``impedance_sources`` plus a single callback evaluation.
+    """
     coeffs = np.zeros(dp0_space.global_dof_count, dtype=dtype)
     air_density = config.air_density
     frequency_hz = float(omega) / (2.0 * np.pi) if omega > 0 else 0.0
@@ -23,7 +35,20 @@ def _build_driver_neumann_coeffs(
         if config.velocity_source_callback is not None
         else config.velocity_sources
     )
-    impedance_tag_set = set(config.impedance_sources.keys())
+    # Skip prescribing a velocity BC on any tag carrying a Robin (impedance)
+    # BC, otherwise the tag would receive a double boundary condition. The
+    # resolved tag set is supplied by the caller (single callback evaluation per
+    # frequency). The local-reconstruction fallback unions the STATIC
+    # impedance_sources tags with any tags a single callback evaluation returns
+    # for this frequency, so a callback-only Robin tag (absent from
+    # impedance_sources) is still correctly skipped here.
+    if impedance_tags is not None:
+        impedance_tag_set = impedance_tags
+    else:
+        impedance_tag_set = set(config.impedance_sources.keys())
+        if config.impedance_source_callback is not None:
+            callback_betas = config.impedance_source_callback(frequency_hz)
+            impedance_tag_set |= {int(tag) for tag in callback_betas.keys()}
     for tag, weight in velocity_sources.items():
         if tag in impedance_tag_set:
             continue

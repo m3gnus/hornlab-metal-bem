@@ -370,6 +370,18 @@ struct DenseSolveRun {
     // only — float32 assembly and quadrature error survive it.
     var refineIterations: Int? = nil
     var refineResidualRel: Double? = nil
+    // Precision of the dense factor/solve. "float32" (default) is the historical
+    // Complex32 LU; "float64" factors/solves the float32-assembled system in
+    // complex128 (zgesv) and narrows the result back to f32. The default keeps
+    // every existing cgesv/cgetrf constructor reporting "float32" automatically.
+    var dtype: String = "float32"
+    // Relative residual of the CHIEF interior null-field constraint rows from the
+    // overdetermined least-squares (zgels) solve: ||scale*(C*p - d)||_2 / ||b||_2.
+    // nil for the plain square LU/zgesv paths (no CHIEF rows). Near the f64 floor
+    // means the boundary solution already satisfies the interior constraint; an
+    // O(1) value means CHIEF is actively correcting a fictitious resonance there
+    // (or the points are badly placed).
+    var chiefResidualRel: Double? = nil
 }
 
 func matrixOneNorm(_ matrix: inout [__CLPK_complex], n: Int) -> __CLPK_real {
@@ -398,6 +410,51 @@ func estimateReciprocalCondition(
     var work = Array(repeating: __CLPK_complex(r: 0.0, i: 0.0), count: 2 * n)
     var rwork = Array(repeating: __CLPK_real(0), count: 2 * n)
     cgecon_(
+        &normChar,
+        &nClpk,
+        &factored,
+        &lda,
+        &anormValue,
+        &rcond,
+        &work,
+        &rwork,
+        &info
+    )
+    if info != 0 {
+        return nil
+    }
+    return Double(rcond)
+}
+
+/// complex128 twin of `matrixOneNorm` (zlange). The work array is
+/// `[__CLPK_doublereal]` (Double), not doublecomplex — zlange's `work` is real,
+/// matching the float32 path's `[__CLPK_real]` work.
+func matrixOneNormZ(_ matrix: inout [__CLPK_doublecomplex], n: Int) -> Double {
+    var normChar = Int8(49) // "1"
+    var mClpk = __CLPK_integer(n)
+    var nClpk = __CLPK_integer(n)
+    var lda = __CLPK_integer(n)
+    var work = [Double(0)] // unused for the 1-norm
+    return Double(zlange_(&normChar, &mClpk, &nClpk, &matrix, &lda, &work))
+}
+
+/// complex128 twin of `estimateReciprocalCondition` (zgecon on LU factors).
+/// `anorm` must be the 1-norm of the original matrix, computed before the
+/// factorization overwrote it.
+func estimateReciprocalConditionZ(
+    factored: inout [__CLPK_doublecomplex],
+    n: Int,
+    anorm: Double
+) -> Double? {
+    var normChar = Int8(49) // "1"
+    var nClpk = __CLPK_integer(n)
+    var lda = __CLPK_integer(n)
+    var anormValue = anorm
+    var rcond = Double(0)
+    var info = __CLPK_integer(0)
+    var work = Array(repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0), count: 2 * n)
+    var rwork = Array(repeating: Double(0), count: 2 * n)
+    zgecon_(
         &normChar,
         &nClpk,
         &factored,
@@ -961,6 +1018,33 @@ func readObservationPoints(root: String, descriptor: [String: Any]) throws -> [(
     return points
 }
 
+/// CHIEF interior overdetermination points. Same [3, m] f32 layout as the
+/// observation points; given in the reduced (modeled) frame when a symmetry
+/// plane is set (the image sum in assembleChiefRows reconstructs the full
+/// interior field).
+func readChiefPoints(root: String, descriptor: [String: Any]) throws -> [(Float, Float, Float)] {
+    let shape = try validateDescriptor(
+        descriptor,
+        name: "chief_points",
+        dtype: "float32",
+        rank: 2
+    )
+    if shape[0] != 3 {
+        try fail("chief_points must have shape [3, m]")
+    }
+    let mPts = shape[1]
+    let values = try readF32(
+        try descriptorPath(root: root, descriptor: descriptor),
+        expectedCount: 3 * mPts
+    )
+    var points: [(Float, Float, Float)] = []
+    points.reserveCapacity(mPts)
+    for idx in 0..<mPts {
+        points.append((values[idx], values[mPts + idx], values[2 * mPts + idx]))
+    }
+    return points
+}
+
 func assembleRegularReference(
     geom: Geometry,
     neumann: [Complex32],
@@ -1130,6 +1214,139 @@ func evaluateExteriorReference(
         out[obsIdx] = acc
     }
     return out
+}
+
+/// Assemble the CHIEF (Combined Helmholtz Interior-integral Equation
+/// Formulation) constraint rows. Each interior point x_c contributes one
+/// equation requiring the exterior representation to evaluate to 0 inside the
+/// body (the interior null-field property):
+///
+///     sum over triangles, images:  D(x_c, y)*p(y) - G(x_c, y)*q(y) = 0,
+///         with  q = g_drv + iK*beta*Pi*p   (the Robin total Neumann data).
+///
+/// Moving p to the LHS and g_drv to the RHS, folding Robin exactly as the
+/// boundary rows do (main.swift assembleRegularReference, term -= (slp*iK*beta)/3
+/// per P1 column) and the field-side reconstruction neumannWithRobin
+/// (q += iK*beta*pAvg, pAvg = sum_local p/3):
+///
+///     [ D_chief - G_chief*iK*diag(beta)*Pi ] * p  =  G_chief * g_drv
+///
+/// This is structurally evaluateExteriorReference with the unknown p kept
+/// symbolic: per-P1-DOF D coefficients go into a dense row, sum(G)*g_drv into
+/// the RHS, and the Robin fold into the same columns.
+///
+/// CRITICAL subtleties (per the implementation plan):
+///   - CHIEF rows are point COLLOCATION of the representation formula, NOT the
+///     Galerkin boundary operator. So: RHS = +integral(G*g_drv) (G, not the
+///     test-basis-weighted slp), NO -1/2 I jump term, NO symmetryRowWeight.
+///   - Uses the REAL-k field-eval kernels (helmholtzG / helmholtzDlp), matching
+///     the physical exterior representation that evaluateExterior uses for the
+///     field; NOT the complex-k assembly kernels. (The boundary operator may
+///     still carry the complex-k shift; CHIEF + complex_k compose fine.)
+///   - Includes the symmetry mirror images, so the image sum reconstructs the
+///     full interior field from points given in the reduced frame.
+///
+/// Returns the row-major m x n coefficient matrix (cRe, cIm), the RHS (dRe,
+/// dIm), and ||C||_inf (max row sum of complex magnitudes) for auto-scaling
+/// against ||A||_inf.
+func assembleChiefRows(
+    geom: Geometry,
+    chiefPoints: [(Float, Float, Float)],
+    driverNeumann: [Complex32],
+    k: Float,
+    kImag: Float,
+    robinBetas: [Complex32]?
+) -> (cRe: [Float], cIm: [Float], dRe: [Float], dIm: [Float], cNormInf: Float) {
+    let (qx, qy, qw) = triangleRule6()
+    let n = geom.p1DofCount
+    let m = chiefPoints.count
+    var c = Array(repeating: Complex32.zero, count: m * n)   // row-major m x n
+    var d = Array(repeating: Complex32.zero, count: m)
+    let imageMasks = symmetryImageMasks(geom.symmetryPlane)
+    // iK = i*k_complex with the SAME convention as the boundary fold and the
+    // field-side Robin reconstruction (main.swift:1026 / :972).
+    let iK = Complex32(re: -kImag, im: k)
+    let third = Float(1.0 / 3.0)
+
+    for ci in 0..<m {
+        let (ox, oy, oz) = chiefPoints[ci]
+        for tri in 0..<geom.nTriangles {
+            let nnx = geom.normal(tri, 0)
+            let nny = geom.normal(tri, 1)
+            let nnz = geom.normal(tri, 2)
+            let jac = 2.0 * geom.areas[tri]
+            let gTri = driverNeumann[tri]
+            let beta = robinBetas?[tri] ?? Complex32.zero
+            let hasRobin = beta.re != 0.0 || beta.im != 0.0
+            let robinCoupling = iK * beta
+            // Per local P1 basis: integral(D*basis_local) coefficients, and the
+            // scalar integral(G) (the basis sums to 1, so the G*g_drv RHS uses
+            // the basis-independent sum).
+            var dCoeff = [Complex32](repeating: .zero, count: 3)
+            var gScalar = Complex32.zero
+            for qa in 0..<qw.count {
+                let (sx, sy, sz) = pointOnTriangle(geom, tri, qx[qa], qy[qa])
+                let b = localBasis(qx[qa], qy[qa])
+                let basis = [b.0, b.1, b.2]
+                let dx = sx - ox
+                let dy = sy - oy
+                let dz = sz - oz
+                let dd = helmholtzDlp(dx, dy, dz, nnx, nny, nnz, k)
+                let gg = helmholtzG(dx, dy, dz, k)
+                let w = qw[qa] * jac
+                for i in 0..<3 {
+                    dCoeff[i] = dCoeff[i] + dd * (basis[i] * w)
+                }
+                gScalar = gScalar + gg * w
+                for mask in imageMasks {
+                    let image = mirrorPoint((sx, sy, sz), mask: mask)
+                    let inrm = mirrorNormal((nnx, nny, nnz), mask: mask)
+                    let idx = image.0 - ox
+                    let idy = image.1 - oy
+                    let idz = image.2 - oz
+                    let idd = helmholtzDlp(idx, idy, idz, inrm.0, inrm.1, inrm.2, k)
+                    let igg = helmholtzG(idx, idy, idz, k)
+                    for i in 0..<3 {
+                        dCoeff[i] = dCoeff[i] + idd * (basis[i] * w)
+                    }
+                    gScalar = gScalar + igg * w
+                }
+            }
+            // RHS: + integral(G) * g_drv  (the +G*g_drv moved from the -G*q term).
+            d[ci] = d[ci] + gScalar * gTri
+            // LHS columns: D coefficient, minus the Robin fold -G*(iK*beta)/3 per
+            // P1 column (same sign as the boundary operator fold).
+            for i in 0..<3 {
+                let col = geom.p1Dof(tri, i)
+                var term = dCoeff[i]
+                if hasRobin {
+                    term = term - (gScalar * robinCoupling) * third
+                }
+                c[ci * n + col] = c[ci * n + col] + term
+            }
+        }
+    }
+
+    // True matrix infinity norm of the m x n (row-major) CHIEF block: max over
+    // rows of the sum of complex magnitudes, matching ||A||_inf so the auto-scale
+    // ratio is dimensionally consistent.
+    var cNormInf: Float = 0
+    for ci in 0..<m {
+        var rowSum: Float = 0
+        let base = ci * n
+        for col in 0..<n {
+            let v = c[base + col]
+            rowSum += Float(hypot(Double(v.re), Double(v.im)))
+        }
+        cNormInf = max(cNormInf, rowSum)
+    }
+    return (
+        c.map { $0.re },
+        c.map { $0.im },
+        d.map { $0.re },
+        d.map { $0.im },
+        cNormInf
+    )
 }
 
 struct P1Incidence {
@@ -3784,6 +4001,9 @@ let metalDenseSolveImplementationEnv = "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_IMP
 // 0 (default) disables refinement.
 let metalDenseSolveRefineEnv = "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_REFINE"
 let metalSolveConcurrencyEnv = "HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY"
+// Dense factor/solve precision: "float32" (default, Complex32 LU) or "float64"
+// (complex128 zgesv, result narrowed back to f32). Mixed precision.
+let metalDenseSolveDtypeEnv = "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE"
 let nearQuadratureEnv = "HORNLAB_METAL_BEM_NATIVE_NEAR_QUADRATURE"
 let defaultMetalThreadsPerThreadgroup = 64
 
@@ -3903,6 +4123,16 @@ func requestedDenseSolveImplementation() throws -> String {
         return raw
     }
     try fail("\(metalDenseSolveImplementationEnv) must be 'cgesv' or 'cgetrf_cgetrs'")
+}
+
+func requestedDenseSolveDtype() throws -> String {
+    let raw = ProcessInfo.processInfo.environment[
+        metalDenseSolveDtypeEnv
+    ] ?? "float32"
+    if raw == "float32" || raw == "float64" {
+        return raw
+    }
+    try fail("\(metalDenseSolveDtypeEnv) must be 'float32' or 'float64'")
 }
 
 func requestedDenseSolveRefineIterations() throws -> Int {
@@ -5450,6 +5680,333 @@ func refineDenseSolveSolution(
     return (iterationsApplied, bestRel)
 }
 
+/// Mixed-precision dense solve: float32 row-major operator widened to complex128
+/// column-major, factored/solved with Accelerate `zgesv`, then narrowed back to
+/// Complex32 so the rest of the pipeline (field eval, surface-pressure
+/// reductions, all `[Complex32]` buffers, on-disk f32 outputs) is unchanged.
+/// This recovers the 3-4 digits the float32 LU loses near a near-singular
+/// system. The float32 iterative refinement (`refineDenseSolveSolution`) is
+/// deliberately NOT run here: it corrects only against the float32 operator and
+/// would cap accuracy at the single-precision floor while wasting a widen/narrow
+/// round-trip.
+func solveDenseAccelerateZgesv(
+    aReRowMajor: [Float],
+    aImRowMajor: [Float],
+    rhsRe: [Float],
+    rhsIm: [Float],
+    n: Int
+) throws -> DenseSolveRun {
+    if aReRowMajor.count != n * n || aImRowMajor.count != n * n {
+        try fail("dense solve matrix size mismatch")
+    }
+    if rhsRe.count != n || rhsIm.count != n {
+        try fail("dense solve RHS size mismatch")
+    }
+    let start = CFAbsoluteTimeGetCurrent()
+
+    // Widen float32 row-major -> complex128 column-major (LAPACK layout).
+    var matrix = Array(
+        repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
+        count: n * n
+    )
+    for row in 0..<n {
+        for col in 0..<n {
+            let source = row * n + col
+            let dest = col * n + row
+            matrix[dest] = __CLPK_doublecomplex(
+                r: Double(aReRowMajor[source]),
+                i: Double(aImRowMajor[source])
+            )
+        }
+    }
+
+    var rhs = Array(
+        repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
+        count: n
+    )
+    for i in 0..<n {
+        rhs[i] = __CLPK_doublecomplex(r: Double(rhsRe[i]), i: Double(rhsIm[i]))
+    }
+
+    var nClpk = __CLPK_integer(n)
+    var nrhs = __CLPK_integer(1)
+    var lda = __CLPK_integer(n)
+    var ldb = __CLPK_integer(n)
+    var info = __CLPK_integer(0)
+    var pivots = Array(repeating: __CLPK_integer(0), count: n)
+    let anorm = matrixOneNormZ(&matrix, n: n)
+    zgesv_(&nClpk, &nrhs, &matrix, &lda, &pivots, &rhs, &ldb, &info)
+
+    if info != 0 {
+        return DenseSolveRun(
+            pressure: [],
+            implementation: "accelerate_lapack_zgesv",
+            seconds: CFAbsoluteTimeGetCurrent() - start,
+            lapackInfo: Int32(info),
+            rcond: nil,
+            dtype: "float64"
+        )
+    }
+    let rcond = estimateReciprocalConditionZ(factored: &matrix, n: n, anorm: anorm)
+    // Narrow the complex128 solution back to Complex32 for the f32 pipeline.
+    return DenseSolveRun(
+        pressure: rhs.map { Complex32(re: Float($0.r), im: Float($0.i)) },
+        implementation: "accelerate_lapack_zgesv",
+        seconds: CFAbsoluteTimeGetCurrent() - start,
+        lapackInfo: Int32(info),
+        rcond: rcond,
+        dtype: "float64"
+    )
+}
+
+/// True matrix infinity norm (max row sum of complex magnitudes) of a row-major
+/// (rows x cols) complex operator, the norm the plan uses to auto-scale the CHIEF
+/// rows against the boundary block: ||M||_inf = max_i sum_j |M_ij|. Magnitudes use
+/// the complex absolute value hypot(re, im), not the max scalar component.
+func matrixInfNormRowMajor(re: [Float], im: [Float], rows: Int, cols: Int) -> Float {
+    var maxRowSum: Float = 0
+    for row in 0..<rows {
+        var rowSum: Float = 0
+        let base = row * cols
+        for col in 0..<cols {
+            let idx = base + col
+            rowSum += Float(hypot(Double(re[idx]), Double(im[idx])))
+        }
+        maxRowSum = max(maxRowSum, rowSum)
+    }
+    return maxRowSum
+}
+
+/// Solve the CHIEF-overdetermined system in complex128 by least squares (zgels,
+/// QR): stack the n x n boundary operator A (rhs b) on top of scale*C (the m
+/// CHIEF rows, rhs scale*d) and minimize ||M*p - r||_2. The scale rescales the
+/// collocation CHIEF rows so they are numerically comparable to the Galerkin
+/// boundary rows: scale = chief_weight * ||A||_inf / max(||C||_inf, eps).
+///
+/// The solved pressure (first n elements of the LS solution) is narrowed back to
+/// Complex32 for the f32 pipeline; the float64 path piggybacks on Feature 1's
+/// complex128 LAPACK machinery (the point of CHIEF is to resolve a near-singular
+/// system, so doing the LS in f32 would partially defeat it).
+///
+/// chief_residual_rel is computed EXPLICITLY as ||scale*(C*p - d)||_2 / ||b||_2
+/// (the plan's robust fallback) rather than relying on zgels leaving the residual
+/// in the trailing rows of the overwritten RHS, so it does not depend on the
+/// exact Accelerate zgels residual-row semantics.
+func solveDenseLeastSquaresZgels(
+    aReRowMajor: [Float],
+    aImRowMajor: [Float],
+    rhsRe: [Float],
+    rhsIm: [Float],
+    cReRowMajor: [Float],
+    cImRowMajor: [Float],
+    dRe: [Float],
+    dIm: [Float],
+    weight: Float,
+    cNormInf: Float,
+    aNormInf: Float,
+    n: Int,
+    m: Int
+) throws -> DenseSolveRun {
+    if aReRowMajor.count != n * n || aImRowMajor.count != n * n {
+        try fail("CHIEF least-squares matrix size mismatch")
+    }
+    if rhsRe.count != n || rhsIm.count != n {
+        try fail("CHIEF least-squares RHS size mismatch")
+    }
+    if cReRowMajor.count != m * n || cImRowMajor.count != m * n {
+        try fail("CHIEF row block size mismatch")
+    }
+    if dRe.count != m || dIm.count != m {
+        try fail("CHIEF row RHS size mismatch")
+    }
+    if m < 1 {
+        try fail("CHIEF least-squares requires at least one constraint row")
+    }
+    let start = CFAbsoluteTimeGetCurrent()
+    let rows = n + m
+    let scale = Double(weight) * (cNormInf > 0 ? Double(aNormInf) / Double(cNormInf) : 1.0)
+
+    // Column-major (rows x n) complex128: A on top, scale*C below.
+    var matrix = Array(
+        repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
+        count: rows * n
+    )
+    for row in 0..<n {
+        for col in 0..<n {
+            let source = row * n + col
+            matrix[col * rows + row] = __CLPK_doublecomplex(
+                r: Double(aReRowMajor[source]),
+                i: Double(aImRowMajor[source])
+            )
+        }
+    }
+    for r in 0..<m {
+        for col in 0..<n {
+            let source = r * n + col
+            matrix[col * rows + (n + r)] = __CLPK_doublecomplex(
+                r: Double(cReRowMajor[source]) * scale,
+                i: Double(cImRowMajor[source]) * scale
+            )
+        }
+    }
+
+    // RHS length = max(rows, n) = rows; first n = b, next m = scale*d.
+    var b = Array(
+        repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
+        count: rows
+    )
+    for i in 0..<n {
+        b[i] = __CLPK_doublecomplex(r: Double(rhsRe[i]), i: Double(rhsIm[i]))
+    }
+    for r in 0..<m {
+        b[n + r] = __CLPK_doublecomplex(
+            r: Double(dRe[r]) * scale,
+            i: Double(dIm[r]) * scale
+        )
+    }
+
+    var trans = Int8(78) // "N"
+    var mC = __CLPK_integer(rows)
+    var nC = __CLPK_integer(n)
+    var nrhs = __CLPK_integer(1)
+    var lda = __CLPK_integer(rows)
+    var ldb = __CLPK_integer(rows)
+    var info = __CLPK_integer(0)
+
+    // Workspace query (lwork = -1), then the real solve.
+    var lwork = __CLPK_integer(-1)
+    var workQuery = [__CLPK_doublecomplex(r: 0.0, i: 0.0)]
+    zgels_(&trans, &mC, &nC, &nrhs, &matrix, &lda, &b, &ldb, &workQuery, &lwork, &info)
+    if info != 0 {
+        return DenseSolveRun(
+            pressure: [],
+            implementation: "accelerate_lapack_zgels",
+            seconds: CFAbsoluteTimeGetCurrent() - start,
+            lapackInfo: Int32(info),
+            rcond: nil,
+            dtype: "float64",
+            chiefResidualRel: nil
+        )
+    }
+    let workSize = max(1, Int(workQuery[0].r))
+    lwork = __CLPK_integer(workSize)
+    var work = Array(
+        repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
+        count: workSize
+    )
+    zgels_(&trans, &mC, &nC, &nrhs, &matrix, &lda, &b, &ldb, &work, &lwork, &info)
+    if info != 0 {
+        return DenseSolveRun(
+            pressure: [],
+            implementation: "accelerate_lapack_zgels",
+            seconds: CFAbsoluteTimeGetCurrent() - start,
+            lapackInfo: Int32(info),
+            rcond: nil,
+            dtype: "float64",
+            chiefResidualRel: nil
+        )
+    }
+
+    // Extract the least-squares solution (first n elements of b).
+    var solution = Array(
+        repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
+        count: n
+    )
+    for i in 0..<n {
+        solution[i] = b[i]
+    }
+
+    // Recompute the CHIEF residual EXPLICITLY: ||scale*(C*p - d)||_2 / ||b||_2,
+    // using the original row-major C/d (not the overwritten LS RHS rows).
+    var residSq = 0.0
+    for r in 0..<m {
+        var accRe = 0.0
+        var accIm = 0.0
+        for col in 0..<n {
+            let cre = Double(cReRowMajor[r * n + col])
+            let cim = Double(cImRowMajor[r * n + col])
+            let pre = solution[col].r
+            let pim = solution[col].i
+            accRe += cre * pre - cim * pim
+            accIm += cre * pim + cim * pre
+        }
+        let diffRe = scale * (accRe - Double(dRe[r]))
+        let diffIm = scale * (accIm - Double(dIm[r]))
+        residSq += diffRe * diffRe + diffIm * diffIm
+    }
+    var refSq = 0.0
+    for i in 0..<n {
+        refSq += Double(rhsRe[i]) * Double(rhsRe[i]) + Double(rhsIm[i]) * Double(rhsIm[i])
+    }
+    let chiefResidualRel = refSq > 0 ? (residSq / refSq).squareRoot() : residSq.squareRoot()
+
+    return DenseSolveRun(
+        pressure: solution.map { Complex32(re: Float($0.r), im: Float($0.i)) },
+        implementation: "accelerate_lapack_zgels",
+        seconds: CFAbsoluteTimeGetCurrent() - start,
+        lapackInfo: Int32(info),
+        rcond: nil,
+        dtype: "float64",
+        chiefResidualRel: chiefResidualRel
+    )
+}
+
+/// Dense solve for one case: the plain square LU/zgesv path, OR the
+/// CHIEF-overdetermined least-squares (zgels) path when interior CHIEF points
+/// are present. The CHIEF rows reuse the field-eval kernels (real-k), carry the
+/// identical Robin fold as the boundary rows, and are auto-scaled by
+/// ||A||_inf/||C||_inf * chief_weight. File-scope (not a captured closure) so the
+/// concurrent solve pool can call it without capturing the batch's mutable
+/// per-case arrays; the sequential and concurrent solve sites share it so the
+/// CHIEF math is assembled identically in all paths.
+func solveCaseDense(
+    arrays: AssemblyArrays,
+    geom: Geometry,
+    chiefPoints: [(Float, Float, Float)]?,
+    chiefWeight: Float,
+    driverNeumann: [Complex32],
+    k: Float,
+    kImag: Float,
+    robinBetas: [Complex32]?
+) throws -> DenseSolveRun {
+    guard let chiefPoints else {
+        return try solveDenseAccelerate(
+            aReRowMajor: arrays.aRe,
+            aImRowMajor: arrays.aIm,
+            rhsRe: arrays.rhsRe,
+            rhsIm: arrays.rhsIm,
+            n: geom.p1DofCount
+        )
+    }
+    let chiefRows = assembleChiefRows(
+        geom: geom,
+        chiefPoints: chiefPoints,
+        driverNeumann: driverNeumann,
+        k: k,
+        kImag: kImag,
+        robinBetas: robinBetas
+    )
+    let n = geom.p1DofCount
+    let aNormInf = matrixInfNormRowMajor(
+        re: arrays.aRe, im: arrays.aIm, rows: n, cols: n
+    )
+    return try solveDenseLeastSquaresZgels(
+        aReRowMajor: arrays.aRe,
+        aImRowMajor: arrays.aIm,
+        rhsRe: arrays.rhsRe,
+        rhsIm: arrays.rhsIm,
+        cReRowMajor: chiefRows.cRe,
+        cImRowMajor: chiefRows.cIm,
+        dRe: chiefRows.dRe,
+        dIm: chiefRows.dIm,
+        weight: chiefWeight,
+        cNormInf: chiefRows.cNormInf,
+        aNormInf: aNormInf,
+        n: n,
+        m: chiefPoints.count
+    )
+}
+
 func solveDenseAccelerateCgesv(
     aReRowMajor: [Float],
     aImRowMajor: [Float],
@@ -5635,6 +6192,15 @@ func solveDenseAccelerate(
     rhsIm: [Float],
     n: Int
 ) throws -> DenseSolveRun {
+    if try requestedDenseSolveDtype() == "float64" {
+        return try solveDenseAccelerateZgesv(
+            aReRowMajor: aReRowMajor,
+            aImRowMajor: aImRowMajor,
+            rhsRe: rhsRe,
+            rhsIm: rhsIm,
+            n: n
+        )
+    }
     let implementation = try requestedDenseSolveImplementation()
     if implementation == "cgetrf_cgetrs" {
         return try solveDenseAccelerateCgetrfCgetrs(
@@ -6285,6 +6851,7 @@ func assembleSolveStandardNeumannBatch(
         if let refineResidualRel = solve.refineResidualRel {
             caseResult["dense_solve_refine_residual_rel"] = refineResidualRel
         }
+        caseResult["dense_solve_dtype"] = solve.dtype
         if let caseId = casePayload["case_id"] as? String {
             caseResult["case_id"] = caseId
         }
@@ -6444,6 +7011,24 @@ func assembleSolveEvaluateStandardNeumannBatch(
         sharedObservationPoints = points
         sharedObservationBuffer = cached.buffer
         sharedObservationCount = cached.count
+    }
+
+    // Pre-read the shared CHIEF interior overdetermination points (one file
+    // across all cases, like observation points). When present, every case's
+    // dense solve becomes an overdetermined least-squares (zgels) solve that
+    // stacks the boundary operator on the CHIEF null-field constraint rows,
+    // curing the exterior-BIE fictitious-eigenvalue non-uniqueness.
+    let chiefPoints: [(Float, Float, Float)]?
+    let chiefWeight: Float
+    if let chiefDescriptor = cases[0]["chief_points"] as? [String: Any] {
+        chiefPoints = try readChiefPoints(root: geom.root, descriptor: chiefDescriptor)
+        chiefWeight = Float(try optionalDouble(cases[0], "chief_weight", default: 1.0))
+        if !(chiefWeight.isFinite && chiefWeight > 0) {
+            try fail("chief_weight must be finite and positive")
+        }
+    } else {
+        chiefPoints = nil
+        chiefWeight = 1.0
     }
 
     // Pre-read per-case wavenumbers and Neumann data so case i+1's GPU
@@ -6611,12 +7196,15 @@ func assembleSolveEvaluateStandardNeumannBatch(
             }
             do {
                 let assembly = try assemblyRun(from: finished, caseIndex: caseIndex)
-                let solve = try solveDenseAccelerate(
-                    aReRowMajor: assembly.arrays.aRe,
-                    aImRowMajor: assembly.arrays.aIm,
-                    rhsRe: assembly.arrays.rhsRe,
-                    rhsIm: assembly.arrays.rhsIm,
-                    n: geom.p1DofCount
+                let solve = try solveCaseDense(
+                    arrays: assembly.arrays,
+                    geom: geom,
+                    chiefPoints: chiefPoints,
+                    chiefWeight: chiefWeight,
+                    driverNeumann: caseNeumanns[caseIndex],
+                    k: caseKs[caseIndex],
+                    kImag: caseKImag[caseIndex],
+                    robinBetas: caseRobinBetas[caseIndex]
                 )
                 solveResults.store(
                     .success(SolvedCase(assembly: assembly, solve: solve)),
@@ -6711,12 +7299,15 @@ func assembleSolveEvaluateStandardNeumannBatch(
             solve = solved.solve
         } else if pipelineAssembly {
             assembly = try pipelinedAssemblyRun(caseIndex)
-            solve = try solveDenseAccelerate(
-                aReRowMajor: assembly.arrays.aRe,
-                aImRowMajor: assembly.arrays.aIm,
-                rhsRe: assembly.arrays.rhsRe,
-                rhsIm: assembly.arrays.rhsIm,
-                n: geom.p1DofCount
+            solve = try solveCaseDense(
+                arrays: assembly.arrays,
+                geom: geom,
+                chiefPoints: chiefPoints,
+                chiefWeight: chiefWeight,
+                driverNeumann: neumann,
+                k: k,
+                kImag: kImag,
+                robinBetas: robinBetas
             )
         } else {
             assembly = try assembleRegular(
@@ -6727,12 +7318,15 @@ func assembleSolveEvaluateStandardNeumannBatch(
                 robinBetas: robinBetas,
                 residentContext: context
             )
-            solve = try solveDenseAccelerate(
-                aReRowMajor: assembly.arrays.aRe,
-                aImRowMajor: assembly.arrays.aIm,
-                rhsRe: assembly.arrays.rhsRe,
-                rhsIm: assembly.arrays.rhsIm,
-                n: geom.p1DofCount
+            solve = try solveCaseDense(
+                arrays: assembly.arrays,
+                geom: geom,
+                chiefPoints: chiefPoints,
+                chiefWeight: chiefWeight,
+                driverNeumann: neumann,
+                k: k,
+                kImag: kImag,
+                robinBetas: robinBetas
             )
         }
         if solve.lapackInfo != 0 {
@@ -6815,6 +7409,15 @@ func assembleSolveEvaluateStandardNeumannBatch(
         }
         if let refineResidualRel = solve.refineResidualRel {
             caseResult["dense_solve_refine_residual_rel"] = refineResidualRel
+        }
+        caseResult["dense_solve_dtype"] = solve.dtype
+        if let chiefPoints {
+            caseResult["chief_points"] = true
+            caseResult["chief_points_count"] = chiefPoints.count
+            caseResult["chief_solver"] = "accelerate_lapack_zgels"
+            if let chiefResidualRel = solve.chiefResidualRel {
+                caseResult["chief_residual_rel"] = chiefResidualRel
+            }
         }
         if kImag != 0.0 {
             caseResult["assembly_k_imag_f32"] = kImag

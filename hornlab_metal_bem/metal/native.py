@@ -732,7 +732,11 @@ class MetalNativeStandardSession:
         observation_points: NDArray[Any],
         *,
         k_imag_f32: NDArray[Any] | None = None,
-        impedance_sources: dict[int, complex] | None = None,
+        impedance_sources: (
+            dict[int, complex]
+            | list[dict[int, complex] | None]
+            | None
+        ) = None,
         batch_id: str = "batch",
         operation_id: str = "assembly-solve-field-batch",
         source_tags: list[int] | tuple[int, ...] | None = None,
@@ -740,6 +744,9 @@ class MetalNativeStandardSession:
         write_surface_pressure: bool = True,
         write_batched_field: bool = False,
         on_case_result: Any | None = None,
+        dense_solve_dtype: str = "float32",
+        chief_points: NDArray[Any] | None = None,
+        chief_weight: float = 1.0,
     ) -> list[Any]:
         """Assemble, solve, and evaluate field in one resident helper run.
 
@@ -795,22 +802,53 @@ class MetalNativeStandardSession:
             raise ValueError("neumann_dp0 must be complex")
         if not np.all(np.isfinite(neumann_values)):
             raise ValueError("neumann_dp0 must contain only finite values")
-        impedance_payload: dict[str, list[float]] | None = None
-        if impedance_sources:
-            impedance_payload = {}
-            for tag, beta in impedance_sources.items():
+        def _beta_payload(
+            sources: dict[int, complex] | None,
+        ) -> dict[str, list[float]] | None:
+            if not sources:
+                return None
+            out: dict[str, list[float]] = {}
+            for tag, beta in sources.items():
                 tag_value = int(tag)
                 beta_value = complex(beta)
                 if tag_value < 0:
                     raise ValueError("impedance_sources tags must be non-negative")
-                if not np.isfinite(beta_value.real) or not np.isfinite(beta_value.imag):
+                if not np.isfinite(beta_value.real) or not np.isfinite(
+                    beta_value.imag
+                ):
                     raise ValueError("impedance_sources values must be finite")
-                impedance_payload[str(tag_value)] = [
+                out[str(tag_value)] = [
                     float(np.float32(beta_value.real)),
                     float(np.float32(beta_value.imag)),
                 ]
+            return out
+
+        # Accept either a single dict (back-compat: one Robin payload reused
+        # for every case) or a per-frequency list of dicts (one per case, for
+        # impedance_source_callback / beta(f)). Build one payload per case.
+        if isinstance(impedance_sources, list):
+            if len(impedance_sources) != frequencies.size:
+                raise ValueError(
+                    "impedance_sources list must have one dict per frequency "
+                    f"({frequencies.size}), got {len(impedance_sources)}"
+                )
+            impedance_payloads = [_beta_payload(d) for d in impedance_sources]
+        else:
+            shared = _beta_payload(impedance_sources)
+            impedance_payloads = [shared] * int(frequencies.size)
         expect_complex_k = bool(np.any(k_imag_values != 0.0))
-        expect_robin = impedance_payload is not None
+        # Robin capability is checked PER CASE: beta(f) (impedance_source_callback)
+        # can be active on some frequencies and absent on others, so a single
+        # batch-global expectation would falsely flag the no-Robin cases as a
+        # stale (pre-Robin) helper binary at _dense_solve_field_result.
+        expect_robin_per_case = [payload is not None for payload in impedance_payloads]
+        if dense_solve_dtype not in {"float32", "float64"}:
+            raise ValueError("dense_solve_dtype must be 'float32' or 'float64'")
+        # The dtype routes to the helper via env var (HORNLAB_METAL_BEM_NATIVE_
+        # DENSE_SOLVE_DTYPE) set sweep-globally in sweep._native_env_overrides;
+        # this kwarg only drives the capability handshake so a stale binary that
+        # predates float64 support errors loudly instead of silently running f32.
+        expect_float64 = dense_solve_dtype == "float64"
 
         points_3xn = _require_observation_points_3xn(observation_points)
         n_obs = int(points_3xn.shape[1])
@@ -833,6 +871,29 @@ class MetalNativeStandardSession:
             dtype=np.float32,
             relative_to=self.info.work_dir,
         )
+        # Shared CHIEF interior overdetermination points (3, m) f32, written once
+        # like obs_points. When present, every case's dense solve becomes an
+        # overdetermined least-squares (zgels) solve in the helper. The kwarg
+        # presence also drives the capability handshake (expect_chief) so a stale
+        # binary that predates CHIEF errors loudly instead of silently ignoring it.
+        chief_desc = None
+        expect_chief = chief_points is not None
+        if expect_chief:
+            chief_arr = np.asarray(chief_points, dtype=np.float32)
+            if chief_arr.ndim != 2 or chief_arr.shape[0] != 3:
+                raise ValueError("chief_points must have shape (3, m)")
+            if chief_arr.shape[1] == 0:
+                raise ValueError("chief_points must be non-empty when set")
+            if not np.all(np.isfinite(chief_arr)):
+                raise ValueError("chief_points must be finite")
+            if not (np.isfinite(chief_weight) and float(chief_weight) > 0):
+                raise ValueError("chief_weight must be finite and positive")
+            chief_desc = write_binary_array(
+                np.ascontiguousarray(chief_arr),
+                inputs_dir / "chief_points_3xm_f32.bin",
+                dtype=np.float32,
+                relative_to=self.info.work_dir,
+            )
         n = self.geometry_payload.p1_dof_count
         batch_outputs: dict[str, Any] | None = None
         if write_batched_field:
@@ -919,8 +980,16 @@ class MetalNativeStandardSession:
                         else {}
                     ),
                     **(
-                        {"impedance_sources": impedance_payload}
-                        if impedance_payload
+                        {"impedance_sources": impedance_payloads[idx]}
+                        if impedance_payloads[idx]
+                        else {}
+                    ),
+                    **(
+                        {
+                            "chief_points": chief_desc.to_manifest(),
+                            "chief_weight": float(chief_weight),
+                        }
+                        if chief_desc is not None
                         else {}
                     ),
                 }
@@ -952,7 +1021,9 @@ class MetalNativeStandardSession:
                 expected_count=int(frequencies.size),
                 on_case_result=on_case_result,
                 expect_complex_k=expect_complex_k,
-                expect_robin=expect_robin,
+                expect_robin_per_case=expect_robin_per_case,
+                expect_float64=expect_float64,
+                expect_chief=expect_chief,
             )
 
         self._run_native_helper(
@@ -972,9 +1043,11 @@ class MetalNativeStandardSession:
                 case_result,
                 batch_diagnostics,
                 expect_complex_k=expect_complex_k,
-                expect_robin=expect_robin,
+                expect_robin=expect_robin_per_case[idx],
+                expect_float64=expect_float64,
+                expect_chief=expect_chief,
             )
-            for case_result in case_results
+            for idx, case_result in enumerate(case_results)
         ]
 
     def _dense_solve_field_result(
@@ -983,6 +1056,8 @@ class MetalNativeStandardSession:
         batch_diagnostics: dict[str, Any],
         expect_complex_k: bool = False,
         expect_robin: bool = False,
+        expect_float64: bool = False,
+        expect_chief: bool = False,
     ) -> Any:
         from .session import DenseSolveFieldResult
 
@@ -1004,6 +1079,22 @@ class MetalNativeStandardSession:
             raise RuntimeError(
                 "native helper acknowledged no Robin boundary support; the "
                 "helper binary predates impedance_sources. Rebuild with "
+                "`swift build -c release` in "
+                "hornlab_metal_bem/metal/native_helper or unset "
+                "HORNLAB_METAL_BEM_NATIVE."
+            )
+        if expect_float64 and diagnostics.get("dense_solve_dtype") != "float64":
+            raise RuntimeError(
+                "native helper acknowledged no float64 dense-solve support; the "
+                "helper binary predates dense_solve_dtype. Rebuild with "
+                "`swift build -c release` in "
+                "hornlab_metal_bem/metal/native_helper or unset "
+                "HORNLAB_METAL_BEM_NATIVE."
+            )
+        if expect_chief and diagnostics.get("chief_points") is not True:
+            raise RuntimeError(
+                "native helper acknowledged no CHIEF support; the helper binary "
+                "predates chief_points. Rebuild with "
                 "`swift build -c release` in "
                 "hornlab_metal_bem/metal/native_helper or unset "
                 "HORNLAB_METAL_BEM_NATIVE."
@@ -1058,7 +1149,9 @@ class MetalNativeStandardSession:
         expected_count: int,
         on_case_result: Any,
         expect_complex_k: bool = False,
-        expect_robin: bool = False,
+        expect_robin_per_case: list[bool] | None = None,
+        expect_float64: bool = False,
+        expect_chief: bool = False,
     ) -> list[Any]:
         """Run one batch helper invocation, firing callbacks per case.
 
@@ -1071,6 +1164,8 @@ class MetalNativeStandardSession:
         """
         from .session import read_json_manifest
 
+        if expect_robin_per_case is None:
+            expect_robin_per_case = [False] * expected_count
         op = "assemble_solve_evaluate_standard_neumann_batch"
         solved_fields: list[Any] = []
 
@@ -1085,7 +1180,9 @@ class MetalNativeStandardSession:
                     case_result,
                     {},
                     expect_complex_k=expect_complex_k,
-                    expect_robin=expect_robin,
+                    expect_robin=expect_robin_per_case[len(solved_fields)],
+                    expect_float64=expect_float64,
+                    expect_chief=expect_chief,
                 )
                 solved_fields.append(solved)
                 if on_case_result(len(solved_fields) - 1, solved) is False:
@@ -1115,7 +1212,9 @@ class MetalNativeStandardSession:
                 case_results[index],
                 batch_diagnostics,
                 expect_complex_k=expect_complex_k,
-                expect_robin=expect_robin,
+                expect_robin=expect_robin_per_case[index],
+                expect_float64=expect_float64,
+                expect_chief=expect_chief,
             )
             solved_fields.append(solved)
             if on_case_result(index, solved) is False:
@@ -1767,6 +1866,11 @@ def _native_case_diagnostics(
         "dense_solve_condition_1norm",
         "dense_solve_refine_iterations",
         "dense_solve_refine_residual_rel",
+        "dense_solve_dtype",
+        "chief_points",
+        "chief_points_count",
+        "chief_residual_rel",
+        "chief_solver",
         "assembly_k_imag_f32",
         "field_k_real_f32",
         "complex_k",

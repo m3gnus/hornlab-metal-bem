@@ -73,6 +73,47 @@ class SolveConfig:
     # Experimental Robin boundary condition. Maps physical tag to normalized
     # surface admittance beta = rho*c/Zs; beta=0 is rigid, beta=1 air-matched.
     impedance_sources: dict[int, complex] = field(default_factory=dict)
+    # Frequency-dependent wall admittance. Mirrors velocity_source_callback:
+    # called once per solve frequency, returns {tag: beta} that OVERRIDES (for
+    # tags also in impedance_sources) and EXTENDS (for new tags) the static
+    # impedance_sources for that frequency. beta = rho*c/Zs (normalized
+    # admittance). Passivity requires Re(beta) >= 0; the sweep rejects any
+    # violation with ValueError.
+    #
+    # Callback-only Robin tags are fully supported: the sweep resolves the
+    # impedance sources exactly once per frequency and threads that resolved
+    # tag set into the driver-Neumann builder, so a tag driven by the callback
+    # ALONE (absent from the static impedance_sources dict) is correctly
+    # skipped for the prescribed-velocity BC — no double boundary condition.
+    # Use the static impedance_sources dict only for tags that should always
+    # carry a Robin BC at every frequency.
+    impedance_source_callback: Callable[[float], dict[int, complex]] | None = None
+
+    # CHIEF (Combined Helmholtz Interior-integral Equation Formulation) points:
+    # interior overdetermination points placed *inside* the modeled body's
+    # cavities (e.g. an LF front chamber / port volume). Each adds one interior
+    # null-field constraint row; the combined system is solved by least squares
+    # (zgels, complex128), which removes the exterior-BIE fictitious-eigenvalue
+    # non-uniqueness that makes an LF-driven solve blow up at an interior-mode
+    # frequency. Shape (m, 3) in metres, in the SAME frame as the mesh vertices.
+    # None disables CHIEF (the default; bit-unchanged from the plain solve).
+    #
+    # Placement guidance: put points in the interior bulk of each enclosed cavity
+    # that hosts the spurious mode (4-12 total is standard; start with ~6). Stay
+    # strictly inside the watertight surface and ~1 element edge away from the
+    # wall (a point too near the boundary makes G(x_c, y) near-singular and
+    # pollutes the row). With native_symmetry_plane set, the modeled domain is a
+    # reduced wedge and the helper adds analytic images: give points in the
+    # reduced frame, inside the reduced cavity, and OFF the symmetry planes (so a
+    # point is not self-cancelled by its image). CHIEF composes with both the
+    # 'standard' and 'complex_k' formulations. The least-squares path runs in
+    # float64 regardless of dense_solve_dtype.
+    chief_points: NDArray[np.float64] | None = None
+    # Relative weight applied to the CHIEF rows before the least-squares solve.
+    # 1.0 (default) auto-scales each case by ||A||_inf/||C||_inf in the helper so
+    # the collocation CHIEF rows are numerically comparable to the Galerkin
+    # boundary rows; override only to bias the interior constraint harder/softer.
+    chief_weight: float = 1.0
 
     # Observation
     observation: ObservationConfig = field(default_factory=ObservationConfig)
@@ -94,6 +135,15 @@ class SolveConfig:
     # legitimate mouth rim from a bad cut.
     native_check_open_edges: bool = True
     metal_native_assembly_mode: MetalNativeAssemblyMode = "corrected"
+    # Dense LU precision. "float32" (default) matches the historical Complex32
+    # LU. "float64" factors/solves the float32-assembled system in complex128
+    # (Accelerate zgesv) to recover the 3-4 digits float32 LU loses near a
+    # near-singular system, then narrows the solved pressure back to f32;
+    # assembly and all downstream buffers/outputs stay float32. Mixed precision.
+    # The complex128 buffers roughly triple peak solve memory, so the native
+    # routing lowers the default solve concurrency for the float64 path unless
+    # the caller pinned HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY.
+    dense_solve_dtype: Literal["float32", "float64"] = "float32"
     return_surface_pressure: bool = False
     metal_native_threads_per_group: int | None = None
     metal_native_matrix_threads_per_group: int | None = None
@@ -157,6 +207,18 @@ class SolveConfig:
             beta_value = complex(beta)
             if not math.isfinite(beta_value.real) or not math.isfinite(beta_value.imag):
                 raise ValueError("impedance_sources values must be finite complex numbers")
+        if self.chief_points is not None:
+            import numpy as _np
+
+            pts = _np.asarray(self.chief_points, dtype=float)
+            if pts.ndim != 2 or pts.shape[1] != 3:
+                raise ValueError("chief_points must have shape (m, 3)")
+            if pts.shape[0] == 0:
+                raise ValueError("chief_points must be non-empty when set")
+            if not _np.all(_np.isfinite(pts)):
+                raise ValueError("chief_points must be finite")
+        if not (math.isfinite(self.chief_weight) and self.chief_weight > 0):
+            raise ValueError("chief_weight must be finite and positive")
         if (
             self.native_symmetry_plane is not None
             and self.native_symmetry_plane not in NATIVE_SYMMETRY_PLANES
@@ -174,6 +236,8 @@ class SolveConfig:
                 "metal_native_assembly_mode must be 'corrected', 'optimized', "
                 "'reference', or 'parity'"
             )
+        if self.dense_solve_dtype not in {"float32", "float64"}:
+            raise ValueError("dense_solve_dtype must be 'float32' or 'float64'")
         if (
             self.metal_native_threads_per_group is not None
             and self.metal_native_threads_per_group <= 0

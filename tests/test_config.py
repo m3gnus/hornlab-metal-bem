@@ -84,6 +84,109 @@ def test_solve_config_accepts_experimental_complex_k_and_robin():
     assert cfg.impedance_sources[9] == 0.02 + 0.0j
 
 
+def test_solve_config_impedance_source_callback_defaults_none():
+    assert SolveConfig().impedance_source_callback is None
+
+
+def test_impedance_source_callback_per_frequency_overrides_static():
+    import numpy as np
+
+    from hornlab_metal_bem.sweep import _impedance_sources_for_frequencies
+
+    tags = np.array([2, 8, 9], dtype=np.int32)
+    cfg = SolveConfig(
+        impedance_sources={8: 0.10 + 0.0j},
+        impedance_source_callback=lambda f: {8: (0.05 if f < 650 else 0.20) + 0j},
+    )
+    result = _impedance_sources_for_frequencies(
+        tags, np.array([600.0, 700.0], dtype=np.float64), cfg
+    )
+    # Callback set -> per-frequency list, callback overrides the static value.
+    assert isinstance(result, list)
+    assert result[0][8] == 0.05 + 0.0j
+    assert result[1][8] == 0.20 + 0.0j
+
+
+def test_impedance_source_callback_extends_static_tags():
+    import numpy as np
+
+    from hornlab_metal_bem.sweep import _impedance_sources_for_frequencies
+
+    tags = np.array([2, 8, 9], dtype=np.int32)
+    cfg = SolveConfig(
+        impedance_sources={9: 0.02 + 0.0j},
+        impedance_source_callback=lambda f: {8: 0.07 + 0.0j},
+    )
+    result = _impedance_sources_for_frequencies(
+        tags, np.array([500.0], dtype=np.float64), cfg
+    )
+    # Static tag 9 survives; callback tag 8 is added on top.
+    assert result[0] == {9: 0.02 + 0.0j, 8: 0.07 + 0.0j}
+
+
+def test_impedance_source_callback_no_callback_returns_static_dict():
+    import numpy as np
+
+    from hornlab_metal_bem.sweep import _impedance_sources_for_frequencies
+
+    tags = np.array([2, 8], dtype=np.int32)
+    cfg = SolveConfig(impedance_sources={8: 0.05 + 0.0j})
+    result = _impedance_sources_for_frequencies(
+        tags, np.array([500.0, 600.0], dtype=np.float64), cfg
+    )
+    # No callback -> single static dict (not a per-frequency list).
+    assert result == {8: 0.05 + 0.0j}
+
+
+def test_impedance_source_callback_passivity_guard():
+    import numpy as np
+
+    from hornlab_metal_bem.sweep import _impedance_sources_for_frequencies
+
+    tags = np.array([2, 8], dtype=np.int32)
+    cfg = SolveConfig(
+        impedance_sources={8: 0.0 + 0.0j},
+        impedance_source_callback=lambda f: {8: -0.1 + 0.0j},
+    )
+    with pytest.raises(ValueError, match="passive"):
+        _impedance_sources_for_frequencies(
+            tags, np.array([500.0], dtype=np.float64), cfg
+        )
+
+
+def test_impedance_source_callback_rejects_nonfinite_beta():
+    import numpy as np
+
+    from hornlab_metal_bem.sweep import _impedance_sources_for_frequencies
+
+    tags = np.array([2, 8], dtype=np.int32)
+    cfg = SolveConfig(
+        impedance_sources={8: 0.0 + 0.0j},
+        impedance_source_callback=lambda f: {8: complex(float("nan"), 0.0)},
+    )
+    with pytest.raises(ValueError, match="non-finite"):
+        _impedance_sources_for_frequencies(
+            tags, np.array([500.0], dtype=np.float64), cfg
+        )
+
+
+def test_impedance_source_callback_skips_unknown_mesh_tag():
+    import numpy as np
+
+    from hornlab_metal_bem.sweep import _impedance_sources_for_frequencies
+
+    tags = np.array([2, 8], dtype=np.int32)
+    cfg = SolveConfig(
+        impedance_sources={8: 0.05 + 0.0j},
+        impedance_source_callback=lambda f: {99: 0.30 + 0.0j},  # tag not in mesh
+    )
+    result = _impedance_sources_for_frequencies(
+        tags, np.array([500.0], dtype=np.float64), cfg
+    )
+    # Unknown tag 99 is dropped; static tag 8 remains.
+    assert result[0] == {8: 0.05 + 0.0j}
+
+
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
@@ -304,3 +407,120 @@ def test_solve_config_callbacks_accept_callables():
     cfg.progress_callback(0, 5, 1000.0)
     assert calls == [("progress", 0)]
     assert cfg.on_frequency_result(0, 1000.0, {}) is True
+
+
+def test_solve_config_dense_solve_dtype_defaults_float32():
+    assert SolveConfig().dense_solve_dtype == "float32"
+
+
+def test_solve_config_dense_solve_dtype_rejects_unknown():
+    with pytest.raises(ValueError, match="dense_solve_dtype"):
+        SolveConfig(dense_solve_dtype="float16")
+
+
+def test_dense_solve_dtype_float32_not_in_native_env(monkeypatch):
+    # The default float32 path must not lower concurrency or otherwise diverge
+    # from the historical env (it still sets the dtype env explicitly, which the
+    # helper treats as its default).
+    from hornlab_metal_bem.sweep import _native_env_overrides
+
+    monkeypatch.delenv(
+        "HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY", raising=False
+    )
+    overrides = _native_env_overrides(SolveConfig())
+    assert overrides["HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE"] == "float32"
+    assert "HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY" not in overrides
+
+
+def test_dense_solve_dtype_float64_plumbs_through_native_env(monkeypatch):
+    # float64 routes via env var and lowers the default solve concurrency to
+    # bound the ~3x complex128 peak memory, unless the caller pinned it.
+    from hornlab_metal_bem.sweep import _native_env_overrides
+
+    monkeypatch.delenv(
+        "HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY", raising=False
+    )
+    overrides = _native_env_overrides(SolveConfig(dense_solve_dtype="float64"))
+    assert overrides["HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE"] == "float64"
+    assert overrides["HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY"] == "3"
+
+
+def test_dense_solve_dtype_float64_respects_pinned_concurrency(monkeypatch):
+    # A caller-pinned concurrency env must win over the float64 auto-lowering.
+    from hornlab_metal_bem.sweep import _native_env_overrides
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY", "6")
+    overrides = _native_env_overrides(SolveConfig(dense_solve_dtype="float64"))
+    assert "HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY" not in overrides
+
+
+def test_chief_points_default_is_none():
+    # CHIEF is opt-in; the default leaves the solve a plain square LU.
+    cfg = SolveConfig()
+    assert cfg.chief_points is None
+    assert cfg.chief_weight == 1.0
+
+
+def test_chief_points_valid_shape_accepted():
+    import numpy as np
+
+    pts = np.array([[0.01, 0.02, 0.03], [-0.01, 0.0, 0.04]], dtype=np.float64)
+    cfg = SolveConfig(chief_points=pts, chief_weight=2.5)
+    assert cfg.chief_points.shape == (2, 3)
+    assert cfg.chief_weight == 2.5
+
+
+def test_chief_points_wrong_shape_rejected():
+    import numpy as np
+
+    with pytest.raises(ValueError, match=r"chief_points must have shape \(m, 3\)"):
+        SolveConfig(chief_points=np.zeros((3, 2), dtype=np.float64))
+    with pytest.raises(ValueError, match=r"chief_points must have shape \(m, 3\)"):
+        SolveConfig(chief_points=np.zeros((4,), dtype=np.float64))
+
+
+def test_chief_points_empty_rejected():
+    import numpy as np
+
+    with pytest.raises(ValueError, match="chief_points must be non-empty"):
+        SolveConfig(chief_points=np.zeros((0, 3), dtype=np.float64))
+
+
+def test_chief_points_non_finite_rejected():
+    import numpy as np
+
+    pts = np.array([[0.0, 0.0, 0.0], [np.nan, 0.0, 0.0]], dtype=np.float64)
+    with pytest.raises(ValueError, match="chief_points must be finite"):
+        SolveConfig(chief_points=pts)
+
+
+def test_chief_weight_non_positive_rejected():
+    import numpy as np
+
+    pts = np.array([[0.01, 0.02, 0.03]], dtype=np.float64)
+    with pytest.raises(ValueError, match="chief_weight must be finite and positive"):
+        SolveConfig(chief_points=pts, chief_weight=0.0)
+    with pytest.raises(ValueError, match="chief_weight must be finite and positive"):
+        SolveConfig(chief_points=pts, chief_weight=-1.0)
+
+
+def test_chief_weight_non_finite_rejected():
+    """NaN/inf chief_weight must be rejected at the config layer: a non-finite
+    weight would otherwise reach the native LS scaling and produce NaN/inf
+    scaling of the CHIEF rows (it passed when validation only checked <= 0)."""
+    import numpy as np
+
+    pts = np.array([[0.01, 0.02, 0.03]], dtype=np.float64)
+    for bad in (float("nan"), float("inf"), -float("inf")):
+        with pytest.raises(
+            ValueError, match="chief_weight must be finite and positive"
+        ):
+            SolveConfig(chief_points=pts, chief_weight=bad)
+    # chief_weight is validated unconditionally (like the prior <= 0 check), so a
+    # non-finite weight is rejected even with chief_points=None. The default
+    # weight of 1.0 is unaffected, so default solves stay bit-identical.
+    with pytest.raises(
+        ValueError, match="chief_weight must be finite and positive"
+    ):
+        SolveConfig(chief_weight=float("nan"))
+    assert SolveConfig().chief_weight == 1.0

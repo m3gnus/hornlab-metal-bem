@@ -2791,6 +2791,241 @@ def test_native_executable_dense_solve_iterative_refinement(
     assert np.linalg.norm(pressure - exact) / np.linalg.norm(exact) < 1e-4
 
 
+def test_native_executable_float64_dense_solve_matches_numpy(
+    monkeypatch,
+    tmp_path,
+):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    # float64 (zgesv) factor/solve of the float32-assembled system, narrowed
+    # back to f32. Must match np.linalg.solve in complex128 to a tolerance much
+    # tighter than the float32 path (bounded only by the f32-narrowed output),
+    # and the per-case diagnostics must report dense_solve_dtype == "float64".
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE", "float64")
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_REFINE", raising=False)
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", raising=False)
+    neumann = np.array([[1.0 + 0.0j, 0.0 + 0.5j]], dtype=np.complex64)
+    frequency_hz = np.array([100.0], dtype=np.float64)
+    k_real = np.array([1.8318326], dtype=np.float32)
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_geometry_buffers(),
+        work_dir=tmp_path / "native-float64-session",
+        session_id="native-float64-test",
+    ) as session:
+        assembly = session.assemble_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            neumann,
+            operation_id="float64-batch-assembly",
+        )[0]
+        solved = session.assemble_solve_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            neumann,
+            operation_id="float64-batch-assembly-solve",
+        )[0]
+
+    matrix = np.fromfile(assembly.matrix_real_f32, dtype="<f4").reshape(
+        assembly.matrix_shape
+    ) + 1j * np.fromfile(assembly.matrix_imag_f32, dtype="<f4").reshape(
+        assembly.matrix_shape
+    )
+    rhs = np.fromfile(assembly.rhs_real_f32, dtype="<f4") + 1j * np.fromfile(
+        assembly.rhs_imag_f32,
+        dtype="<f4",
+    )
+    pressure = np.fromfile(solved.pressure_real_f32, dtype="<f4") + 1j * np.fromfile(
+        solved.pressure_imag_f32,
+        dtype="<f4",
+    )
+    result = json.loads(
+        (
+            tmp_path
+            / "native-float64-session"
+            / "float64-batch-assembly-solve"
+            / "assembly-solve-batch-result.json"
+        ).read_text(encoding="utf-8")
+    )
+    case_result = result["cases"][0]
+    assert solved.lapack_info == 0
+    assert case_result["solve_implementation"] == "accelerate_lapack_zgesv"
+    assert case_result["dense_solve_dtype"] == "float64"
+    # No iterative refinement runs on the float64 path; its bookkeeping keys must
+    # be absent (the plan explicitly skips refinement for float64).
+    assert "dense_solve_refine_iterations" not in case_result
+    assert "dense_solve_refine_residual_rel" not in case_result
+    exact = np.linalg.solve(matrix.astype(np.complex128), rhs.astype(np.complex128))
+    assert np.linalg.norm(pressure - exact) / np.linalg.norm(exact) < 1e-5
+
+
+def test_native_executable_float64_and_float32_dense_solve_agree(
+    monkeypatch,
+    tmp_path,
+):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    # The float32 and float64 paths solve the SAME assembled operator; on a
+    # well-conditioned case they must agree to ~f32 tolerance (the float64
+    # output is narrowed back to f32, so the gap is bounded by f32 rounding).
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_REFINE", raising=False)
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", raising=False)
+    neumann = np.array([[1.0 + 0.0j, 0.0 + 0.5j]], dtype=np.complex64)
+    frequency_hz = np.array([100.0], dtype=np.float64)
+    k_real = np.array([1.8318326], dtype=np.float32)
+
+    def _solve(dtype: str, label: str) -> np.ndarray:
+        monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE", dtype)
+        with MetalNativeStandardSession.create_session(
+            geometry_buffers=_tiny_geometry_buffers(),
+            work_dir=tmp_path / f"native-agree-{label}-session",
+            session_id=f"native-agree-{label}-test",
+        ) as session:
+            solved = session.assemble_solve_standard_neumann_batch(
+                frequency_hz,
+                k_real,
+                neumann,
+                operation_id=f"agree-{label}-batch-assembly-solve",
+            )[0]
+        return np.fromfile(
+            solved.pressure_real_f32, dtype="<f4"
+        ) + 1j * np.fromfile(solved.pressure_imag_f32, dtype="<f4")
+
+    pressure_f32 = _solve("float32", "f32")
+    pressure_f64 = _solve("float64", "f64")
+    assert np.all(np.isfinite(pressure_f32))
+    assert np.all(np.isfinite(pressure_f64))
+    rel = np.linalg.norm(pressure_f64 - pressure_f32) / np.linalg.norm(pressure_f32)
+    assert rel < 1e-4
+
+
+def test_native_executable_chief_points_diagnostics(monkeypatch, tmp_path):
+    """CHIEF interior points route through the evaluate batch: the helper solves
+    the overdetermined system by zgels and emits the chief diagnostics. The
+    solved pressure stays finite and the chief residual is reported."""
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
+    neumann = np.array([[1.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j]], dtype=np.complex64)
+    frequency_hz = np.array([172.0], dtype=np.float64)
+    k_real = np.array([np.float32(2.0 * np.pi * 172.0 / 343.0)], dtype=np.float32)
+    observation_points = np.array(
+        [[0.0, 0.0, 0.7], [0.2, 0.0, 0.8]],
+        dtype=np.float32,
+    )
+    # Interior overdetermination points (m, 3) in the mesh frame; marshalled to
+    # the (3, m) f32 layout the helper expects, exactly as sweep.run does.
+    chief_points = np.array(
+        [[0.02, 0.03, 0.05], [-0.03, 0.02, 0.04], [0.01, -0.02, 0.06]],
+        dtype=np.float64,
+    )
+    chief_3xm = np.ascontiguousarray(chief_points.T, dtype=np.float32)
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_robin_geometry_buffers(),
+        work_dir=tmp_path / "native-chief-session",
+        session_id="native-chief-test",
+    ) as session:
+        solved = session.assemble_solve_evaluate_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            neumann,
+            observation_points,
+            operation_id="resident-chief",
+            source_tags=[2],
+            impedance_source_tag=2,
+            chief_points=chief_3xm,
+        )[0]
+
+    pressure = np.fromfile(solved.pressure_real_f32, dtype="<f4") + 1j * np.fromfile(
+        solved.pressure_imag_f32,
+        dtype="<f4",
+    )
+    field = np.fromfile(solved.field_real_f32, dtype="<f4") + 1j * np.fromfile(
+        solved.field_imag_f32,
+        dtype="<f4",
+    )
+
+    assert solved.lapack_info == 0
+    assert np.all(np.isfinite(pressure))
+    assert np.all(np.isfinite(field))
+    assert solved.diagnostics["chief_points"] is True
+    assert solved.diagnostics["chief_points_count"] == 3
+    assert solved.diagnostics["chief_solver"] == "accelerate_lapack_zgels"
+    assert solved.diagnostics["solve_implementation"] == "accelerate_lapack_zgels"
+    # The least-squares path runs in float64 regardless of dense_solve_dtype.
+    assert solved.diagnostics["dense_solve_dtype"] == "float64"
+    assert np.isfinite(solved.diagnostics["chief_residual_rel"])
+    assert solved.diagnostics["chief_residual_rel"] >= 0.0
+
+
+def test_native_executable_chief_off_matches_plain_solve(monkeypatch, tmp_path):
+    """chief_points=None (the default) must leave the solve bit-for-bit identical
+    to the plain square-LU path: same pressure, same square solver, and no chief
+    diagnostic keys."""
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE", "float32")
+    neumann = np.array([[1.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j]], dtype=np.complex64)
+    frequency_hz = np.array([172.0], dtype=np.float64)
+    k_real = np.array([np.float32(2.0 * np.pi * 172.0 / 343.0)], dtype=np.float32)
+    observation_points = np.array(
+        [[0.0, 0.0, 0.7], [0.2, 0.0, 0.8]],
+        dtype=np.float32,
+    )
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_robin_geometry_buffers(),
+        work_dir=tmp_path / "native-chief-off-session",
+        session_id="native-chief-off-test",
+    ) as session:
+        solved = session.assemble_solve_evaluate_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            neumann,
+            observation_points,
+            operation_id="resident-chief-off",
+            source_tags=[2],
+            impedance_source_tag=2,
+        )[0]
+
+    pressure = np.fromfile(solved.pressure_real_f32, dtype="<f4") + 1j * np.fromfile(
+        solved.pressure_imag_f32,
+        dtype="<f4",
+    )
+    assert solved.lapack_info == 0
+    assert np.all(np.isfinite(pressure))
+    # The default square-LU path (cgesv), not the CHIEF least-squares path.
+    assert solved.diagnostics["solve_implementation"] == "accelerate_lapack_cgesv"
+    assert "chief_points" not in solved.diagnostics
+    assert "chief_residual_rel" not in solved.diagnostics
+    assert "chief_solver" not in solved.diagnostics
+
+
 def test_native_executable_resident_assembly_solve_lu_factor_variant_matches_python(
     monkeypatch,
     tmp_path,
@@ -3592,3 +3827,218 @@ def test_metal_bem_backend_wraps_native_session_without_routing(monkeypatch):
         context.close()
 
     assert fake_session.closed is True
+
+
+def _solve_robin_surface_pressure(
+    session,
+    *,
+    impedance_sources,
+    frequency_hz,
+    k_real,
+    k_imag,
+    operation_id,
+):
+    neumann = np.array(
+        [[1.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j]] * len(frequency_hz),
+        dtype=np.complex64,
+    )
+    observation_points = np.array(
+        [[0.0, 0.0, 0.7], [0.2, 0.0, 0.8]],
+        dtype=np.float32,
+    )
+    return session.assemble_solve_evaluate_standard_neumann_batch(
+        frequency_hz,
+        k_real,
+        neumann,
+        observation_points,
+        k_imag_f32=k_imag,
+        impedance_sources=impedance_sources,
+        operation_id=operation_id,
+        source_tags=[2],
+        impedance_source_tag=2,
+        write_surface_pressure=True,
+    )
+
+
+def _read_surface_pressure(solved):
+    return np.fromfile(solved.pressure_real_f32, dtype="<f4") + 1j * np.fromfile(
+        solved.pressure_imag_f32,
+        dtype="<f4",
+    )
+
+
+def test_impedance_source_callback_per_frequency_beta(monkeypatch, tmp_path):
+    """A per-frequency list of Robin betas must reach the helper as distinct
+    per-case payloads: two frequencies with different beta on tag 8 produce
+    different surface pressure, and both cases are flagged robin_boundary."""
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
+    # Two frequencies. The Robin beta on tag 8 differs between them; the only
+    # difference between the two cases is the per-case impedance_sources dict.
+    frequency_hz = np.array([172.0, 172.0], dtype=np.float64)
+    k_real = np.array(
+        [np.float32(2.0 * np.pi * 172.0 / 343.0)] * 2,
+        dtype=np.float32,
+    )
+    k_imag = (k_real * np.float32(0.005)).astype(np.float32)
+    per_case_beta = [
+        {8: 0.05 + 0.0j},
+        {8: 0.20 + 0.0j},
+    ]
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_robin_geometry_buffers(),
+        work_dir=tmp_path / "native-callback-beta-session",
+        session_id="native-callback-beta-test",
+    ) as session:
+        solved = _solve_robin_surface_pressure(
+            session,
+            impedance_sources=per_case_beta,
+            frequency_hz=frequency_hz,
+            k_real=k_real,
+            k_imag=k_imag,
+            operation_id="resident-callback-beta",
+        )
+
+    assert len(solved) == 2
+    p0 = _read_surface_pressure(solved[0])
+    p1 = _read_surface_pressure(solved[1])
+    assert np.all(np.isfinite(p0))
+    assert np.all(np.isfinite(p1))
+    # Both cases carry a Robin boundary.
+    assert solved[0].diagnostics["robin_boundary"] is True
+    assert solved[1].diagnostics["robin_boundary"] is True
+    # Distinct per-frequency beta -> distinct surface pressure (proves the
+    # per-case dict reached the helper rather than a single shared payload).
+    assert not np.allclose(p0, p1)
+
+
+def test_impedance_source_callback_equals_static_dict(monkeypatch, tmp_path):
+    """A per-case list of identical dicts must produce bit-for-bit the same
+    surface pressure as passing that single dict statically (callback ==
+    static-dict equivalence)."""
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
+    frequency_hz = np.array([172.0, 250.0], dtype=np.float64)
+    k_real = (2.0 * np.pi * frequency_hz / 343.0).astype(np.float32)
+    k_imag = (k_real * np.float32(0.005)).astype(np.float32)
+    static_beta = {8: 0.05 + 0.0j, 9: 0.02 + 0.01j}
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_robin_geometry_buffers(),
+        work_dir=tmp_path / "native-callback-static-session",
+        session_id="native-callback-static-test",
+    ) as session:
+        solved_static = _solve_robin_surface_pressure(
+            session,
+            impedance_sources=static_beta,
+            frequency_hz=frequency_hz,
+            k_real=k_real,
+            k_imag=k_imag,
+            operation_id="resident-static-beta",
+        )
+        solved_list = _solve_robin_surface_pressure(
+            session,
+            impedance_sources=[dict(static_beta), dict(static_beta)],
+            frequency_hz=frequency_hz,
+            k_real=k_real,
+            k_imag=k_imag,
+            operation_id="resident-list-beta",
+        )
+
+    assert len(solved_static) == len(solved_list) == 2
+    for case_static, case_list in zip(solved_static, solved_list):
+        assert case_static.diagnostics["robin_boundary"] is True
+        assert case_list.diagnostics["robin_boundary"] is True
+        p_static = _read_surface_pressure(case_static)
+        p_list = _read_surface_pressure(case_list)
+        np.testing.assert_array_equal(p_static, p_list)
+
+
+def test_impedance_sources_list_length_must_match_frequencies(tmp_path):
+    """A per-case impedance_sources list of the wrong length is rejected
+    Python-side in the session method (before the helper subprocess runs)."""
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+    frequency_hz = np.array([172.0, 250.0], dtype=np.float64)
+    k_real = (2.0 * np.pi * frequency_hz / 343.0).astype(np.float32)
+    neumann = np.array(
+        [[1.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j]] * 2,
+        dtype=np.complex64,
+    )
+    observation_points = np.array([[0.0, 0.0, 0.7]], dtype=np.float32)
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_robin_geometry_buffers(),
+        work_dir=tmp_path / "native-list-length-session",
+        session_id="native-list-length-test",
+    ) as session:
+        with pytest.raises(ValueError, match="one dict per frequency"):
+            session.assemble_solve_evaluate_standard_neumann_batch(
+                frequency_hz,
+                k_real,
+                neumann,
+                observation_points,
+                impedance_sources=[{8: 0.05 + 0.0j}],  # only 1, need 2
+                operation_id="resident-list-length",
+                source_tags=[2],
+                impedance_source_tag=2,
+            )
+
+
+def test_impedance_sources_mixed_active_inactive_per_case(tmp_path):
+    """beta(f) active on some frequencies and absent on others must NOT trip the
+    per-case Robin capability handshake (regression: it was batch-global, so a
+    no-Robin case falsely raised 'helper predates Robin')."""
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+    frequency_hz = np.array([172.0, 250.0], dtype=np.float64)
+    k_real = (2.0 * np.pi * frequency_hz / 343.0).astype(np.float32)
+    neumann = np.array(
+        [[1.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j]] * 2,
+        dtype=np.complex64,
+    )
+    observation_points = np.array([[0.0, 0.0, 0.7]], dtype=np.float32)
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_robin_geometry_buffers(),
+        work_dir=tmp_path / "native-mixed-robin-session",
+        session_id="native-mixed-robin-test",
+    ) as session:
+        # case 0: no Robin (empty dict); case 1: Robin on tag 8. Must not raise.
+        solved = session.assemble_solve_evaluate_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            neumann,
+            observation_points,
+            impedance_sources=[{}, {8: 0.05 + 0.0j}],
+            operation_id="resident-mixed-robin",
+            source_tags=[2],
+            impedance_source_tag=2,
+        )
+
+    assert len(solved) == 2
+    assert solved[0].diagnostics.get("robin_boundary") is not True
+    assert solved[1].diagnostics.get("robin_boundary") is True
