@@ -837,7 +837,11 @@ class MetalNativeStandardSession:
             shared = _beta_payload(impedance_sources)
             impedance_payloads = [shared] * int(frequencies.size)
         expect_complex_k = bool(np.any(k_imag_values != 0.0))
-        expect_robin = any(payload is not None for payload in impedance_payloads)
+        # Robin capability is checked PER CASE: beta(f) (impedance_source_callback)
+        # can be active on some frequencies and absent on others, so a single
+        # batch-global expectation would falsely flag the no-Robin cases as a
+        # stale (pre-Robin) helper binary at _dense_solve_field_result.
+        expect_robin_per_case = [payload is not None for payload in impedance_payloads]
         if dense_solve_dtype not in {"float32", "float64"}:
             raise ValueError("dense_solve_dtype must be 'float32' or 'float64'")
         # The dtype routes to the helper via env var (HORNLAB_METAL_BEM_NATIVE_
@@ -1017,7 +1021,7 @@ class MetalNativeStandardSession:
                 expected_count=int(frequencies.size),
                 on_case_result=on_case_result,
                 expect_complex_k=expect_complex_k,
-                expect_robin=expect_robin,
+                expect_robin_per_case=expect_robin_per_case,
                 expect_float64=expect_float64,
                 expect_chief=expect_chief,
             )
@@ -1039,11 +1043,11 @@ class MetalNativeStandardSession:
                 case_result,
                 batch_diagnostics,
                 expect_complex_k=expect_complex_k,
-                expect_robin=expect_robin,
+                expect_robin=expect_robin_per_case[idx],
                 expect_float64=expect_float64,
                 expect_chief=expect_chief,
             )
-            for case_result in case_results
+            for idx, case_result in enumerate(case_results)
         ]
 
     def _dense_solve_field_result(
@@ -1145,7 +1149,7 @@ class MetalNativeStandardSession:
         expected_count: int,
         on_case_result: Any,
         expect_complex_k: bool = False,
-        expect_robin: bool = False,
+        expect_robin_per_case: list[bool] | None = None,
         expect_float64: bool = False,
         expect_chief: bool = False,
     ) -> list[Any]:
@@ -1160,6 +1164,8 @@ class MetalNativeStandardSession:
         """
         from .session import read_json_manifest
 
+        if expect_robin_per_case is None:
+            expect_robin_per_case = [False] * expected_count
         op = "assemble_solve_evaluate_standard_neumann_batch"
         solved_fields: list[Any] = []
 
@@ -1174,7 +1180,7 @@ class MetalNativeStandardSession:
                     case_result,
                     {},
                     expect_complex_k=expect_complex_k,
-                    expect_robin=expect_robin,
+                    expect_robin=expect_robin_per_case[len(solved_fields)],
                     expect_float64=expect_float64,
                     expect_chief=expect_chief,
                 )
@@ -1206,7 +1212,7 @@ class MetalNativeStandardSession:
                 case_results[index],
                 batch_diagnostics,
                 expect_complex_k=expect_complex_k,
-                expect_robin=expect_robin,
+                expect_robin=expect_robin_per_case[index],
                 expect_float64=expect_float64,
                 expect_chief=expect_chief,
             )

@@ -57,9 +57,16 @@ def viscothermal_wall_beta(f_hz: float, *, hydraulic_radius_m: float) -> complex
 
 
 def beta_from_surface_impedance(Zs: complex) -> complex:
-    """Convert a (complex) specific surface impedance Zs [Pa*s/m] to beta."""
-    if Zs == 0:
-        return 0.0 + 0.0j
+    """Convert a (complex) specific surface impedance Zs [Pa*s/m] to beta.
+
+    Zs -> 0 is a pressure-release/short boundary (infinite admittance), the
+    OPPOSITE of a rigid wall, so a near-zero magnitude is rejected rather than
+    silently mapped to beta = 0 (rigid).
+    """
+    if abs(complex(Zs)) < 1e-12:
+        raise ValueError(
+            "Zs is at/near zero (pressure-release limit); beta = rho*c/Zs diverges"
+        )
     return complex(RHO0 * C0) / complex(Zs)
 
 

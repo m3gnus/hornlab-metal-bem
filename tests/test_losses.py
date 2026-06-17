@@ -39,9 +39,11 @@ def test_beta_from_surface_impedance_air_matched():
     assert beta == pytest.approx(1.0 + 0.0j)
 
 
-def test_beta_from_surface_impedance_zero_is_rigid_safe():
-    # Zs == 0 -> guarded to beta 0 rather than dividing by zero.
-    assert losses.beta_from_surface_impedance(0) == 0.0 + 0.0j
+def test_beta_from_surface_impedance_zero_rejected():
+    # Zs -> 0 is pressure-release (infinite admittance), NOT rigid; reject it
+    # rather than silently returning beta = 0 (the opposite boundary condition).
+    with pytest.raises(ValueError, match="pressure-release"):
+        losses.beta_from_surface_impedance(0)
 
 
 def test_beta_from_surface_impedance_complex():

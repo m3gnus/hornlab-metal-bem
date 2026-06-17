@@ -3970,8 +3970,14 @@ def test_impedance_source_callback_equals_static_dict(monkeypatch, tmp_path):
 
 
 def test_impedance_sources_list_length_must_match_frequencies(tmp_path):
-    """A per-case impedance_sources list of the wrong length is rejected before
-    the helper runs (no native runtime required)."""
+    """A per-case impedance_sources list of the wrong length is rejected
+    Python-side in the session method (before the helper subprocess runs)."""
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
     frequency_hz = np.array([172.0, 250.0], dtype=np.float64)
     k_real = (2.0 * np.pi * frequency_hz / 343.0).astype(np.float32)
     neumann = np.array(
@@ -3996,3 +4002,43 @@ def test_impedance_sources_list_length_must_match_frequencies(tmp_path):
                 source_tags=[2],
                 impedance_source_tag=2,
             )
+
+
+def test_impedance_sources_mixed_active_inactive_per_case(tmp_path):
+    """beta(f) active on some frequencies and absent on others must NOT trip the
+    per-case Robin capability handshake (regression: it was batch-global, so a
+    no-Robin case falsely raised 'helper predates Robin')."""
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+    frequency_hz = np.array([172.0, 250.0], dtype=np.float64)
+    k_real = (2.0 * np.pi * frequency_hz / 343.0).astype(np.float32)
+    neumann = np.array(
+        [[1.0 + 0.0j, 0.0 + 0.0j, 0.0 + 0.0j]] * 2,
+        dtype=np.complex64,
+    )
+    observation_points = np.array([[0.0, 0.0, 0.7]], dtype=np.float32)
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_tiny_robin_geometry_buffers(),
+        work_dir=tmp_path / "native-mixed-robin-session",
+        session_id="native-mixed-robin-test",
+    ) as session:
+        # case 0: no Robin (empty dict); case 1: Robin on tag 8. Must not raise.
+        solved = session.assemble_solve_evaluate_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            neumann,
+            observation_points,
+            impedance_sources=[{}, {8: 0.05 + 0.0j}],
+            operation_id="resident-mixed-robin",
+            source_tags=[2],
+            impedance_source_tag=2,
+        )
+
+    assert len(solved) == 2
+    assert solved[0].diagnostics.get("robin_boundary") is not True
+    assert solved[1].diagnostics.get("robin_boundary") is True
