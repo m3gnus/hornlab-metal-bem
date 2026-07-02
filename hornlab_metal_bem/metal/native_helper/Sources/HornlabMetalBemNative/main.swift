@@ -2720,10 +2720,10 @@ let regularAssemblyMetalSource = """
 #include <metal_stdlib>
 using namespace metal;
 
-// Specialized per session by specializedAssemblyMetalSource(): the symmetry
-// plane is a compile-time constant so the compiler prunes the image-mask
-// loops entirely for the planes that are not active.
-constant int SYMMETRY_PLANE = 0;
+// Specialized per pipeline by Metal function constants. Release builds can load
+// the precompiled metallib while still pruning inactive symmetry branches when
+// each kernel function is materialized.
+constant int SYMMETRY_PLANE [[function_constant(0)]];
 
 struct Params {
     int nDof;
@@ -3714,13 +3714,6 @@ kernel void duffy_delta_blocks(
 }
 """
 
-func specializedAssemblyMetalSource(symmetryPlaneCode: Int32) -> String {
-    regularAssemblyMetalSource.replacingOccurrences(
-        of: "constant int SYMMETRY_PLANE = 0;",
-        with: "constant int SYMMETRY_PLANE = \(symmetryPlaneCode);"
-    )
-}
-
 final class MetalWarmup: @unchecked Sendable {
     static let shared = MetalWarmup()
 
@@ -3787,32 +3780,117 @@ final class MetalWarmup: @unchecked Sendable {
     }
 }
 
+struct AssemblyLibrary {
+    let library: MTLLibrary
+    let source: String
+    let path: String?
+}
+
+struct AssemblyLibraryLoad {
+    let library: MTLLibrary
+    let source: String
+    let path: String?
+    let seconds: Double
+    let cacheHit: Bool
+}
+
+func bundledAssemblyMetallibURL() -> URL? {
+    #if SWIFT_PACKAGE
+    return Bundle.module.url(forResource: "regular_assembly", withExtension: "metallib")
+    #else
+    return nil
+    #endif
+}
+
+func assemblyMetallibCandidateURLs() -> [URL] {
+    var candidates: [URL] = []
+    if let explicitPath = ProcessInfo.processInfo.environment["HORNLAB_METAL_BEM_METALLIB"],
+       !explicitPath.isEmpty {
+        candidates.append(URL(fileURLWithPath: explicitPath))
+    }
+    if let bundleURL = bundledAssemblyMetallibURL() {
+        candidates.append(bundleURL)
+    }
+    let executableDir = URL(fileURLWithPath: CommandLine.arguments[0])
+        .deletingLastPathComponent()
+    candidates.append(executableDir.appendingPathComponent("regular_assembly.metallib"))
+    candidates.append(
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Resources/regular_assembly.metallib")
+    )
+
+    var seen = Set<String>()
+    var unique: [URL] = []
+    for candidate in candidates {
+        let path = candidate.path
+        if seen.insert(path).inserted {
+            unique.append(candidate)
+        }
+    }
+    return unique
+}
+
+func makeAssemblyLibrary(device: MTLDevice) throws -> AssemblyLibrary {
+    for url in assemblyMetallibCandidateURLs()
+        where FileManager.default.isReadableFile(atPath: url.path) {
+        if let library = try? device.makeLibrary(URL: url) {
+            return AssemblyLibrary(library: library, source: "metallib", path: url.path)
+        }
+    }
+    let library = try device.makeLibrary(source: regularAssemblyMetalSource, options: nil)
+    return AssemblyLibrary(library: library, source: "source", path: nil)
+}
+
 final class AssemblyLibraryCache: @unchecked Sendable {
     static let shared = AssemblyLibraryCache()
 
     private let lock = NSLock()
-    private var libraries: [Int32: MTLLibrary] = [:]
+    private var cachedLibrary: AssemblyLibrary?
 
-    func library(device: MTLDevice, symmetryPlaneCode: Int32) throws -> MTLLibrary {
+    func library(device: MTLDevice) throws -> AssemblyLibraryLoad {
         lock.lock()
-        defer {
+        if let cachedLibrary {
             lock.unlock()
+            return AssemblyLibraryLoad(
+                library: cachedLibrary.library,
+                source: cachedLibrary.source,
+                path: cachedLibrary.path,
+                seconds: 0.0,
+                cacheHit: true
+            )
         }
-        if let library = libraries[symmetryPlaneCode] {
-            return library
-        }
+        lock.unlock()
 
-        let library = try device.makeLibrary(
-            source: specializedAssemblyMetalSource(symmetryPlaneCode: symmetryPlaneCode),
-            options: nil
+        let start = CFAbsoluteTimeGetCurrent()
+        let loaded = try makeAssemblyLibrary(device: device)
+        let seconds = CFAbsoluteTimeGetCurrent() - start
+
+        lock.lock()
+        if let cachedLibrary {
+            lock.unlock()
+            return AssemblyLibraryLoad(
+                library: cachedLibrary.library,
+                source: cachedLibrary.source,
+                path: cachedLibrary.path,
+                seconds: 0.0,
+                cacheHit: true
+            )
+        }
+        cachedLibrary = loaded
+        lock.unlock()
+        return AssemblyLibraryLoad(
+            library: loaded.library,
+            source: loaded.source,
+            path: loaded.path,
+            seconds: seconds,
+            cacheHit: false
         )
-        libraries[symmetryPlaneCode] = library
-        return library
     }
 }
 
-func assemblyLibrary(device: MTLDevice, symmetryPlaneCode: Int32) throws -> MTLLibrary {
-    try AssemblyLibraryCache.shared.library(device: device, symmetryPlaneCode: symmetryPlaneCode)
+func assemblyLibrary(device: MTLDevice) throws -> AssemblyLibraryLoad {
+    try AssemblyLibraryCache.shared.library(device: device)
 }
 
 func makeBuffer<T>(_ device: MTLDevice, _ values: [T], label: String) throws -> MTLBuffer {
@@ -3905,10 +3983,12 @@ func computeDuffyDeltaBlocksMetal(
     guard let commandQueue = device.makeCommandQueue() else {
         try fail("failed to create Metal command queue")
     }
-    let library = try assemblyLibrary(device: device, symmetryPlaneCode: geom.symmetryPlaneCode)
-    guard let function = library.makeFunction(name: "duffy_delta_blocks") else {
-        try fail("failed to load Metal Duffy kernel")
-    }
+    let libraryLoad = try assemblyLibrary(device: device)
+    let function = try residentKernelFunction(
+        library: libraryLoad.library,
+        name: "duffy_delta_blocks",
+        symmetryPlaneCode: geom.symmetryPlaneCode
+    )
     let pipeline = try device.makeComputePipelineState(function: function)
     let pairCount = pairList.pairs.count
 
@@ -4329,7 +4409,144 @@ struct ResidentMetalPipelines {
 }
 
 final class ResidentMetalPipelineBox: @unchecked Sendable {
-    var result: Result<ResidentMetalPipelines, Error>?
+    var result: Result<(pipelines: ResidentMetalPipelines, timings: ResidentMetalPipelineTimings), Error>?
+}
+
+struct ResidentMetalPipelineTimings {
+    let deviceSeconds: Double
+    let librarySeconds: Double
+    let pipelineSeconds: Double
+    let librarySource: String
+    let libraryPath: String?
+    let libraryCacheHit: Bool
+    let pipelineCacheHit: Bool
+}
+
+struct ResidentMetalPipelineLoad {
+    let pipelines: ResidentMetalPipelines
+    let timings: ResidentMetalPipelineTimings
+}
+
+func residentKernelFunction(
+    library: MTLLibrary,
+    name: String,
+    symmetryPlaneCode: Int32
+) throws -> MTLFunction {
+    let constants = MTLFunctionConstantValues()
+    var symmetryPlane = symmetryPlaneCode
+    constants.setConstantValue(&symmetryPlane, type: .int, index: 0)
+    do {
+        return try library.makeFunction(name: name, constantValues: constants)
+    } catch {
+        try fail("failed to load resident Metal kernel \(name): \(error)")
+    }
+}
+
+final class ResidentMetalPipelineCache: @unchecked Sendable {
+    static let shared = ResidentMetalPipelineCache()
+
+    private let lock = NSLock()
+    private var pipelinesBySymmetry: [Int32: ResidentMetalPipelines] = [:]
+
+    func pipelines(symmetryPlaneCode: Int32) throws -> ResidentMetalPipelineLoad {
+        lock.lock()
+        if let pipelines = pipelinesBySymmetry[symmetryPlaneCode] {
+            lock.unlock()
+            return ResidentMetalPipelineLoad(
+                pipelines: pipelines,
+                timings: ResidentMetalPipelineTimings(
+                    deviceSeconds: 0.0,
+                    librarySeconds: 0.0,
+                    pipelineSeconds: 0.0,
+                    librarySource: "cache",
+                    libraryPath: nil,
+                    libraryCacheHit: true,
+                    pipelineCacheHit: true
+                )
+            )
+        }
+        lock.unlock()
+
+        let deviceStart = CFAbsoluteTimeGetCurrent()
+        let device = try MetalWarmup.shared.device()
+        let deviceSeconds = CFAbsoluteTimeGetCurrent() - deviceStart
+
+        let libraryLoad = try assemblyLibrary(device: device)
+
+        let pipelineStart = CFAbsoluteTimeGetCurrent()
+        let matrixFunction = try residentKernelFunction(
+            library: libraryLoad.library,
+            name: "assemble_matrix_regular",
+            symmetryPlaneCode: symmetryPlaneCode
+        )
+        let pairAtomicFunction = try residentKernelFunction(
+            library: libraryLoad.library,
+            name: "assemble_matrix_pair_atomic",
+            symmetryPlaneCode: symmetryPlaneCode
+        )
+        let rhsFunction = try residentKernelFunction(
+            library: libraryLoad.library,
+            name: "assemble_rhs_source_regular",
+            symmetryPlaneCode: symmetryPlaneCode
+        )
+        let pairBlockFunction = try residentKernelFunction(
+            library: libraryLoad.library,
+            name: "assemble_pair_blocks_regular",
+            symmetryPlaneCode: symmetryPlaneCode
+        )
+        let fieldFunction = try residentKernelFunction(
+            library: libraryLoad.library,
+            name: "evaluate_field_regular",
+            symmetryPlaneCode: symmetryPlaneCode
+        )
+        let duffyFunction = try residentKernelFunction(
+            library: libraryLoad.library,
+            name: "duffy_delta_blocks",
+            symmetryPlaneCode: symmetryPlaneCode
+        )
+        let pipelines = ResidentMetalPipelines(
+            library: libraryLoad.library,
+            matrixPipeline: try device.makeComputePipelineState(function: matrixFunction),
+            pairAtomicPipeline: try device.makeComputePipelineState(function: pairAtomicFunction),
+            rhsPipeline: try device.makeComputePipelineState(function: rhsFunction),
+            pairBlockPipeline: try device.makeComputePipelineState(function: pairBlockFunction),
+            fieldPipeline: try device.makeComputePipelineState(function: fieldFunction),
+            duffyPipeline: try device.makeComputePipelineState(function: duffyFunction)
+        )
+        let pipelineSeconds = CFAbsoluteTimeGetCurrent() - pipelineStart
+
+        lock.lock()
+        if let cached = pipelinesBySymmetry[symmetryPlaneCode] {
+            lock.unlock()
+            return ResidentMetalPipelineLoad(
+                pipelines: cached,
+                timings: ResidentMetalPipelineTimings(
+                    deviceSeconds: 0.0,
+                    librarySeconds: 0.0,
+                    pipelineSeconds: 0.0,
+                    librarySource: "cache",
+                    libraryPath: nil,
+                    libraryCacheHit: true,
+                    pipelineCacheHit: true
+                )
+            )
+        }
+        pipelinesBySymmetry[symmetryPlaneCode] = pipelines
+        lock.unlock()
+
+        return ResidentMetalPipelineLoad(
+            pipelines: pipelines,
+            timings: ResidentMetalPipelineTimings(
+                deviceSeconds: deviceSeconds,
+                librarySeconds: libraryLoad.seconds,
+                pipelineSeconds: pipelineSeconds,
+                librarySource: libraryLoad.source,
+                libraryPath: libraryLoad.path,
+                libraryCacheHit: libraryLoad.cacheHit,
+                pipelineCacheHit: false
+            )
+        )
+    }
 }
 
 final class ResidentMetalContext {
@@ -4347,6 +4564,13 @@ final class ResidentMetalContext {
     let pairList: DuffyPairList
     let duffyReductionPlan: DuffyReductionPlan
     let duffyReductionPlanBuildSeconds: Double
+    let metalDeviceSeconds: Double
+    let metalLibrarySeconds: Double
+    let metalPipelineSeconds: Double
+    let metalLibrarySource: String
+    let metalLibraryPath: String?
+    let metalLibraryCacheHit: Bool
+    let metalPipelineCacheHit: Bool
     let rules: [Int: DuffyRule]
     let px: MTLBuffer
     let py: MTLBuffer
@@ -4398,27 +4622,12 @@ final class ResidentMetalContext {
         let symmetryPlaneCode = geom.symmetryPlaneCode
         Thread.detachNewThread {
             do {
-                let device = try MetalWarmup.shared.device()
-                let library = try assemblyLibrary(
-                    device: device,
+                let load = try ResidentMetalPipelineCache.shared.pipelines(
                     symmetryPlaneCode: symmetryPlaneCode
                 )
-                guard let matrixFunction = library.makeFunction(name: "assemble_matrix_regular"),
-                      let pairAtomicFunction = library.makeFunction(name: "assemble_matrix_pair_atomic"),
-                      let rhsFunction = library.makeFunction(name: "assemble_rhs_source_regular"),
-                      let pairBlockFunction = library.makeFunction(name: "assemble_pair_blocks_regular"),
-                      let fieldFunction = library.makeFunction(name: "evaluate_field_regular"),
-                      let duffyFunction = library.makeFunction(name: "duffy_delta_blocks") else {
-                    try fail("failed to load resident Metal kernels")
-                }
-                pipelineBox.result = .success(ResidentMetalPipelines(
-                    library: library,
-                    matrixPipeline: try device.makeComputePipelineState(function: matrixFunction),
-                    pairAtomicPipeline: try device.makeComputePipelineState(function: pairAtomicFunction),
-                    rhsPipeline: try device.makeComputePipelineState(function: rhsFunction),
-                    pairBlockPipeline: try device.makeComputePipelineState(function: pairBlockFunction),
-                    fieldPipeline: try device.makeComputePipelineState(function: fieldFunction),
-                    duffyPipeline: try device.makeComputePipelineState(function: duffyFunction)
+                pipelineBox.result = .success((
+                    pipelines: load.pipelines,
+                    timings: load.timings
                 ))
             } catch {
                 pipelineBox.result = .failure(error)
@@ -4525,7 +4734,8 @@ final class ResidentMetalContext {
         guard let pipelineResult = pipelineBox.result else {
             try fail("failed to load resident Metal kernels")
         }
-        let pipelines = try pipelineResult.get()
+        let pipelineLoad = try pipelineResult.get()
+        let pipelines = pipelineLoad.pipelines
         self.library = pipelines.library
         self.matrixPipeline = pipelines.matrixPipeline
         self.pairAtomicPipeline = pipelines.pairAtomicPipeline
@@ -4533,6 +4743,13 @@ final class ResidentMetalContext {
         self.pairBlockPipeline = pipelines.pairBlockPipeline
         self.fieldPipeline = pipelines.fieldPipeline
         self.duffyPipeline = pipelines.duffyPipeline
+        self.metalDeviceSeconds = pipelineLoad.timings.deviceSeconds
+        self.metalLibrarySeconds = pipelineLoad.timings.librarySeconds
+        self.metalPipelineSeconds = pipelineLoad.timings.pipelineSeconds
+        self.metalLibrarySource = pipelineLoad.timings.librarySource
+        self.metalLibraryPath = pipelineLoad.timings.libraryPath
+        self.metalLibraryCacheHit = pipelineLoad.timings.libraryCacheHit
+        self.metalPipelineCacheHit = pipelineLoad.timings.pipelineCacheHit
     }
 
     struct AssemblyOutputSlot {
@@ -5490,11 +5707,17 @@ func assembleRegularMetal(
     guard let commandQueue = device.makeCommandQueue() else {
         try fail("failed to create Metal command queue")
     }
-    let library = try assemblyLibrary(device: device, symmetryPlaneCode: geom.symmetryPlaneCode)
-    guard let matrixFunction = library.makeFunction(name: "assemble_matrix_regular"),
-          let rhsFunction = library.makeFunction(name: "assemble_rhs_source_regular") else {
-        try fail("failed to load Metal regular assembly kernels")
-    }
+    let libraryLoad = try assemblyLibrary(device: device)
+    let matrixFunction = try residentKernelFunction(
+        library: libraryLoad.library,
+        name: "assemble_matrix_regular",
+        symmetryPlaneCode: geom.symmetryPlaneCode
+    )
+    let rhsFunction = try residentKernelFunction(
+        library: libraryLoad.library,
+        name: "assemble_rhs_source_regular",
+        symmetryPlaneCode: geom.symmetryPlaneCode
+    )
     let matrixPipeline = try device.makeComputePipelineState(function: matrixFunction)
     let rhsPipeline = try device.makeComputePipelineState(function: rhsFunction)
     let incidence = try buildP1Incidence(geom)
@@ -5646,10 +5869,12 @@ func evaluateExteriorMetal(
     guard let commandQueue = device.makeCommandQueue() else {
         try fail("failed to create Metal command queue")
     }
-    let library = try assemblyLibrary(device: device, symmetryPlaneCode: geom.symmetryPlaneCode)
-    guard let fieldFunction = library.makeFunction(name: "evaluate_field_regular") else {
-        try fail("failed to load Metal field kernel")
-    }
+    let libraryLoad = try assemblyLibrary(device: device)
+    let fieldFunction = try residentKernelFunction(
+        library: libraryLoad.library,
+        name: "evaluate_field_regular",
+        symmetryPlaneCode: geom.symmetryPlaneCode
+    )
     let fieldPipeline = try device.makeComputePipelineState(function: fieldFunction)
     var params = MetalKernelParams(
         nDof: Int32(geom.p1DofCount),
@@ -7072,6 +7297,26 @@ func assemblyResultPayload(
     return result
 }
 
+func residentContextDiagnostics(
+    context: ResidentMetalContext,
+    contextSeconds: Double
+) -> [String: Any] {
+    var diagnostics: [String: Any] = [
+        "resident_context_seconds": contextSeconds,
+        "resident_context_device_seconds": context.metalDeviceSeconds,
+        "resident_context_library_seconds": context.metalLibrarySeconds,
+        "resident_context_pipeline_seconds": context.metalPipelineSeconds,
+        "resident_context_metal_library_source": context.metalLibrarySource,
+        "resident_context_metal_library_cache_hit": context.metalLibraryCacheHit,
+        "resident_context_pipeline_cache_hit": context.metalPipelineCacheHit,
+        "resident_duffy_reduction_plan_seconds": context.duffyReductionPlanBuildSeconds,
+    ]
+    if let path = context.metalLibraryPath {
+        diagnostics["resident_context_metal_library_path"] = path
+    }
+    return diagnostics
+}
+
 func assembleStandardNeumannBatch(
     sessionManifestPath: String,
     payloadPath: String,
@@ -7133,7 +7378,7 @@ func assembleStandardNeumannBatch(
         totalAssemblySeconds += run.seconds
         totalRegularSeconds += max(0.0, run.seconds - assemblyCorrectionSeconds(run))
     }
-    let result: [String: Any] = [
+    var result: [String: Any] = [
         "schema": schema,
         "op": "assemble_standard_neumann_batch_result",
         "implementation": "swift_native_resident_metal_batch",
@@ -7158,6 +7403,9 @@ func assembleStandardNeumannBatch(
         ],
         "cases": caseResults,
     ]
+    result.merge(
+        residentContextDiagnostics(context: context, contextSeconds: contextSeconds)
+    ) { _, new in new }
     try writeJSON(resultPath, result)
 }
 
@@ -7275,7 +7523,7 @@ func assembleSolveStandardNeumannBatch(
         totalDenseSolveSeconds += solve.seconds
     }
 
-    let result: [String: Any] = [
+    var result: [String: Any] = [
         "schema": schema,
         "op": "assemble_solve_standard_neumann_batch_result",
         "implementation": "swift_native_resident_metal_assembly_accelerate_solve_batch",
@@ -7297,6 +7545,9 @@ func assembleSolveStandardNeumannBatch(
         ],
         "cases": caseResults,
     ]
+    result.merge(
+        residentContextDiagnostics(context: context, contextSeconds: contextSeconds)
+    ) { _, new in new }
     try writeJSON(resultPath, result)
 }
 
@@ -8151,7 +8402,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
         )
     }
 
-    let result: [String: Any] = [
+    var result: [String: Any] = [
         "schema": schema,
         "op": "assemble_solve_evaluate_standard_neumann_batch_result",
         "implementation": "swift_native_resident_metal_assembly_accelerate_solve_field_batch",
@@ -8181,6 +8432,9 @@ func assembleSolveEvaluateStandardNeumannBatch(
         ],
         "cases": caseResults,
     ]
+    result.merge(
+        residentContextDiagnostics(context: context, contextSeconds: contextSeconds)
+    ) { _, new in new }
     try writeJSON(resultPath, result)
 }
 

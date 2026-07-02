@@ -166,7 +166,7 @@ complex pressure and derive SPL explicitly when needed.
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e ".[dev]"
-swift build -c release --package-path hornlab_metal_bem/metal/native_helper
+python scripts/build_metal_native_release.py
 python -m pytest tests/test_config.py tests/test_hornlab_metal_bem_namespace.py tests/test_metal_native.py -q
 ```
 

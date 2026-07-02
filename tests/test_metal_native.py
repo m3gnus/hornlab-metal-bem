@@ -639,6 +639,8 @@ def test_native_diagnostics_helpers_preserve_manifest_metadata():
             "session_id": "session",
             "batch_id": "batch",
             "wall_seconds": 1.25,
+            "resident_context_library_seconds": 0.05,
+            "resident_context_metal_library_source": "metallib",
             "resident_reuse": {"geometry_buffers": True},
             "cases": [],
             "ignored_output_path": "outputs/field.bin",
@@ -660,6 +662,8 @@ def test_native_diagnostics_helpers_preserve_manifest_metadata():
 
     assert case["assembly_implementation"] == "assembly_impl"
     assert case["duffy_corrections"]["implemented"] is True
+    assert case["batch"]["resident_context_library_seconds"] == 0.05
+    assert case["batch"]["resident_context_metal_library_source"] == "metallib"
     assert case["batch"]["resident_reuse"]["geometry_buffers"] is True
     assert "pressure_real_f32" not in case
     assert "ignored_output_path" not in case["batch"]

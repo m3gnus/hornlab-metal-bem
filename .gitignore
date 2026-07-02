@@ -9,5 +9,6 @@ build/
 dist/
 *.egg-info/
 hornlab_metal_bem/metal/native_helper/.build/
+hornlab_metal_bem/metal/native_helper/Sources/HornlabMetalBemNative/Resources/*.metallib
 runs/
 artifacts/
