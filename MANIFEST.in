@@ -1,0 +1,6 @@
+include scripts/build_metal_native_release.py
+include hornlab_metal_bem/metal/HornlabMetalBemNative.swift
+include hornlab_metal_bem/metal/native_helper/Package.swift
+include hornlab_metal_bem/metal/native_helper/Sources/HornlabMetalBemNative/main.swift
+include hornlab_metal_bem/metal/native_helper/Sources/HornlabMetalBemNative/Resources/.gitkeep
+include hornlab_metal_bem/metal/native_helper/Sources/HornlabMetalBemNative/Resources/*.metallib

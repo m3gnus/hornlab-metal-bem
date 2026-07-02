@@ -224,10 +224,11 @@ Runtime discovery prefers an explicit helper executable, then
 `metal/native_helper/.build/{release,debug}/HornlabMetalBemNative`. If no helper
 binary is present, it falls back to Swift via `HORNLAB_METAL_BEM_SWIFT` or
 `swift` on `PATH` and the script entrypoint.
-Release helper builds should use `scripts/build_metal_native_release.py`, which
-precompiles the embedded Metal assembly kernels into
-`regular_assembly.metallib` before running `swift build -c release`. At runtime
-the helper loads that binary library when present and falls back to
+Release helper builds should use
+`scripts/build_metal_native_release.py --require-metallib`, which precompiles
+the embedded Metal assembly kernels into `regular_assembly.metallib` before
+running `swift build -c release`. At runtime the helper loads that binary
+library when present and falls back to
 `makeLibrary(source:)` if the generated metallib is missing. Python package
 builds also try to precompile that `.metallib` on macOS before package data is
 collected; set `HORNLAB_METAL_BEM_SKIP_METALLIB=1` to skip that optional step.

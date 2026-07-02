@@ -1,12 +1,28 @@
 from __future__ import annotations
 
+import importlib.util
 import os
 import platform
 import subprocess
 from distutils import log
+from pathlib import Path
 
 from setuptools import setup
 from setuptools.command.build_py import build_py as _build_py
+
+ROOT = Path(__file__).resolve().parent
+
+
+def _load_metallib_builder():
+    script = ROOT / "scripts" / "build_metal_native_release.py"
+    if not script.is_file():
+        raise RuntimeError(f"Metal library build script is missing: {script}")
+    spec = importlib.util.spec_from_file_location("_hornlab_metal_bem_release_build", script)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load Metal library build script: {script}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module._build_metallib
 
 
 class build_py(_build_py):
@@ -20,7 +36,7 @@ class build_py(_build_py):
         if platform.system() != "Darwin":
             return
         try:
-            from scripts.build_metal_native_release import _build_metallib
+            _build_metallib = _load_metallib_builder()
         except Exception as exc:
             self.announce(f"Skipping Metal library precompile: {exc}", level=log.WARN)
             return
