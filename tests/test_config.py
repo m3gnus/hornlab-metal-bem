@@ -524,3 +524,28 @@ def test_chief_weight_non_finite_rejected():
     ):
         SolveConfig(chief_weight=float("nan"))
     assert SolveConfig().chief_weight == 1.0
+
+
+def test_chief_points_lower_default_solve_concurrency(monkeypatch):
+    # CHIEF routes to a complex128 zgels solve regardless of dense_solve_dtype,
+    # so its peak memory matches (slightly exceeds) the float64 path; the
+    # default concurrency lowering must apply to it too.
+    import numpy as np
+
+    from hornlab_metal_bem.sweep import _native_env_overrides
+
+    monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY", raising=False)
+    pts = np.array([[0.0, 0.0, 0.5]])
+    overrides = _native_env_overrides(SolveConfig(chief_points=pts))
+    assert overrides["HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY"] == "3"
+
+
+def test_chief_points_respect_pinned_concurrency(monkeypatch):
+    import numpy as np
+
+    from hornlab_metal_bem.sweep import _native_env_overrides
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY", "6")
+    pts = np.array([[0.0, 0.0, 0.5]])
+    overrides = _native_env_overrides(SolveConfig(chief_points=pts))
+    assert "HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY" not in overrides

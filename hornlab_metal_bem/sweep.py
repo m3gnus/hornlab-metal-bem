@@ -108,11 +108,13 @@ def _native_env_overrides(config: SolveConfig) -> dict[str, str]:
     if os.environ.get("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE") is None:
         overrides["HORNLAB_METAL_BEM_NATIVE_FIELD_MODE"] = "optimized"
     # complex128 zgesv holds a doublecomplex column-major copy alongside the
-    # float32 row-major operator, roughly tripling peak solve memory. Lower the
-    # default solve concurrency for the float64 path unless the caller pinned it
-    # (via the env var on os.environ), keeping peak memory bounded.
+    # float32 row-major operator, roughly tripling peak solve memory. CHIEF
+    # cases route to a complex128 zgels least-squares solve regardless of
+    # dense_solve_dtype and hold a slightly larger (n+m) x n copy per worker.
+    # Lower the default solve concurrency for both paths unless the caller
+    # pinned it (via the env var on os.environ), keeping peak memory bounded.
     if (
-        config.dense_solve_dtype == "float64"
+        (config.dense_solve_dtype == "float64" or config.chief_points is not None)
         and os.environ.get("HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY") is None
     ):
         overrides["HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY"] = "3"
@@ -298,6 +300,47 @@ def _mesh_max_edge_m(mesh: LoadedMesh) -> float:
     return max_edge
 
 
+def _warn_near_boundary_chief_points(
+    mesh: LoadedMesh,
+    chief_points: NDArray[np.float64],
+    max_edge_m: float,
+) -> None:
+    """Warn when a CHIEF point sits on or near the boundary surface.
+
+    CHIEF null-field constraint rows are exact only for strictly interior
+    points: a point on (or within roughly a quadrature panel of) the wall
+    contributes a wrong constraint row that biases the whole least-squares
+    solution with no error signal. Distance is approximated as the minimum
+    distance to mesh vertices and triangle centroids, which is within one
+    edge length of the true surface distance — cheap and adequate for a
+    placement sanity check.
+    """
+    vertices, elements = _mesh_vertices_elements(mesh)
+    if elements.size == 0 or max_edge_m <= 0.0:
+        return
+    centroids = vertices[elements].mean(axis=1)
+    anchors = np.vstack([vertices, centroids])
+    pts = np.asarray(chief_points, dtype=np.float64).reshape(-1, 3)
+    deltas = pts[:, None, :] - anchors[None, :, :]
+    min_d = np.sqrt(np.einsum("pak,pak->pa", deltas, deltas)).min(axis=1)
+    threshold = 0.5 * float(max_edge_m)
+    near = np.nonzero(min_d < threshold)[0]
+    if near.size:
+        worst = int(near[np.argmin(min_d[near])])
+        logger.warning(
+            "[hornlab-metal-bem] %d of %d chief_points sit within 0.5*max_edge "
+            "(%.4g m) of the boundary mesh (closest: point %d at %.4g m). CHIEF "
+            "points must be strictly interior — near-wall points bias the "
+            "least-squares solution without any error signal; move them deeper "
+            "into the cavity interior.",
+            int(near.size),
+            int(pts.shape[0]),
+            threshold,
+            worst,
+            float(min_d[worst]),
+        )
+
+
 def _apply_dense_solve_policy(
     diagnostics: dict,
     *,
@@ -309,7 +352,12 @@ def _apply_dense_solve_policy(
         return
     raw_rcond = diagnostics.get("dense_solve_rcond")
     if raw_rcond is None:
+        # The CHIEF zgels path returns no rcond estimate, so the conditioning
+        # policy cannot run there. Mark it explicitly: a plain
+        # dense_solve_suspect=False would read as "checked and fine".
+        diagnostics["dense_solve_policy_available"] = False
         return
+    diagnostics["dense_solve_policy_available"] = True
     try:
         rcond = float(raw_rcond)
     except (TypeError, ValueError):
@@ -569,6 +617,11 @@ def run_sweep_native_metal(
     if config.chief_points is not None:
         chief_points_3xm = np.ascontiguousarray(
             np.asarray(config.chief_points, dtype=np.float64).T, dtype=np.float32
+        )
+        _warn_near_boundary_chief_points(
+            mesh,
+            np.asarray(config.chief_points, dtype=np.float64),
+            mesh_max_edge_m,
         )
     surface_pavg: dict[int, list[complex]] = {tag: [] for tag in source_tags}
     pressure_rows: list[NDArray[np.complex128]] = []

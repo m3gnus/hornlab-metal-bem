@@ -1085,11 +1085,15 @@ class MetalNativeStandardSession:
             )
         if expect_float64 and diagnostics.get("dense_solve_dtype") != "float64":
             raise RuntimeError(
-                "native helper acknowledged no float64 dense-solve support; the "
-                "helper binary predates dense_solve_dtype. Rebuild with "
+                "native helper did not run the float64 dense solve. Either the "
+                "helper binary predates dense_solve_dtype (rebuild with "
                 "`swift build -c release` in "
                 "hornlab_metal_bem/metal/native_helper or unset "
-                "HORNLAB_METAL_BEM_NATIVE."
+                "HORNLAB_METAL_BEM_NATIVE), or the helper env lacks "
+                "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE=float64 — solve()/"
+                "solve_frequencies() set it automatically, but direct session "
+                "callers must pass it in extra_env themselves (this kwarg only "
+                "drives the capability handshake)."
             )
         if expect_chief and diagnostics.get("chief_points") is not True:
             raise RuntimeError(

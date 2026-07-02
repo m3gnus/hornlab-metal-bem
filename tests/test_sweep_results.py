@@ -173,3 +173,52 @@ def test_mesh_max_edge_accepts_bempp_shaped_arrays():
     )
 
     np.testing.assert_allclose(sweep._mesh_max_edge_m(mesh), np.sqrt(2.0))
+
+
+def test_dense_solve_policy_marks_availability():
+    checked = {"dense_solve_rcond": 1e-2}
+    sweep._apply_dense_solve_policy(checked, threshold=1e-6)
+    assert checked["dense_solve_policy_available"] is True
+    assert checked["dense_solve_suspect"] is False
+
+    # The CHIEF zgels path returns no rcond: the policy must say so instead
+    # of leaving a plain False that reads as "checked and fine".
+    unchecked = {}
+    sweep._apply_dense_solve_policy(unchecked, threshold=1e-6)
+    assert unchecked["dense_solve_policy_available"] is False
+    assert unchecked["dense_solve_suspect"] is False
+
+
+def _single_triangle_mesh():
+    # bempp-shaped (3, n) arrays; a unit right triangle in the z=0 plane.
+    return SimpleNamespace(
+        grid=SimpleNamespace(
+            vertices=np.array(
+                [
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.0, 0.0, 0.0],
+                ],
+                dtype=np.float64,
+            ),
+            elements=np.array([[0], [1], [2]], dtype=np.int32),
+        )
+    )
+
+
+def test_chief_points_near_boundary_warn(caplog):
+    mesh = _single_triangle_mesh()
+    with caplog.at_level("WARNING"):
+        sweep._warn_near_boundary_chief_points(
+            mesh, np.array([[0.0, 1.0, 0.0]]), max_edge_m=float(np.sqrt(2.0))
+        )
+    assert any("chief_points" in record.message for record in caplog.records)
+
+
+def test_chief_points_deep_interior_do_not_warn(caplog):
+    mesh = _single_triangle_mesh()
+    with caplog.at_level("WARNING"):
+        sweep._warn_near_boundary_chief_points(
+            mesh, np.array([[5.0, 5.0, 5.0]]), max_edge_m=float(np.sqrt(2.0))
+        )
+    assert not caplog.records
