@@ -94,10 +94,11 @@ def infer_frame(
         origin_at: ``"mouth"`` (default, IEC 60268-5) measures from the
             radiating aperture; ``"throat"`` measures from the source
             centroid.
-        symmetry_plane: optional plane identifier. When set, the observation
-            origin is projected onto requested image planes (X=0 for ``yz``,
-            Y=0 for ``xz``, Z=0 for legacy ``xy``) for image-source physics
-            in half/quarter models.
+        symmetry_plane: optional plane identifier. When set for a
+            mirror-reduced mesh, the inferred axis and observation origin are
+            projected onto requested image planes (X=0 for ``yz``, Y=0 for
+            ``xz``, Z=0 for legacy ``xy``) for image-source physics in
+            half/quarter models.
 
     Returns:
         ObservationFrame with axis/origin/u/v and diagnostic mouth_center
