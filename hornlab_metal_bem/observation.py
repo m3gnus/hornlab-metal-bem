@@ -49,6 +49,30 @@ def _principal_axis(vertices: NDArray[np.float64], center: NDArray[np.float64]) 
     return axis / norm
 
 
+# symmetry_plane here means a mirror-reduced mesh; full image-method
+# callers with native symmetry must pass frame_override instead.
+def _project_to_symmetry_subspace(
+    vector: NDArray[np.float64],
+    symmetry_plane: str | None,
+) -> NDArray[np.float64]:
+    """Zero components normal to requested native symmetry planes."""
+    projected = np.array(vector, dtype=np.float64, copy=True)
+    if symmetry_plane is None:
+        return projected
+
+    plane = str(symmetry_plane).strip().lower()
+    if plane == "yz":
+        projected[0] = 0.0
+    elif plane == "xz":
+        projected[1] = 0.0
+    elif plane == "yz+xz":
+        projected[0] = 0.0
+        projected[1] = 0.0
+    elif plane == "xy":
+        projected[2] = 0.0
+    return projected
+
+
 def infer_frame(
     grid,
     physical_tags: NDArray[np.int32],
@@ -135,6 +159,14 @@ def infer_frame(
     else:
         source_from_tags = True
 
+    if symmetry_plane is not None:
+        # Full-model axes are mirror-invariant; reduced normals/PCA can be
+        # quadrant-biased, so constrain the axis before extent heuristics.
+        projected_normal = _project_to_symmetry_subspace(avg_normal, symmetry_plane)
+        projected_norm = float(np.linalg.norm(projected_normal))
+        if projected_norm > 1e-12:
+            avg_normal = projected_normal / projected_norm
+
     # Determine forward axis: should point away from source toward mouth.
     # Project all vertices along avg_normal; mouth is at the extreme.
     projections = vertices @ avg_normal
@@ -188,16 +220,7 @@ def infer_frame(
     # half-mesh has vertices at X>=0 (yz symmetry) or Z>=0 (xy), but the
     # effective acoustic centre of the full model is on the plane.
     if symmetry_plane is not None:
-        plane = str(symmetry_plane).strip().lower()
-        if plane == "yz":
-            origin[0] = 0.0
-        elif plane == "xz":
-            origin[1] = 0.0
-        elif plane == "yz+xz":
-            origin[0] = 0.0
-            origin[1] = 0.0
-        elif plane == "xy":
-            origin[2] = 0.0
+        origin = _project_to_symmetry_subspace(origin, symmetry_plane)
 
     logger.info(
         "Frame: axis=[%.3f,%.3f,%.3f], origin=%s",

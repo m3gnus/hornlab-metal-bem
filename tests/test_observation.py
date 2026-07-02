@@ -44,6 +44,97 @@ def _mock_grid(vertices: np.ndarray, elements: np.ndarray):
     return grid
 
 
+def _build_curved_cap_horn_mesh():
+    """Build a symmetric +Z horn with a curved source cap."""
+    count = 64
+    radial_count = 5
+    throat_radius = 0.02
+    mouth_radius = 0.08
+    length = 0.3
+    sag = 0.5 * throat_radius
+    angles = np.linspace(0.0, 2.0 * np.pi, count, endpoint=False)
+
+    center = np.array([[0.0, 0.0, 0.0]])
+    rings = []
+    ring_indices = []
+    next_vertex = 1
+    for ring_idx in range(1, radial_count + 1):
+        radius = throat_radius * ring_idx / radial_count
+        z = sag * (radius / throat_radius) ** 2
+        ring = np.column_stack([
+            radius * np.cos(angles),
+            radius * np.sin(angles),
+            z * np.ones(count),
+        ])
+        rings.append(ring)
+        ring_indices.append(np.arange(next_vertex, next_vertex + count))
+        next_vertex += count
+
+    mouth = np.column_stack([
+        mouth_radius * np.cos(angles),
+        mouth_radius * np.sin(angles),
+        length * np.ones(count),
+    ])
+    mouth_indices = np.arange(next_vertex, next_vertex + count)
+    vertices = np.vstack([center, *rings, mouth])
+
+    source_elems = []
+    wall_elems = []
+    for idx in range(count):
+        next_idx = (idx + 1) % count
+        source_elems.append([0, ring_indices[0][idx], ring_indices[0][next_idx]])
+        for ring_idx in range(radial_count - 1):
+            inner_idx = ring_indices[ring_idx][idx]
+            inner_next = ring_indices[ring_idx][next_idx]
+            outer_idx = ring_indices[ring_idx + 1][idx]
+            outer_next = ring_indices[ring_idx + 1][next_idx]
+            source_elems.append([inner_idx, outer_idx, outer_next])
+            source_elems.append([inner_idx, outer_next, inner_next])
+
+        rim_idx = ring_indices[-1][idx]
+        rim_next = ring_indices[-1][next_idx]
+        mouth_idx = mouth_indices[idx]
+        mouth_next = mouth_indices[next_idx]
+        wall_elems.append([rim_idx, mouth_idx, mouth_next])
+        wall_elems.append([rim_idx, mouth_next, rim_next])
+
+    elements = np.array(source_elems + wall_elems, dtype=np.int32)
+    tags = np.array([2] * len(source_elems) + [1] * len(wall_elems), dtype=np.int32)
+    return vertices.T, elements.T, tags
+
+
+def _restrict_mesh(
+    vertices: np.ndarray,
+    elements: np.ndarray,
+    tags: np.ndarray,
+    predicate,
+):
+    """Keep elements whose centroid satisfies predicate and compact vertices."""
+    vertices_nx3 = vertices.T
+    elements_mx3 = elements.T
+    centroids = vertices_nx3[elements_mx3].mean(axis=1)
+    keep = np.array([predicate(centroid) for centroid in centroids], dtype=bool)
+
+    kept_elements = elements_mx3[keep]
+    kept_tags = tags[keep]
+    used_vertices = np.unique(kept_elements)
+    remap = np.full(vertices_nx3.shape[0], -1, dtype=np.int32)
+    remap[used_vertices] = np.arange(used_vertices.shape[0], dtype=np.int32)
+
+    return vertices_nx3[used_vertices].T, remap[kept_elements].T, kept_tags
+
+
+def _rotate_z_horn_to_y(vertices: np.ndarray) -> np.ndarray:
+    """Rotate +Z horn coordinates so it fires along +Y."""
+    vertices_nx3 = vertices.T
+    rotated = np.column_stack([
+        vertices_nx3[:, 0],
+        vertices_nx3[:, 2],
+        -vertices_nx3[:, 1],
+    ])
+    return rotated.T
+
+
 # ---------------------------------------------------------------------------
 # build_observation_points — custom_points happy path
 # ---------------------------------------------------------------------------
@@ -378,3 +469,92 @@ class TestInferFrameOrigin:
         # source_center should be near z=0
         assert abs(frame.origin[2]) < 0.05
         np.testing.assert_allclose(frame.origin, frame.source_center)
+
+
+# ---------------------------------------------------------------------------
+# infer_frame — symmetry-reduced curved source caps
+# ---------------------------------------------------------------------------
+
+class TestInferFrameSymmetryReduced:
+
+    def test_yz_xz_quadrant_projects_axis_frame_and_origin(self):
+        verts, elems, tags = _build_curved_cap_horn_mesh()
+        verts, elems, tags = _restrict_mesh(
+            verts, elems, tags,
+            lambda centroid: centroid[0] > 0.0 and centroid[1] > 0.0,
+        )
+        grid = _mock_grid(verts, elems)
+
+        frame = infer_frame(grid, tags, source_tag=2, symmetry_plane="yz+xz")
+
+        np.testing.assert_allclose(frame.axis, [0.0, 0.0, 1.0], atol=1e-9)
+        np.testing.assert_allclose(frame.u, [1.0, 0.0, 0.0], atol=1e-9)
+        np.testing.assert_allclose(frame.v, [0.0, 1.0, 0.0], atol=1e-9)
+        assert frame.origin[0] == 0.0
+        assert frame.origin[1] == 0.0
+
+    @pytest.mark.parametrize(
+        ("symmetry_plane", "predicate", "origin_index"),
+        [
+            ("yz", lambda centroid: centroid[0] > 0.0, 0),
+            ("xz", lambda centroid: centroid[1] > 0.0, 1),
+        ],
+    )
+    def test_half_mesh_projects_axis_and_origin(
+        self, symmetry_plane, predicate, origin_index,
+    ):
+        verts, elems, tags = _build_curved_cap_horn_mesh()
+        verts, elems, tags = _restrict_mesh(verts, elems, tags, predicate)
+        grid = _mock_grid(verts, elems)
+
+        frame = infer_frame(grid, tags, source_tag=2, symmetry_plane=symmetry_plane)
+
+        np.testing.assert_allclose(frame.axis, [0.0, 0.0, 1.0], atol=1e-9)
+        assert frame.origin[origin_index] == 0.0
+
+    def test_full_mesh_axis_matches_yz_xz_quadrant_axis(self):
+        full_verts, full_elems, full_tags = _build_curved_cap_horn_mesh()
+        full_grid = _mock_grid(full_verts, full_elems)
+        full_frame = infer_frame(full_grid, full_tags, source_tag=2)
+
+        quad_verts, quad_elems, quad_tags = _restrict_mesh(
+            full_verts, full_elems, full_tags,
+            lambda centroid: centroid[0] > 0.0 and centroid[1] > 0.0,
+        )
+        quad_grid = _mock_grid(quad_verts, quad_elems)
+        quad_frame = infer_frame(
+            quad_grid, quad_tags, source_tag=2, symmetry_plane="yz+xz",
+        )
+
+        np.testing.assert_allclose(full_frame.axis, quad_frame.axis, atol=1e-9)
+
+    def test_xy_half_mesh_for_y_firing_horn_projects_axis_to_xy_plane(self):
+        verts, elems, tags = _build_curved_cap_horn_mesh()
+        verts = _rotate_z_horn_to_y(verts)
+        verts, elems, tags = _restrict_mesh(
+            verts, elems, tags,
+            lambda centroid: centroid[2] >= 0.0,
+        )
+        grid = _mock_grid(verts, elems)
+
+        frame = infer_frame(grid, tags, source_tag=2, symmetry_plane="xy")
+
+        assert frame.axis[2] == 0.0
+        np.testing.assert_allclose(frame.axis, [0.0, 1.0, 0.0], atol=1e-9)
+
+    def test_degenerate_axis_projection_keeps_unit_unprojected_axis(self):
+        verts, elems, tags = _build_curved_cap_horn_mesh()
+        grid = _mock_grid(verts, elems)
+
+        frame = infer_frame(grid, tags, source_tag=2, symmetry_plane="xy")
+
+        np.testing.assert_allclose(np.linalg.norm(frame.axis), 1.0, atol=1e-12)
+        assert frame.axis[2] > 0.9
+
+    def test_full_curved_cap_without_symmetry_stays_on_axis(self):
+        verts, elems, tags = _build_curved_cap_horn_mesh()
+        grid = _mock_grid(verts, elems)
+
+        frame = infer_frame(grid, tags, source_tag=2)
+
+        np.testing.assert_allclose(frame.axis, [0.0, 0.0, 1.0], atol=1e-9)
