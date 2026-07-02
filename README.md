@@ -97,6 +97,18 @@ features.
 Use `solve_frequencies(mesh, frequencies_hz, config=None)` when frequency order
 comes from the caller instead of a generated sweep.
 
+Use `solve_multi_source(mesh, sources, config=None, frequencies_hz=None)` when
+several velocity sources share one mesh (e.g. HF/MF/LF drive bases or aperture
+radiation-matrix columns). Each entry of `sources` is a `velocity_sources`
+dict; the helper assembles and factors each frequency's operator ONCE and
+back-substitutes one right-hand side per source (multi-RHS), so N sources cost
+roughly one solve plus N-1 cheap RHS/field passes. It returns one
+`SolveResult` per source, matching sequential `solve()` calls to float32
+tolerance, and records `surface_pressure_avg` on the union of all source tags
+in every result (zero-velocity tags are legal listeners). Multi-source rides
+the default pipelined corrected/optimized assembly path; the reference/parity
+debug modes stay single-source.
+
 ## Observation Points
 
 `ObservationConfig` builds polar observation arcs by default:

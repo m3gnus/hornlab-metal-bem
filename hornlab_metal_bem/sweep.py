@@ -1,6 +1,7 @@
 """Native Metal frequency sweep execution."""
 from __future__ import annotations
 
+from dataclasses import replace
 import logging
 import math
 import os
@@ -851,3 +852,314 @@ def run_sweep_native_metal(
         ),
         native_diagnostics=native_diagnostics_rows,
     )
+
+
+def _extra_source_system_view(system, extra) -> SimpleNamespace:
+    """Per-extra-source view over one solved case for the result builders.
+
+    Mirrors the attribute surface `_append_system_result` reads. The shared
+    assembly/dense-solve cost is attributed to source 0's result only; extra
+    sources report zero there and their own field-evaluation time, so summing
+    per-source timings reproduces the true total instead of multiplying the
+    shared factorization by the source count.
+    """
+    return SimpleNamespace(
+        impedance=extra.impedance,
+        surface_pressure_avg=extra.surface_pressure_avg,
+        pressure_real_f32=extra.pressure_real_f32,
+        pressure_imag_f32=extra.pressure_imag_f32,
+        pressure_shape=extra.pressure_shape,
+        field_real_f32=extra.field_real_f32,
+        field_imag_f32=extra.field_imag_f32,
+        field_shape=extra.field_shape,
+        field_row_index=extra.field_row_index,
+        field_batch_shape=extra.field_batch_shape,
+        assembly_s=0.0,
+        dense_solve_s=0.0,
+        field_s=extra.field_s,
+        lapack_info=system.lapack_info,
+        diagnostics=getattr(system, "diagnostics", {}),
+    )
+
+
+def run_sweep_native_metal_multi_source(
+    mesh: LoadedMesh,
+    frequencies: NDArray[np.float64],
+    frame: ObservationFrame,
+    config: SolveConfig,
+    sources: list[dict[int, complex]],
+) -> list[SolveResult]:
+    """Solve one sweep with multiple velocity sources sharing each operator.
+
+    Each frequency's system matrix is assembled and factored ONCE in the
+    native helper; every entry of ``sources`` contributes one right-hand side
+    (multi-RHS) plus its own field evaluation and reductions. Returns one
+    ``SolveResult`` per source, each equivalent to a sequential ``solve()``
+    with ``config.velocity_sources`` replaced by that source dict (to float32
+    tolerance). ``config.velocity_sources`` itself is ignored.
+
+    ``surface_pressure_avg`` is recorded for the sorted union of all source
+    tags in EVERY result, so cross-source transfer terms (e.g. radiation-
+    impedance matrix columns) come out of one call. Streaming callbacks
+    (``on_frequency_result``) and ``velocity_source_callback`` are not
+    supported here.
+    """
+    should_route_native_metal(config)
+    if not sources:
+        raise ValueError("sources must contain at least one velocity dict")
+    if config.velocity_source_callback is not None:
+        raise ValueError(
+            "multi-source solves do not support velocity_source_callback"
+        )
+    if config.on_frequency_result is not None:
+        raise ValueError(
+            "multi-source solves do not support on_frequency_result streaming"
+        )
+    per_source_configs = [
+        replace(config, velocity_sources=dict(source)) for source in sources
+    ]
+    if len(sources) == 1:
+        return [
+            run_sweep_native_metal(mesh, frequencies, frame, per_source_configs[0])
+        ]
+
+    frequencies = np.asarray(frequencies, dtype=np.float64)
+    if frequencies.size == 0:
+        raise ValueError("frequencies must contain at least one value")
+
+    mesh_tags = {int(tag) for tag in np.unique(mesh.physical_tags)}
+    for index, source in enumerate(sources):
+        missing_tags = sorted(set(source) - mesh_tags)
+        if missing_tags:
+            raise ValueError(
+                f"sources[{index}] tags {missing_tags} are not present in the "
+                f"mesh; available physical tags: {sorted(mesh_tags)}"
+            )
+
+    try:
+        from .metal.geometry import build_metal_geometry_buffers
+        from .metal.native import MetalNativeStandardSession
+    except Exception as exc:  # pragma: no cover - import/runtime specific.
+        raise AssemblyBackendUnavailable(
+            f"Native Metal helper could not be imported: {exc}"
+        ) from exc
+
+    runtime = _discover_runtime_smoke_cached()
+    if not runtime.available:
+        reason = "; ".join(runtime.unavailable_reasons)
+        raise AssemblyBackendUnavailable(reason)
+
+    t_total = time.time()
+    obs_points, angles_deg = build_observation_points(frame, config.observation)
+    p1_space, dp0_space = make_pure_function_spaces(mesh.grid)
+    geometry_buffers = build_metal_geometry_buffers(
+        mesh.grid,
+        mesh.physical_tags,
+        p1_space,
+        dp0_space,
+    )
+    mesh_max_edge_m = _mesh_max_edge_m(mesh)
+
+    # Union of all source tags: every source's result records the average
+    # surface pressure on every tag any source drives (or lists at zero
+    # velocity), which is exactly the cross-term data an aperture radiation
+    # matrix needs.
+    source_tags = sorted({int(tag) for source in sources for tag in source})
+    impedance_source_tags = [
+        min(source.keys(), default=2) for source in sources
+    ]
+    impedance_sources_arg = _impedance_sources_for_frequencies(
+        mesh.physical_tags, frequencies, config
+    )
+    chief_points_3xm = None
+    if config.chief_points is not None:
+        chief_points_3xm = np.ascontiguousarray(
+            np.asarray(config.chief_points, dtype=np.float64).T, dtype=np.float32
+        )
+        _warn_near_boundary_chief_points(
+            mesh,
+            np.asarray(config.chief_points, dtype=np.float64),
+            mesh_max_edge_m,
+        )
+
+    n_sources = len(sources)
+    surface_pavg = [
+        {tag: [] for tag in source_tags} for _ in range(n_sources)
+    ]
+    pressure_rows: list[list[NDArray[np.complex128]]] = [
+        [] for _ in range(n_sources)
+    ]
+    spl_rows: list[list[NDArray[np.float64]]] = [[] for _ in range(n_sources)]
+    impedance_rows: list[list[complex]] = [[] for _ in range(n_sources)]
+    surface_pressure_rows: list[list[NDArray[np.complex128]] | None] = [
+        [] if config.return_surface_pressure else None for _ in range(n_sources)
+    ]
+    native_diagnostics_rows: list[list[dict]] = [[] for _ in range(n_sources)]
+    solver_logs: list[list[dict]] = [[] for _ in range(n_sources)]
+    completed_freqs: list[list[float]] = [[] for _ in range(n_sources)]
+    on_axis_idx = int(np.argmin(np.abs(angles_deg)))
+    n_planes, n_angles, _ = obs_points.shape
+    field_points = _field_points_3xn(obs_points)
+
+    freq_values = np.asarray(frequencies, dtype=np.float64)
+    k_values, k_imag_values = _k_values_for_native(freq_values, config)
+    per_source_neumann = [
+        _build_neumann_rows(
+            dp0_space,
+            mesh.physical_tags,
+            freq_values,
+            source_config,
+            impedance_sources_arg,
+        )
+        for source_config in per_source_configs
+    ]
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=geometry_buffers,
+        symmetry_plane=config.native_symmetry_plane,
+        check_open_edges=config.native_check_open_edges,
+        runtime_status=runtime,
+        extra_env=_native_env_overrides(config),
+    ) as session:
+        logger.info(
+            "Running %d-frequency x %d-source native Metal multi-RHS batch.",
+            len(freq_values),
+            n_sources,
+        )
+        systems = session.assemble_solve_evaluate_standard_neumann_batch(
+            freq_values,
+            k_values,
+            per_source_neumann[0],
+            field_points,
+            k_imag_f32=k_imag_values,
+            impedance_sources=impedance_sources_arg,
+            batch_id="all_observation_planes",
+            operation_id="assembly-solve-field-resident-batch-multi-source",
+            source_tags=source_tags,
+            impedance_source_tag=impedance_source_tags[0],
+            write_surface_pressure=config.return_surface_pressure,
+            write_batched_field=True,
+            dense_solve_dtype=config.dense_solve_dtype,
+            chief_points=chief_points_3xm,
+            chief_weight=config.chief_weight,
+            extra_neumann_dp0=np.stack(per_source_neumann[1:], axis=0),
+            extra_impedance_source_tags=impedance_source_tags[1:],
+        )
+        field_batch_complex: NDArray[np.complex128] | None = None
+        if systems and systems[0].field_row_index is not None:
+            first = systems[0]
+            if first.field_batch_shape is None:
+                raise RuntimeError("native batched field result missing shape")
+            field_batch_complex = _read_complex_f32(
+                Path(first.field_real_f32),
+                Path(first.field_imag_f32),
+                tuple(first.field_batch_shape),
+            ).astype(np.complex128)
+
+        for i, (freq, system) in enumerate(zip(freq_values, systems)):
+            frequency_hz = float(freq)
+            if len(system.extra_sources) != n_sources - 1:
+                raise RuntimeError(
+                    "native multi-source case returned "
+                    f"{len(system.extra_sources)} extra source(s), expected "
+                    f"{n_sources - 1}"
+                )
+            timing_s = (
+                float(system.assembly_s)
+                + float(system.dense_solve_s)
+                + float(system.field_s)
+            )
+            for source_index in range(n_sources):
+                source_system = (
+                    system
+                    if source_index == 0
+                    else _extra_source_system_view(
+                        system, system.extra_sources[source_index - 1]
+                    )
+                )
+                source_timing = (
+                    timing_s
+                    if source_index == 0
+                    else float(source_system.field_s)
+                )
+                _append_system_result(
+                    frequency_hz=frequency_hz,
+                    system=source_system,
+                    backend="native_metal_resident_multi_source_batch",
+                    timing_s=source_timing,
+                    mesh=mesh,
+                    p1_space=p1_space,
+                    source_tags=source_tags,
+                    impedance_source_tag=impedance_source_tags[source_index],
+                    n_planes=n_planes,
+                    n_angles=n_angles,
+                    on_axis_idx=on_axis_idx,
+                    field_batch_complex=field_batch_complex,
+                    surface_pavg=surface_pavg[source_index],
+                    pressure_rows=pressure_rows[source_index],
+                    spl_rows=spl_rows[source_index],
+                    impedance_rows=impedance_rows[source_index],
+                    surface_pressure_rows=surface_pressure_rows[source_index],
+                    native_diagnostics_rows=native_diagnostics_rows[source_index],
+                    solver_log=solver_logs[source_index],
+                    completed_freqs=completed_freqs[source_index],
+                    dense_solve_rcond_warning_threshold=(
+                        config.dense_solve_rcond_warning_threshold
+                    ),
+                    mesh_max_edge_m=mesh_max_edge_m,
+                    mesh_elements_per_wavelength_min=(
+                        config.mesh_elements_per_wavelength_min
+                    ),
+                )
+            if config.progress_callback is not None:
+                config.progress_callback(i, len(freq_values), frequency_hz)
+
+    total_s = time.time() - t_total
+    results: list[SolveResult] = []
+    for source_index in range(n_sources):
+        solver_log = solver_logs[source_index]
+        sp_avg: dict[int, np.ndarray] = {
+            tag: np.array(values, dtype=np.complex128)
+            for tag, values in surface_pavg[source_index].items()
+        }
+        timings = {
+            "solve_s": sum(float(entry["timing_s"]) for entry in solver_log),
+            "assembly_s": sum(float(entry["assembly_s"]) for entry in solver_log),
+            "dense_solve_s": sum(
+                float(entry["dense_solve_s"]) for entry in solver_log
+            ),
+            "directivity_s": sum(
+                float(entry["field_s"]) for entry in solver_log
+            ),
+            # Shared wall clock: the batch solves every source at once, so the
+            # per-source split lives in solve_s/assembly_s/dense_solve_s
+            # (source 0 carries the shared factorization cost).
+            "total_s": total_s if source_index == 0 else 0.0,
+        }
+        results.append(
+            SolveResult(
+                frequencies_hz=np.array(
+                    completed_freqs[source_index], dtype=np.float64
+                ),
+                pressure_complex=np.stack(pressure_rows[source_index], axis=0),
+                directivity_db=np.stack(spl_rows[source_index], axis=0),
+                impedance=np.array(
+                    impedance_rows[source_index], dtype=np.complex128
+                ),
+                observation_angles_deg=angles_deg,
+                observation_points=obs_points,
+                observation_planes=config.observation.planes,
+                config=per_source_configs[source_index],
+                mesh_info=mesh.info,
+                timings=timings,
+                solver_log=solver_log,
+                surface_pressure_avg=sp_avg if sp_avg else None,
+                surface_pressure_complex=(
+                    np.stack(surface_pressure_rows[source_index], axis=0)
+                    if surface_pressure_rows[source_index] is not None
+                    else None
+                ),
+                native_diagnostics=native_diagnostics_rows[source_index],
+            )
+        )
+    return results

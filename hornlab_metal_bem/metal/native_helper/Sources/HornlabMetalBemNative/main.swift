@@ -384,6 +384,38 @@ struct DenseSolveRun {
     var chiefResidualRel: Double? = nil
 }
 
+/// Dense solve result for one case with B right-hand sides sharing one
+/// operator: one factorization (LU or QR), B back-substitutions. Per-RHS
+/// entries (`pressures`, refine bookkeeping, CHIEF residuals) are indexed by
+/// source; the factorization-level values (implementation, lapackInfo, rcond,
+/// dtype) are shared by construction.
+struct MultiDenseSolveRun {
+    let pressures: [[Complex32]]
+    let implementation: String
+    let seconds: Double
+    let lapackInfo: Int32
+    let rcond: Double?
+    var refineIterations: [Int]? = nil
+    var refineResidualRels: [Double]? = nil
+    var dtype: String = "float32"
+    var chiefResidualRels: [Double]? = nil
+
+    /// Single-source view for the existing per-case result plumbing.
+    func single(_ index: Int) -> DenseSolveRun {
+        DenseSolveRun(
+            pressure: pressures.isEmpty ? [] : pressures[index],
+            implementation: implementation,
+            seconds: seconds,
+            lapackInfo: lapackInfo,
+            rcond: rcond,
+            refineIterations: refineIterations?[index],
+            refineResidualRel: refineResidualRels?[index],
+            dtype: dtype,
+            chiefResidualRel: chiefResidualRels?[index]
+        )
+    }
+}
+
 func matrixOneNorm(_ matrix: inout [__CLPK_complex], n: Int) -> __CLPK_real {
     var normChar = Int8(49) // "1"
     var mClpk = __CLPK_integer(n)
@@ -1252,16 +1284,23 @@ func evaluateExteriorReference(
 func assembleChiefRows(
     geom: Geometry,
     chiefPoints: [(Float, Float, Float)],
-    driverNeumann: [Complex32],
+    driverNeumanns: [[Complex32]],
     k: Float,
     kImag: Float,
     robinBetas: [Complex32]?
-) -> (cRe: [Float], cIm: [Float], dRe: [Float], dIm: [Float], cNormInf: Float) {
+) -> (cRe: [Float], cIm: [Float], dRe: [[Float]], dIm: [[Float]], cNormInf: Float) {
     let (qx, qy, qw) = triangleRule6()
     let n = geom.p1DofCount
     let m = chiefPoints.count
+    let sourceCount = driverNeumanns.count
     var c = Array(repeating: Complex32.zero, count: m * n)   // row-major m x n
-    var d = Array(repeating: Complex32.zero, count: m)
+    // Per-source constraint RHS d_s: the C block depends only on geometry, k,
+    // and the Robin fold, so the multi-source case shares one quadrature pass
+    // and accumulates every source's G*g_drv projection from the same gScalar.
+    var d = Array(
+        repeating: Array(repeating: Complex32.zero, count: m),
+        count: sourceCount
+    )
     let imageMasks = symmetryImageMasks(geom.symmetryPlane)
     // iK = i*k_complex with the SAME convention as the boundary fold and the
     // field-side Robin reconstruction (main.swift:1026 / :972).
@@ -1275,7 +1314,6 @@ func assembleChiefRows(
             let nny = geom.normal(tri, 1)
             let nnz = geom.normal(tri, 2)
             let jac = 2.0 * geom.areas[tri]
-            let gTri = driverNeumann[tri]
             let beta = robinBetas?[tri] ?? Complex32.zero
             let hasRobin = beta.re != 0.0 || beta.im != 0.0
             let robinCoupling = iK * beta
@@ -1313,7 +1351,9 @@ func assembleChiefRows(
                 }
             }
             // RHS: + integral(G) * g_drv  (the +G*g_drv moved from the -G*q term).
-            d[ci] = d[ci] + gScalar * gTri
+            for s in 0..<sourceCount {
+                d[s][ci] = d[s][ci] + gScalar * driverNeumanns[s][tri]
+            }
             // LHS columns: D coefficient, minus the Robin fold -G*(iK*beta)/3 per
             // P1 column (same sign as the boundary operator fold).
             for i in 0..<3 {
@@ -1343,8 +1383,8 @@ func assembleChiefRows(
     return (
         c.map { $0.re },
         c.map { $0.im },
-        d.map { $0.re },
-        d.map { $0.im },
+        d.map { row in row.map { $0.re } },
+        d.map { row in row.map { $0.im } },
         cNormInf
     )
 }
@@ -2387,11 +2427,16 @@ func applyNearFieldCorrectionsCPU(
     to arrays: AssemblyArrays,
     geom: Geometry,
     neumann: [Complex32],
+    extraNeumanns: [[Complex32]] = [],
+    extraRhs: [(re: [Float], im: [Float])] = [],
     k: Float,
     kImag: Float = 0.0,
     robinBetas: [Complex32]? = nil,
     config: NearQuadratureConfig
-) throws -> (AssemblyArrays, NearQuadratureStats) {
+) throws -> (AssemblyArrays, [(re: [Float], im: [Float])], NearQuadratureStats) {
+    if extraNeumanns.count != extraRhs.count {
+        try fail("near-field corrections extraNeumanns/extraRhs count mismatch")
+    }
     let start = CFAbsoluteTimeGetCurrent()
     let pairList = try buildNearPairList(geom: geom, threshold: config.threshold)
     let n = geom.p1DofCount
@@ -2399,6 +2444,7 @@ func applyNearFieldCorrectionsCPU(
     var aIm = arrays.aIm
     var rhsRe = arrays.rhsRe
     var rhsIm = arrays.rhsIm
+    var correctedExtra = extraRhs
     var triplets: [Int64: (Double, Double)] = [:]
     triplets.reserveCapacity(pairList.pairs.count * 9)
     let iK = Complex32(re: -kImag, im: k)
@@ -2436,6 +2482,13 @@ func applyNearFieldCorrectionsCPU(
             let rhsDelta = (slpDelta * gTrial) * rowWeight
             rhsRe[row] += rhsDelta.re
             rhsIm[row] += rhsDelta.im
+            // Multi-source: the same slpDelta folds each extra source's own
+            // neumann coefficient into its own RHS in this single pair pass.
+            for s in correctedExtra.indices {
+                let extraDelta = (slpDelta * extraNeumanns[s][pair.trial]) * rowWeight
+                correctedExtra[s].re[row] += extraDelta.re
+                correctedExtra[s].im[row] += extraDelta.im
+            }
 
             for j in 0..<3 {
                 let col = geom.p1Dof(pair.trial, j)
@@ -2470,6 +2523,7 @@ func applyNearFieldCorrectionsCPU(
     )
     return (
         AssemblyArrays(aRe: aRe, aIm: aIm, rhsRe: rhsRe, rhsIm: rhsIm),
+        correctedExtra,
         stats
     )
 }
@@ -2478,23 +2532,27 @@ func applyNearFieldCorrectionsIfEnabled(
     to arrays: AssemblyArrays,
     geom: Geometry,
     neumann: [Complex32],
+    extraNeumanns: [[Complex32]] = [],
+    extraRhs: [(re: [Float], im: [Float])] = [],
     k: Float,
     kImag: Float = 0.0,
     robinBetas: [Complex32]? = nil
-) throws -> (AssemblyArrays, NearQuadratureStats?) {
+) throws -> (AssemblyArrays, [(re: [Float], im: [Float])], NearQuadratureStats?) {
     guard let config = try requestedNearQuadratureConfig() else {
-        return (arrays, nil)
+        return (arrays, extraRhs, nil)
     }
-    let (corrected, stats) = try applyNearFieldCorrectionsCPU(
+    let (corrected, correctedExtra, stats) = try applyNearFieldCorrectionsCPU(
         to: arrays,
         geom: geom,
         neumann: neumann,
+        extraNeumanns: extraNeumanns,
+        extraRhs: extraRhs,
         k: k,
         kImag: kImag,
         robinBetas: robinBetas,
         config: config
     )
-    return (corrected, stats)
+    return (corrected, correctedExtra, stats)
 }
 
 func applyDuffyCorrections(
@@ -4328,6 +4386,10 @@ final class ResidentMetalContext {
     var fieldOutIm: MTLBuffer?
     var fieldOutCount = 0
     private var alternateOutputSlot: AssemblyOutputSlot?
+    // Per-slot extra RHS output buffers for multi-source cases, grown on
+    // demand to the batch's extra-source count. Keyed by slot parity (0/1)
+    // like the primary output slots so pipelined cases never alias.
+    private var extraRhsBuffersBySlot: [Int: [(re: MTLBuffer, im: MTLBuffer)]] = [:]
 
     init(geom: Geometry) throws {
         self.geom = geom
@@ -4528,6 +4590,37 @@ final class ResidentMetalContext {
         return slot
     }
 
+    /// Extra RHS output buffers for one slot parity, grown to `count` on
+    /// demand and reused across the batch (same lifecycle discipline as the
+    /// primary slots: finish case i before beginning case i + 2).
+    func extraRhsBuffers(
+        slotIndex: Int,
+        count: Int
+    ) throws -> [(re: MTLBuffer, im: MTLBuffer)] {
+        let key = slotIndex % 2
+        var buffers = extraRhsBuffersBySlot[key] ?? []
+        let n = geom.p1DofCount
+        while buffers.count < count {
+            let index = buffers.count
+            buffers.append(
+                (
+                    re: try makeOutputBuffer(
+                        device,
+                        count: n,
+                        label: "resident_extra_rhs_re_\(key)_\(index)"
+                    ),
+                    im: try makeOutputBuffer(
+                        device,
+                        count: n,
+                        label: "resident_extra_rhs_im_\(key)_\(index)"
+                    )
+                )
+            )
+        }
+        extraRhsBuffersBySlot[key] = buffers
+        return Array(buffers.prefix(count))
+    }
+
     private func readAssemblyArrays(slot: AssemblyOutputSlot) -> AssemblyArrays {
         let n = geom.p1DofCount
         return AssemblyArrays(
@@ -4568,29 +4661,6 @@ final class ResidentMetalContext {
         params.hasRobin = robinBuffers.hasRobin
         let n = geom.p1DofCount
         let matrixCount = n * n
-        var sourceTrisArray: [Int32] = []
-        var sourceReArray: [Float] = []
-        var sourceImArray: [Float] = []
-        sourceTrisArray.reserveCapacity(neumann.count)
-        sourceReArray.reserveCapacity(neumann.count)
-        sourceImArray.reserveCapacity(neumann.count)
-        for tri in 0..<neumann.count {
-            let value = neumann[tri]
-            if value.re != 0.0 || value.im != 0.0 {
-                sourceTrisArray.append(Int32(tri))
-                sourceReArray.append(value.re)
-                sourceImArray.append(value.im)
-            }
-        }
-        if sourceTrisArray.isEmpty {
-            sourceTrisArray.append(0)
-            sourceReArray.append(0.0)
-            sourceImArray.append(0.0)
-        }
-        var sourceCount = Int32(sourceTrisArray.count)
-        let sourceTris = try makeBuffer(device, sourceTrisArray, label: "resident_source_tris")
-        let sourceRe = try makeBuffer(device, sourceReArray, label: "resident_source_re")
-        let sourceIm = try makeBuffer(device, sourceImArray, label: "resident_source_im")
 
         let matrixDispatch: [String: Any]
         if implementation == "pair_atomic" {
@@ -4661,12 +4731,60 @@ final class ResidentMetalContext {
             matrixEncoder.endEncoding()
         }
 
+        let rhsDispatch = try encodeRhsSourceDispatch(
+            commandBuffer: commandBuffer,
+            outRe: slot.rhsRe,
+            outIm: slot.rhsIm,
+            neumann: neumann,
+            params: params,
+            label: "resident regular DP0 Neumann RHS"
+        )
+        return (implementation: implementation, matrix: matrixDispatch, rhs: rhsDispatch)
+    }
+
+    /// Encode one single-layer RHS assembly dispatch (V*g contraction over the
+    /// nonzero support of `neumann`). Shared by the primary case RHS and the
+    /// extra multi-source RHS vectors: the kernel cost scales with the source
+    /// support, not the operator size, so per-source dispatches are cheap.
+    private func encodeRhsSourceDispatch(
+        commandBuffer: MTLCommandBuffer,
+        outRe: MTLBuffer,
+        outIm: MTLBuffer,
+        neumann: [Complex32],
+        params: MetalKernelParams,
+        label: String
+    ) throws -> [String: Any] {
+        var sourceTrisArray: [Int32] = []
+        var sourceReArray: [Float] = []
+        var sourceImArray: [Float] = []
+        sourceTrisArray.reserveCapacity(neumann.count)
+        sourceReArray.reserveCapacity(neumann.count)
+        sourceImArray.reserveCapacity(neumann.count)
+        for tri in 0..<neumann.count {
+            let value = neumann[tri]
+            if value.re != 0.0 || value.im != 0.0 {
+                sourceTrisArray.append(Int32(tri))
+                sourceReArray.append(value.re)
+                sourceImArray.append(value.im)
+            }
+        }
+        if sourceTrisArray.isEmpty {
+            sourceTrisArray.append(0)
+            sourceReArray.append(0.0)
+            sourceImArray.append(0.0)
+        }
+        var sourceCount = Int32(sourceTrisArray.count)
+        let sourceTris = try makeBuffer(device, sourceTrisArray, label: "resident_source_tris")
+        let sourceRe = try makeBuffer(device, sourceReArray, label: "resident_source_re")
+        let sourceIm = try makeBuffer(device, sourceImArray, label: "resident_source_im")
+        var kernelParams = params
+
         guard let rhsEncoder = commandBuffer.makeComputeCommandEncoder() else {
             try fail("failed to create Metal RHS encoder")
         }
-        rhsEncoder.label = "resident regular DP0 Neumann RHS"
-        rhsEncoder.setBuffer(slot.rhsRe, offset: 0, index: 0)
-        rhsEncoder.setBuffer(slot.rhsIm, offset: 0, index: 1)
+        rhsEncoder.label = label
+        rhsEncoder.setBuffer(outRe, offset: 0, index: 0)
+        rhsEncoder.setBuffer(outIm, offset: 0, index: 1)
         rhsEncoder.setBuffer(px, offset: 0, index: 2)
         rhsEncoder.setBuffer(py, offset: 0, index: 3)
         rhsEncoder.setBuffer(pz, offset: 0, index: 4)
@@ -4678,16 +4796,16 @@ final class ResidentMetalContext {
         rhsEncoder.setBuffer(sourceTris, offset: 0, index: 10)
         rhsEncoder.setBuffer(sourceRe, offset: 0, index: 11)
         rhsEncoder.setBuffer(sourceIm, offset: 0, index: 12)
-        rhsEncoder.setBytes(&params, length: MemoryLayout<MetalKernelParams>.stride, index: 13)
+        rhsEncoder.setBytes(&kernelParams, length: MemoryLayout<MetalKernelParams>.stride, index: 13)
         rhsEncoder.setBytes(&sourceCount, length: MemoryLayout<Int32>.stride, index: 14)
         let rhsDispatch = try dispatch1D(
             encoder: rhsEncoder,
             pipeline: rhsPipeline,
-            count: n,
+            count: geom.p1DofCount,
             kernel: "rhs"
         )
         rhsEncoder.endEncoding()
-        return (implementation: implementation, matrix: matrixDispatch, rhs: rhsDispatch)
+        return rhsDispatch
     }
 
     func assembleRegularMetal(
@@ -4987,6 +5105,7 @@ final class ResidentMetalContext {
     struct PendingAssembly {
         let caseIndex: Int
         let slot: AssemblyOutputSlot
+        let extraRhsBuffers: [(re: MTLBuffer, im: MTLBuffer)]
         let regularCommandBuffer: MTLCommandBuffer
         let duffyCommandBuffer: MTLCommandBuffer?
         let includesDuffyBlocks: Bool
@@ -4998,6 +5117,10 @@ final class ResidentMetalContext {
 
     struct FinishedAssembly {
         let regular: MetalAssemblyOutput
+        // Uncorrected extra-source RHS vectors (multi-source cases), read
+        // back alongside the primary arrays. Duffy/near-field RHS deltas are
+        // applied on the CPU afterwards, mirroring the primary RHS flow.
+        let extraRhs: [(re: [Float], im: [Float])]
         let duffyBlocks: MetalDuffyBlockOutput?
         let regularGpuSeconds: Double
         let duffyGpuSeconds: Double
@@ -5009,15 +5132,22 @@ final class ResidentMetalContext {
     /// while the CPU is still solving earlier cases. Even and odd cases write
     /// to distinct output slots; callers must finish case i before beginning
     /// case i + 2 so a slot is never written while it is still being read.
+    /// `extraNeumanns` adds one cheap RHS-only dispatch per extra source into
+    /// the same command buffer; the O(n^2) matrix work stays shared.
     func beginAssembly(
         caseIndex: Int,
         neumann: [Complex32],
+        extraNeumanns: [[Complex32]] = [],
         k: Float,
         kImag: Float = 0.0,
         robinBetas: [Complex32]? = nil,
         includeDuffyBlocks: Bool
     ) throws -> PendingAssembly {
         let slot = try outputSlot(caseIndex % 2)
+        let extraBuffers = try extraRhsBuffers(
+            slotIndex: caseIndex % 2,
+            count: extraNeumanns.count
+        )
         guard let regularCommandBuffer = commandQueue.makeCommandBuffer() else {
             try fail("failed to create Metal command buffer")
         }
@@ -5030,6 +5160,27 @@ final class ResidentMetalContext {
             kImag: kImag,
             robinBetas: robinBetas
         )
+        if !extraNeumanns.isEmpty {
+            let extraParams = MetalKernelParams(
+                nDof: Int32(geom.p1DofCount),
+                nTriangles: Int32(geom.nTriangles),
+                maxInc: Int32(incidence.maxInc),
+                symmetryPlane: geom.symmetryPlaneCode,
+                k: k,
+                kImag: kImag,
+                hasRobin: 0
+            )
+            for (index, extraNeumann) in extraNeumanns.enumerated() {
+                _ = try encodeRhsSourceDispatch(
+                    commandBuffer: regularCommandBuffer,
+                    outRe: extraBuffers[index].re,
+                    outIm: extraBuffers[index].im,
+                    neumann: extraNeumann,
+                    params: extraParams,
+                    label: "resident extra DP0 Neumann RHS source \(index + 1)"
+                )
+            }
+        }
         regularCommandBuffer.commit()
 
         var duffyCommandBuffer: MTLCommandBuffer? = nil
@@ -5051,6 +5202,7 @@ final class ResidentMetalContext {
         return PendingAssembly(
             caseIndex: caseIndex,
             slot: slot,
+            extraRhsBuffers: extraBuffers,
             regularCommandBuffer: regularCommandBuffer,
             duffyCommandBuffer: duffyCommandBuffer,
             includesDuffyBlocks: includeDuffyBlocks,
@@ -5090,6 +5242,13 @@ final class ResidentMetalContext {
                 "rhs": pending.rhsDispatch,
             ]
         )
+        let n = geom.p1DofCount
+        let extraRhs = pending.extraRhsBuffers.map { buffers in
+            (
+                re: readFloatBuffer(buffers.re, count: n),
+                im: readFloatBuffer(buffers.im, count: n)
+            )
+        }
         var duffyBlocks: MetalDuffyBlockOutput? = nil
         if let duffyDispatchReport = pending.duffyDispatchReport {
             duffyBlocks = try readDuffyBlocks(
@@ -5107,11 +5266,48 @@ final class ResidentMetalContext {
         }
         return FinishedAssembly(
             regular: regular,
+            extraRhs: extraRhs,
             duffyBlocks: duffyBlocks,
             regularGpuSeconds: regularGpuSeconds,
             duffyGpuSeconds: duffyGpuSeconds,
             readbackSeconds: CFAbsoluteTimeGetCurrent() - readbackStart
         )
+    }
+
+    /// RHS-only Duffy delta fold for extra multi-source RHS vectors. The
+    /// matrix deltas are neumann-independent and already applied once by
+    /// `reduceDuffyDeltaBlocks`; each extra source only needs its own
+    /// slpDelta * g_s[trial] contribution, reusing the same GPU delta blocks
+    /// and reduction plan.
+    func applyDuffyRhsDeltas(
+        to extraRhs: [(re: [Float], im: [Float])],
+        extraNeumanns: [[Complex32]],
+        blocks: MetalDuffyBlockOutput
+    ) -> [(re: [Float], im: [Float])] {
+        guard !extraRhs.isEmpty else {
+            return extraRhs
+        }
+        let pairCount = pairList.pairs.count
+        var corrected = extraRhs
+        for pairIndex in 0..<pairCount {
+            let trialTri = duffyReductionPlan.pairTrialTriangles[pairIndex]
+            for i in 0..<3 {
+                let slpIndex = pairIndex + i * pairCount
+                let row = duffyReductionPlan.rhsRows[slpIndex]
+                let rowWeight = duffyReductionPlan.rowWeights[slpIndex]
+                let slpDelta = Complex32(
+                    re: blocks.slpRe[slpIndex],
+                    im: blocks.slpIm[slpIndex]
+                )
+                for s in extraRhs.indices {
+                    let gTrial = extraNeumanns[s][trialTri]
+                    let rhsDelta = (slpDelta * gTrial) * rowWeight
+                    corrected[s].re[row] += rhsDelta.re
+                    corrected[s].im[row] += rhsDelta.im
+                }
+            }
+        }
+        return corrected
     }
 
     func reduceDuffyDeltaBlocks(
@@ -5696,11 +5892,37 @@ func solveDenseAccelerateZgesv(
     rhsIm: [Float],
     n: Int
 ) throws -> DenseSolveRun {
+    let multi = try solveDenseAccelerateZgesvMulti(
+        aReRowMajor: aReRowMajor,
+        aImRowMajor: aImRowMajor,
+        rhsRe: [rhsRe],
+        rhsIm: [rhsIm],
+        n: n
+    )
+    return multi.single(0)
+}
+
+/// Multi-RHS float64 dense solve: one complex128 LU (zgesv with nrhs=B),
+/// B back-substitutions inside the same LAPACK call. `rhsRe`/`rhsIm` are
+/// indexed [source][dof]; the column-major RHS block is B contiguous columns.
+func solveDenseAccelerateZgesvMulti(
+    aReRowMajor: [Float],
+    aImRowMajor: [Float],
+    rhsRe: [[Float]],
+    rhsIm: [[Float]],
+    n: Int
+) throws -> MultiDenseSolveRun {
     if aReRowMajor.count != n * n || aImRowMajor.count != n * n {
         try fail("dense solve matrix size mismatch")
     }
-    if rhsRe.count != n || rhsIm.count != n {
-        try fail("dense solve RHS size mismatch")
+    let sourceCount = rhsRe.count
+    if sourceCount < 1 || rhsIm.count != sourceCount {
+        try fail("dense solve RHS source count mismatch")
+    }
+    for s in 0..<sourceCount {
+        if rhsRe[s].count != n || rhsIm[s].count != n {
+            try fail("dense solve RHS size mismatch")
+        }
     }
     let start = CFAbsoluteTimeGetCurrent()
 
@@ -5722,14 +5944,19 @@ func solveDenseAccelerateZgesv(
 
     var rhs = Array(
         repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
-        count: n
+        count: n * sourceCount
     )
-    for i in 0..<n {
-        rhs[i] = __CLPK_doublecomplex(r: Double(rhsRe[i]), i: Double(rhsIm[i]))
+    for s in 0..<sourceCount {
+        for i in 0..<n {
+            rhs[s * n + i] = __CLPK_doublecomplex(
+                r: Double(rhsRe[s][i]),
+                i: Double(rhsIm[s][i])
+            )
+        }
     }
 
     var nClpk = __CLPK_integer(n)
-    var nrhs = __CLPK_integer(1)
+    var nrhs = __CLPK_integer(sourceCount)
     var lda = __CLPK_integer(n)
     var ldb = __CLPK_integer(n)
     var info = __CLPK_integer(0)
@@ -5738,8 +5965,8 @@ func solveDenseAccelerateZgesv(
     zgesv_(&nClpk, &nrhs, &matrix, &lda, &pivots, &rhs, &ldb, &info)
 
     if info != 0 {
-        return DenseSolveRun(
-            pressure: [],
+        return MultiDenseSolveRun(
+            pressures: [],
             implementation: "accelerate_lapack_zgesv",
             seconds: CFAbsoluteTimeGetCurrent() - start,
             lapackInfo: Int32(info),
@@ -5748,9 +5975,14 @@ func solveDenseAccelerateZgesv(
         )
     }
     let rcond = estimateReciprocalConditionZ(factored: &matrix, n: n, anorm: anorm)
-    // Narrow the complex128 solution back to Complex32 for the f32 pipeline.
-    return DenseSolveRun(
-        pressure: rhs.map { Complex32(re: Float($0.r), im: Float($0.i)) },
+    // Narrow the complex128 solutions back to Complex32 for the f32 pipeline.
+    let pressures = (0..<sourceCount).map { s in
+        (0..<n).map { i in
+            Complex32(re: Float(rhs[s * n + i].r), im: Float(rhs[s * n + i].i))
+        }
+    }
+    return MultiDenseSolveRun(
+        pressures: pressures,
         implementation: "accelerate_lapack_zgesv",
         seconds: CFAbsoluteTimeGetCurrent() - start,
         lapackInfo: Int32(info),
@@ -5795,29 +6027,38 @@ func matrixInfNormRowMajor(re: [Float], im: [Float], rows: Int, cols: Int) -> Fl
 func solveDenseLeastSquaresZgels(
     aReRowMajor: [Float],
     aImRowMajor: [Float],
-    rhsRe: [Float],
-    rhsIm: [Float],
+    rhsRe: [[Float]],
+    rhsIm: [[Float]],
     cReRowMajor: [Float],
     cImRowMajor: [Float],
-    dRe: [Float],
-    dIm: [Float],
+    dRe: [[Float]],
+    dIm: [[Float]],
     weight: Float,
     cNormInf: Float,
     aNormInf: Float,
     n: Int,
     m: Int
-) throws -> DenseSolveRun {
+) throws -> MultiDenseSolveRun {
     if aReRowMajor.count != n * n || aImRowMajor.count != n * n {
         try fail("CHIEF least-squares matrix size mismatch")
     }
-    if rhsRe.count != n || rhsIm.count != n {
-        try fail("CHIEF least-squares RHS size mismatch")
+    let sourceCount = rhsRe.count
+    if sourceCount < 1 || rhsIm.count != sourceCount {
+        try fail("CHIEF least-squares RHS source count mismatch")
+    }
+    if dRe.count != sourceCount || dIm.count != sourceCount {
+        try fail("CHIEF row RHS source count mismatch")
+    }
+    for s in 0..<sourceCount {
+        if rhsRe[s].count != n || rhsIm[s].count != n {
+            try fail("CHIEF least-squares RHS size mismatch")
+        }
+        if dRe[s].count != m || dIm[s].count != m {
+            try fail("CHIEF row RHS size mismatch")
+        }
     }
     if cReRowMajor.count != m * n || cImRowMajor.count != m * n {
         try fail("CHIEF row block size mismatch")
-    }
-    if dRe.count != m || dIm.count != m {
-        try fail("CHIEF row RHS size mismatch")
     }
     if m < 1 {
         try fail("CHIEF least-squares requires at least one constraint row")
@@ -5850,25 +6091,33 @@ func solveDenseLeastSquaresZgels(
         }
     }
 
-    // RHS length = max(rows, n) = rows; first n = b, next m = scale*d.
+    // RHS block: one length-rows column per source; first n = b_s, next
+    // m = scale*d_s. All columns share the single QR factorization inside
+    // one zgels call (nrhs = B).
     var b = Array(
         repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
-        count: rows
+        count: rows * sourceCount
     )
-    for i in 0..<n {
-        b[i] = __CLPK_doublecomplex(r: Double(rhsRe[i]), i: Double(rhsIm[i]))
-    }
-    for r in 0..<m {
-        b[n + r] = __CLPK_doublecomplex(
-            r: Double(dRe[r]) * scale,
-            i: Double(dIm[r]) * scale
-        )
+    for s in 0..<sourceCount {
+        let base = s * rows
+        for i in 0..<n {
+            b[base + i] = __CLPK_doublecomplex(
+                r: Double(rhsRe[s][i]),
+                i: Double(rhsIm[s][i])
+            )
+        }
+        for r in 0..<m {
+            b[base + n + r] = __CLPK_doublecomplex(
+                r: Double(dRe[s][r]) * scale,
+                i: Double(dIm[s][r]) * scale
+            )
+        }
     }
 
     var trans = Int8(78) // "N"
     var mC = __CLPK_integer(rows)
     var nC = __CLPK_integer(n)
-    var nrhs = __CLPK_integer(1)
+    var nrhs = __CLPK_integer(sourceCount)
     var lda = __CLPK_integer(rows)
     var ldb = __CLPK_integer(rows)
     var info = __CLPK_integer(0)
@@ -5878,14 +6127,14 @@ func solveDenseLeastSquaresZgels(
     var workQuery = [__CLPK_doublecomplex(r: 0.0, i: 0.0)]
     zgels_(&trans, &mC, &nC, &nrhs, &matrix, &lda, &b, &ldb, &workQuery, &lwork, &info)
     if info != 0 {
-        return DenseSolveRun(
-            pressure: [],
+        return MultiDenseSolveRun(
+            pressures: [],
             implementation: "accelerate_lapack_zgels",
             seconds: CFAbsoluteTimeGetCurrent() - start,
             lapackInfo: Int32(info),
             rcond: nil,
             dtype: "float64",
-            chiefResidualRel: nil
+            chiefResidualRels: nil
         )
     }
     let workSize = max(1, Int(workQuery[0].r))
@@ -5896,58 +6145,72 @@ func solveDenseLeastSquaresZgels(
     )
     zgels_(&trans, &mC, &nC, &nrhs, &matrix, &lda, &b, &ldb, &work, &lwork, &info)
     if info != 0 {
-        return DenseSolveRun(
-            pressure: [],
+        return MultiDenseSolveRun(
+            pressures: [],
             implementation: "accelerate_lapack_zgels",
             seconds: CFAbsoluteTimeGetCurrent() - start,
             lapackInfo: Int32(info),
             rcond: nil,
             dtype: "float64",
-            chiefResidualRel: nil
+            chiefResidualRels: nil
         )
     }
 
-    // Extract the least-squares solution (first n elements of b).
-    var solution = Array(
-        repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
-        count: n
-    )
-    for i in 0..<n {
-        solution[i] = b[i]
-    }
-
-    // Recompute the CHIEF residual EXPLICITLY: ||scale*(C*p - d)||_2 / ||b||_2,
-    // using the original row-major C/d (not the overwritten LS RHS rows).
-    var residSq = 0.0
-    for r in 0..<m {
-        var accRe = 0.0
-        var accIm = 0.0
-        for col in 0..<n {
-            let cre = Double(cReRowMajor[r * n + col])
-            let cim = Double(cImRowMajor[r * n + col])
-            let pre = solution[col].r
-            let pim = solution[col].i
-            accRe += cre * pre - cim * pim
-            accIm += cre * pim + cim * pre
+    // Extract per-source least-squares solutions (first n elements of each
+    // column) and recompute the CHIEF residual EXPLICITLY per source:
+    // ||scale*(C*p_s - d_s)||_2 / ||b_s||_2, using the original row-major C/d
+    // (not the overwritten LS RHS rows).
+    var pressures: [[Complex32]] = []
+    var chiefResidualRels: [Double] = []
+    pressures.reserveCapacity(sourceCount)
+    chiefResidualRels.reserveCapacity(sourceCount)
+    for s in 0..<sourceCount {
+        let base = s * rows
+        var solution = Array(
+            repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
+            count: n
+        )
+        for i in 0..<n {
+            solution[i] = b[base + i]
         }
-        let diffRe = scale * (accRe - Double(dRe[r]))
-        let diffIm = scale * (accIm - Double(dIm[r]))
-        residSq += diffRe * diffRe + diffIm * diffIm
-    }
-    var refSq = 0.0
-    for i in 0..<n {
-        refSq += Double(rhsRe[i]) * Double(rhsRe[i]) + Double(rhsIm[i]) * Double(rhsIm[i])
-    }
-    let chiefResidualRel = refSq > 0 ? (residSq / refSq).squareRoot() : residSq.squareRoot()
 
-    return DenseSolveRun(
-        pressure: solution.map { Complex32(re: Float($0.r), im: Float($0.i)) },
+        var residSq = 0.0
+        for r in 0..<m {
+            var accRe = 0.0
+            var accIm = 0.0
+            for col in 0..<n {
+                let cre = Double(cReRowMajor[r * n + col])
+                let cim = Double(cImRowMajor[r * n + col])
+                let pre = solution[col].r
+                let pim = solution[col].i
+                accRe += cre * pre - cim * pim
+                accIm += cre * pim + cim * pre
+            }
+            let diffRe = scale * (accRe - Double(dRe[s][r]))
+            let diffIm = scale * (accIm - Double(dIm[s][r]))
+            residSq += diffRe * diffRe + diffIm * diffIm
+        }
+        var refSq = 0.0
+        for i in 0..<n {
+            refSq += Double(rhsRe[s][i]) * Double(rhsRe[s][i])
+                + Double(rhsIm[s][i]) * Double(rhsIm[s][i])
+        }
+        chiefResidualRels.append(
+            refSq > 0 ? (residSq / refSq).squareRoot() : residSq.squareRoot()
+        )
+        pressures.append(
+            solution.map { Complex32(re: Float($0.r), im: Float($0.i)) }
+        )
+    }
+
+    return MultiDenseSolveRun(
+        pressures: pressures,
         implementation: "accelerate_lapack_zgels",
         seconds: CFAbsoluteTimeGetCurrent() - start,
         lapackInfo: Int32(info),
         rcond: nil,
         dtype: "float64",
-        chiefResidualRel: chiefResidualRel
+        chiefResidualRels: chiefResidualRels
     )
 }
 
@@ -5969,19 +6232,57 @@ func solveCaseDense(
     kImag: Float,
     robinBetas: [Complex32]?
 ) throws -> DenseSolveRun {
+    let multi = try solveCaseDenseMulti(
+        arrays: arrays,
+        extraRhs: [],
+        geom: geom,
+        chiefPoints: chiefPoints,
+        chiefWeight: chiefWeight,
+        driverNeumanns: [driverNeumann],
+        k: k,
+        kImag: kImag,
+        robinBetas: robinBetas
+    )
+    return multi.single(0)
+}
+
+/// Multi-RHS dense solve for one case: the operator (and CHIEF C block) is
+/// assembled and factored once; every source contributes one RHS column
+/// (source 0 from `arrays`, sources 1.. from `extraRhs`) and, on the CHIEF
+/// path, one constraint RHS d_s — all columns share the LU or QR.
+func solveCaseDenseMulti(
+    arrays: AssemblyArrays,
+    extraRhs: [(re: [Float], im: [Float])],
+    geom: Geometry,
+    chiefPoints: [(Float, Float, Float)]?,
+    chiefWeight: Float,
+    driverNeumanns: [[Complex32]],
+    k: Float,
+    kImag: Float,
+    robinBetas: [Complex32]?
+) throws -> MultiDenseSolveRun {
+    if driverNeumanns.count != extraRhs.count + 1 {
+        try fail("multi-RHS dense solve driverNeumanns/extraRhs count mismatch")
+    }
+    var rhsRe = [arrays.rhsRe]
+    var rhsIm = [arrays.rhsIm]
+    for extra in extraRhs {
+        rhsRe.append(extra.re)
+        rhsIm.append(extra.im)
+    }
     guard let chiefPoints else {
-        return try solveDenseAccelerate(
+        return try solveDenseAccelerateMulti(
             aReRowMajor: arrays.aRe,
             aImRowMajor: arrays.aIm,
-            rhsRe: arrays.rhsRe,
-            rhsIm: arrays.rhsIm,
+            rhsRe: rhsRe,
+            rhsIm: rhsIm,
             n: geom.p1DofCount
         )
     }
     let chiefRows = assembleChiefRows(
         geom: geom,
         chiefPoints: chiefPoints,
-        driverNeumann: driverNeumann,
+        driverNeumanns: driverNeumanns,
         k: k,
         kImag: kImag,
         robinBetas: robinBetas
@@ -5993,8 +6294,8 @@ func solveCaseDense(
     return try solveDenseLeastSquaresZgels(
         aReRowMajor: arrays.aRe,
         aImRowMajor: arrays.aIm,
-        rhsRe: arrays.rhsRe,
-        rhsIm: arrays.rhsIm,
+        rhsRe: rhsRe,
+        rhsIm: rhsIm,
         cReRowMajor: chiefRows.cRe,
         cImRowMajor: chiefRows.cIm,
         dRe: chiefRows.dRe,
@@ -6014,11 +6315,37 @@ func solveDenseAccelerateCgesv(
     rhsIm: [Float],
     n: Int
 ) throws -> DenseSolveRun {
+    let multi = try solveDenseAccelerateCgesvMulti(
+        aReRowMajor: aReRowMajor,
+        aImRowMajor: aImRowMajor,
+        rhsRe: [rhsRe],
+        rhsIm: [rhsIm],
+        n: n
+    )
+    return multi.single(0)
+}
+
+/// Multi-RHS float32 dense solve: one cgesv factorization with nrhs=B. The
+/// optional mixed-precision refinement runs per column against the shared LU
+/// factors (cgetrs inside refineDenseSolveSolution is a back-substitution).
+func solveDenseAccelerateCgesvMulti(
+    aReRowMajor: [Float],
+    aImRowMajor: [Float],
+    rhsRe: [[Float]],
+    rhsIm: [[Float]],
+    n: Int
+) throws -> MultiDenseSolveRun {
     if aReRowMajor.count != n * n || aImRowMajor.count != n * n {
         try fail("dense solve matrix size mismatch")
     }
-    if rhsRe.count != n || rhsIm.count != n {
-        try fail("dense solve RHS size mismatch")
+    let sourceCount = rhsRe.count
+    if sourceCount < 1 || rhsIm.count != sourceCount {
+        try fail("dense solve RHS source count mismatch")
+    }
+    for s in 0..<sourceCount {
+        if rhsRe[s].count != n || rhsIm[s].count != n {
+            try fail("dense solve RHS size mismatch")
+        }
     }
     let start = CFAbsoluteTimeGetCurrent()
 
@@ -6039,14 +6366,16 @@ func solveDenseAccelerateCgesv(
 
     var rhs = Array(
         repeating: __CLPK_complex(r: 0.0, i: 0.0),
-        count: n
+        count: n * sourceCount
     )
-    for i in 0..<n {
-        rhs[i] = __CLPK_complex(r: rhsRe[i], i: rhsIm[i])
+    for s in 0..<sourceCount {
+        for i in 0..<n {
+            rhs[s * n + i] = __CLPK_complex(r: rhsRe[s][i], i: rhsIm[s][i])
+        }
     }
 
     var nClpk = __CLPK_integer(n)
-    var nrhs = __CLPK_integer(1)
+    var nrhs = __CLPK_integer(sourceCount)
     var lda = __CLPK_integer(n)
     var ldb = __CLPK_integer(n)
     var info = __CLPK_integer(0)
@@ -6055,8 +6384,8 @@ func solveDenseAccelerateCgesv(
     cgesv_(&nClpk, &nrhs, &matrix, &lda, &pivots, &rhs, &ldb, &info)
 
     if info != 0 {
-        return DenseSolveRun(
-            pressure: [],
+        return MultiDenseSolveRun(
+            pressures: [],
             implementation: "accelerate_lapack_cgesv",
             seconds: CFAbsoluteTimeGetCurrent() - start,
             lapackInfo: Int32(info),
@@ -6064,32 +6393,47 @@ func solveDenseAccelerateCgesv(
         )
     }
     let rcond = estimateReciprocalCondition(factored: &matrix, n: n, anorm: anorm)
-    var refineIterations: Int? = nil
-    var refineResidualRel: Double? = nil
+    var refineIterations: [Int]? = nil
+    var refineResidualRels: [Double]? = nil
     let refinePasses = try requestedDenseSolveRefineIterations()
     if refinePasses > 0 {
-        let outcome = refineDenseSolveSolution(
-            aReRowMajor: aReRowMajor,
-            aImRowMajor: aImRowMajor,
-            rhsRe: rhsRe,
-            rhsIm: rhsIm,
-            factored: &matrix,
-            pivots: &pivots,
-            solution: &rhs,
-            n: n,
-            maxIterations: refinePasses
-        )
-        refineIterations = outcome.iterations
-        refineResidualRel = outcome.residualRel
+        var iterations: [Int] = []
+        var residuals: [Double] = []
+        for s in 0..<sourceCount {
+            var solution = Array(rhs[(s * n)..<((s + 1) * n)])
+            let outcome = refineDenseSolveSolution(
+                aReRowMajor: aReRowMajor,
+                aImRowMajor: aImRowMajor,
+                rhsRe: rhsRe[s],
+                rhsIm: rhsIm[s],
+                factored: &matrix,
+                pivots: &pivots,
+                solution: &solution,
+                n: n,
+                maxIterations: refinePasses
+            )
+            for i in 0..<n {
+                rhs[s * n + i] = solution[i]
+            }
+            iterations.append(outcome.iterations)
+            residuals.append(outcome.residualRel)
+        }
+        refineIterations = iterations
+        refineResidualRels = residuals
     }
-    return DenseSolveRun(
-        pressure: rhs.map { Complex32(re: $0.r, im: $0.i) },
+    let pressures = (0..<sourceCount).map { s in
+        (0..<n).map { i in
+            Complex32(re: rhs[s * n + i].r, im: rhs[s * n + i].i)
+        }
+    }
+    return MultiDenseSolveRun(
+        pressures: pressures,
         implementation: "accelerate_lapack_cgesv",
         seconds: CFAbsoluteTimeGetCurrent() - start,
         lapackInfo: Int32(info),
         rcond: rcond,
         refineIterations: refineIterations,
-        refineResidualRel: refineResidualRel
+        refineResidualRels: refineResidualRels
     )
 }
 
@@ -6100,11 +6444,35 @@ func solveDenseAccelerateCgetrfCgetrs(
     rhsIm: [Float],
     n: Int
 ) throws -> DenseSolveRun {
+    let multi = try solveDenseAccelerateCgetrfCgetrsMulti(
+        aReRowMajor: aReRowMajor,
+        aImRowMajor: aImRowMajor,
+        rhsRe: [rhsRe],
+        rhsIm: [rhsIm],
+        n: n
+    )
+    return multi.single(0)
+}
+
+/// Multi-RHS explicit factor/solve split: one cgetrf, one cgetrs with nrhs=B.
+func solveDenseAccelerateCgetrfCgetrsMulti(
+    aReRowMajor: [Float],
+    aImRowMajor: [Float],
+    rhsRe: [[Float]],
+    rhsIm: [[Float]],
+    n: Int
+) throws -> MultiDenseSolveRun {
     if aReRowMajor.count != n * n || aImRowMajor.count != n * n {
         try fail("dense solve matrix size mismatch")
     }
-    if rhsRe.count != n || rhsIm.count != n {
-        try fail("dense solve RHS size mismatch")
+    let sourceCount = rhsRe.count
+    if sourceCount < 1 || rhsIm.count != sourceCount {
+        try fail("dense solve RHS source count mismatch")
+    }
+    for s in 0..<sourceCount {
+        if rhsRe[s].count != n || rhsIm[s].count != n {
+            try fail("dense solve RHS size mismatch")
+        }
     }
     let start = CFAbsoluteTimeGetCurrent()
 
@@ -6125,15 +6493,17 @@ func solveDenseAccelerateCgetrfCgetrs(
 
     var rhs = Array(
         repeating: __CLPK_complex(r: 0.0, i: 0.0),
-        count: n
+        count: n * sourceCount
     )
-    for i in 0..<n {
-        rhs[i] = __CLPK_complex(r: rhsRe[i], i: rhsIm[i])
+    for s in 0..<sourceCount {
+        for i in 0..<n {
+            rhs[s * n + i] = __CLPK_complex(r: rhsRe[s][i], i: rhsIm[s][i])
+        }
     }
 
     var mClpk = __CLPK_integer(n)
     var nClpk = __CLPK_integer(n)
-    var nrhs = __CLPK_integer(1)
+    var nrhs = __CLPK_integer(sourceCount)
     var lda = __CLPK_integer(n)
     var ldb = __CLPK_integer(n)
     var info = __CLPK_integer(0)
@@ -6148,40 +6518,55 @@ func solveDenseAccelerateCgetrfCgetrs(
     }
 
     if info != 0 {
-        return DenseSolveRun(
-            pressure: [],
+        return MultiDenseSolveRun(
+            pressures: [],
             implementation: "accelerate_lapack_cgetrf_cgetrs",
             seconds: CFAbsoluteTimeGetCurrent() - start,
             lapackInfo: Int32(info),
             rcond: rcond
         )
     }
-    var refineIterations: Int? = nil
-    var refineResidualRel: Double? = nil
+    var refineIterations: [Int]? = nil
+    var refineResidualRels: [Double]? = nil
     let refinePasses = try requestedDenseSolveRefineIterations()
     if refinePasses > 0 {
-        let outcome = refineDenseSolveSolution(
-            aReRowMajor: aReRowMajor,
-            aImRowMajor: aImRowMajor,
-            rhsRe: rhsRe,
-            rhsIm: rhsIm,
-            factored: &matrix,
-            pivots: &pivots,
-            solution: &rhs,
-            n: n,
-            maxIterations: refinePasses
-        )
-        refineIterations = outcome.iterations
-        refineResidualRel = outcome.residualRel
+        var iterations: [Int] = []
+        var residuals: [Double] = []
+        for s in 0..<sourceCount {
+            var solution = Array(rhs[(s * n)..<((s + 1) * n)])
+            let outcome = refineDenseSolveSolution(
+                aReRowMajor: aReRowMajor,
+                aImRowMajor: aImRowMajor,
+                rhsRe: rhsRe[s],
+                rhsIm: rhsIm[s],
+                factored: &matrix,
+                pivots: &pivots,
+                solution: &solution,
+                n: n,
+                maxIterations: refinePasses
+            )
+            for i in 0..<n {
+                rhs[s * n + i] = solution[i]
+            }
+            iterations.append(outcome.iterations)
+            residuals.append(outcome.residualRel)
+        }
+        refineIterations = iterations
+        refineResidualRels = residuals
     }
-    return DenseSolveRun(
-        pressure: rhs.map { Complex32(re: $0.r, im: $0.i) },
+    let pressures = (0..<sourceCount).map { s in
+        (0..<n).map { i in
+            Complex32(re: rhs[s * n + i].r, im: rhs[s * n + i].i)
+        }
+    }
+    return MultiDenseSolveRun(
+        pressures: pressures,
         implementation: "accelerate_lapack_cgetrf_cgetrs",
         seconds: CFAbsoluteTimeGetCurrent() - start,
         lapackInfo: Int32(info),
         rcond: rcond,
         refineIterations: refineIterations,
-        refineResidualRel: refineResidualRel
+        refineResidualRels: refineResidualRels
     )
 }
 
@@ -6192,8 +6577,25 @@ func solveDenseAccelerate(
     rhsIm: [Float],
     n: Int
 ) throws -> DenseSolveRun {
+    let multi = try solveDenseAccelerateMulti(
+        aReRowMajor: aReRowMajor,
+        aImRowMajor: aImRowMajor,
+        rhsRe: [rhsRe],
+        rhsIm: [rhsIm],
+        n: n
+    )
+    return multi.single(0)
+}
+
+func solveDenseAccelerateMulti(
+    aReRowMajor: [Float],
+    aImRowMajor: [Float],
+    rhsRe: [[Float]],
+    rhsIm: [[Float]],
+    n: Int
+) throws -> MultiDenseSolveRun {
     if try requestedDenseSolveDtype() == "float64" {
-        return try solveDenseAccelerateZgesv(
+        return try solveDenseAccelerateZgesvMulti(
             aReRowMajor: aReRowMajor,
             aImRowMajor: aImRowMajor,
             rhsRe: rhsRe,
@@ -6203,7 +6605,7 @@ func solveDenseAccelerate(
     }
     let implementation = try requestedDenseSolveImplementation()
     if implementation == "cgetrf_cgetrs" {
-        return try solveDenseAccelerateCgetrfCgetrs(
+        return try solveDenseAccelerateCgetrfCgetrsMulti(
             aReRowMajor: aReRowMajor,
             aImRowMajor: aImRowMajor,
             rhsRe: rhsRe,
@@ -6211,7 +6613,7 @@ func solveDenseAccelerate(
             n: n
         )
     }
-    return try solveDenseAccelerateCgesv(
+    return try solveDenseAccelerateCgesvMulti(
         aReRowMajor: aReRowMajor,
         aImRowMajor: aImRowMajor,
         rhsRe: rhsRe,
@@ -6250,7 +6652,7 @@ func assembleRegular(
                 kImag: kImag,
                 robinBetas: robinBetas
             )
-            let (nearCorrected, nearStats) = try applyNearFieldCorrectionsIfEnabled(
+            let (nearCorrected, _, nearStats) = try applyNearFieldCorrectionsIfEnabled(
                 to: corrected,
                 geom: geom,
                 neumann: neumann,
@@ -6291,7 +6693,7 @@ func assembleRegular(
                 residentContext: residentContext
             )
         }
-        let (nearCorrected, nearStats) = try applyNearFieldCorrectionsIfEnabled(
+        let (nearCorrected, _, nearStats) = try applyNearFieldCorrectionsIfEnabled(
             to: output.arrays,
             geom: geom,
             neumann: neumann,
@@ -6330,7 +6732,7 @@ func assembleRegular(
             robinBetas: robinBetas,
             residentContext: residentContext
         )
-        let (nearCorrected, nearStats) = try applyNearFieldCorrectionsIfEnabled(
+        let (nearCorrected, _, nearStats) = try applyNearFieldCorrectionsIfEnabled(
             to: corrected,
             geom: geom,
             neumann: neumann,
@@ -6900,7 +7302,10 @@ func assembleSolveStandardNeumannBatch(
 
 struct SolvedCase {
     let assembly: AssemblyRun
-    let solve: DenseSolveRun
+    // Fully corrected extra-source RHS vectors (empty for single-source
+    // cases); retained for diagnostics parity with the primary arrays.
+    let extraRhs: [(re: [Float], im: [Float])]
+    let solve: MultiDenseSolveRun
 }
 
 final class CaseSolveResults: @unchecked Sendable {
@@ -7037,11 +7442,13 @@ func assembleSolveEvaluateStandardNeumannBatch(
     var caseKImag: [Float] = []
     var caseFieldKs: [Float] = []
     var caseNeumanns: [[Complex32]] = []
+    var caseExtraNeumanns: [[[Complex32]]] = []
     var caseRobinBetas: [[Complex32]?] = []
     caseKs.reserveCapacity(cases.count)
     caseKImag.reserveCapacity(cases.count)
     caseFieldKs.reserveCapacity(cases.count)
     caseNeumanns.reserveCapacity(cases.count)
+    caseExtraNeumanns.reserveCapacity(cases.count)
     caseRobinBetas.reserveCapacity(cases.count)
     for casePayload in cases {
         let kReal = Float(try requireDouble(casePayload, "k_real_f32"))
@@ -7062,8 +7469,33 @@ func assembleSolveEvaluateStandardNeumannBatch(
                 count: geom.dp0DofCount
             )
         )
+        // Multi-source: extra_sources adds one Neumann RHS per additional
+        // source sharing this case's operator (same k, Robin fold, CHIEF C).
+        var extraNeumanns: [[Complex32]] = []
+        if let rawExtraSources = casePayload["extra_sources"] {
+            guard let extraSources = rawExtraSources as? [[String: Any]] else {
+                try fail("extra_sources must be a list of objects")
+            }
+            for extraSource in extraSources {
+                extraNeumanns.append(
+                    try readComplexVector(
+                        root: geom.root,
+                        descriptors: try requireObject(extraSource, "neumann_dp0"),
+                        count: geom.dp0DofCount
+                    )
+                )
+            }
+        }
+        caseExtraNeumanns.append(extraNeumanns)
         caseRobinBetas.append(robinBetas)
     }
+    // A uniform per-case source count keeps the batched field layout
+    // (cases x sources rows) and the Python-side result splitting simple.
+    let extraSourceCount = caseExtraNeumanns[0].count
+    if caseExtraNeumanns.contains(where: { $0.count != extraSourceCount }) {
+        try fail("extra_sources must have the same length in every case")
+    }
+    let sourcesPerCase = extraSourceCount + 1
 
     let assemblyMode = ProcessInfo.processInfo.environment[
         "HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE"
@@ -7080,6 +7512,17 @@ func assembleSolveEvaluateStandardNeumannBatch(
             || regularImplementation == "pair_atomic")
         && (assemblyMode == "optimized"
             || (assemblyMode == "corrected" && duffyMode == "gpu_blocks"))
+    // Multi-source cases ride the resident pipelined path: the extra RHS
+    // dispatches and the RHS-only correction folds are wired there. The
+    // reference/parity/CPU-Duffy debug paths recompute the RHS inside their
+    // full-quadrature assembly and stay single-source by contract.
+    if extraSourceCount > 0 && !pipelineAssembly {
+        try fail(
+            "extra_sources requires the pipelined optimized/corrected assembly "
+                + "path (entrywise or pair_atomic implementation with gpu_blocks "
+                + "Duffy mode); reference/parity assembly modes are single-source"
+        )
+    }
     let solveConcurrency = pipelineAssembly ? try requestedSolveConcurrency() : 1
     let includeDuffyBlocks = assemblyMode == "corrected"
     var pendingAssembly: ResidentMetalContext.PendingAssembly? = nil
@@ -7100,17 +7543,19 @@ func assembleSolveEvaluateStandardNeumannBatch(
     func assemblyRun(
         from finished: ResidentMetalContext.FinishedAssembly,
         caseIndex: Int
-    ) throws -> AssemblyRun {
+    ) throws -> (run: AssemblyRun, extraRhs: [(re: [Float], im: [Float])]) {
         guard let blocks = finished.duffyBlocks else {
-            let (nearCorrected, nearStats) = try applyNearFieldCorrectionsIfEnabled(
+            let (nearCorrected, nearExtra, nearStats) = try applyNearFieldCorrectionsIfEnabled(
                 to: finished.regular.arrays,
                 geom: geom,
                 neumann: caseNeumanns[caseIndex],
+                extraNeumanns: caseExtraNeumanns[caseIndex],
+                extraRhs: finished.extraRhs,
                 k: caseKs[caseIndex],
                 kImag: caseKImag[caseIndex],
                 robinBetas: caseRobinBetas[caseIndex]
             )
-            return AssemblyRun(
+            let run = AssemblyRun(
                 arrays: nearCorrected,
                 implementation: regularMetalImplementationName(finished.regular),
                 mode: assemblyMode,
@@ -7121,6 +7566,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
                 nearStats: nearStats,
                 metalDispatch: finished.regular.dispatch
             )
+            return (run, nearExtra)
         }
         let (correctedArrays, reductionSeconds) = context.reduceDuffyDeltaBlocks(
             to: finished.regular.arrays,
@@ -7129,6 +7575,11 @@ func assembleSolveEvaluateStandardNeumannBatch(
             k: caseKs[caseIndex],
             kImag: caseKImag[caseIndex],
             robinBetas: caseRobinBetas[caseIndex]
+        )
+        let duffyExtra = context.applyDuffyRhsDeltas(
+            to: finished.extraRhs,
+            extraNeumanns: caseExtraNeumanns[caseIndex],
+            blocks: blocks
         )
         let stats = DuffyCorrectionStats(
             plan: context.pairList.plan,
@@ -7143,15 +7594,17 @@ func assembleSolveEvaluateStandardNeumannBatch(
             reductionPrecomputed: true,
             reductionPlanBuildSeconds: context.duffyReductionPlanBuildSeconds
         )
-        let (nearCorrected, nearStats) = try applyNearFieldCorrectionsIfEnabled(
+        let (nearCorrected, nearExtra, nearStats) = try applyNearFieldCorrectionsIfEnabled(
             to: correctedArrays,
             geom: geom,
             neumann: caseNeumanns[caseIndex],
+            extraNeumanns: caseExtraNeumanns[caseIndex],
+            extraRhs: duffyExtra,
             k: caseKs[caseIndex],
             kImag: caseKImag[caseIndex],
             robinBetas: caseRobinBetas[caseIndex]
         )
-        return AssemblyRun(
+        let run = AssemblyRun(
             arrays: nearCorrected,
             implementation: correctedMetalImplementationName(finished.regular, stats: stats),
             mode: assemblyMode,
@@ -7162,9 +7615,12 @@ func assembleSolveEvaluateStandardNeumannBatch(
             nearStats: nearStats,
             metalDispatch: finished.regular.dispatch
         )
+        return (run, nearExtra)
     }
 
-    func pipelinedAssemblyRun(_ caseIndex: Int) throws -> AssemblyRun {
+    func pipelinedAssemblyRun(
+        _ caseIndex: Int
+    ) throws -> (run: AssemblyRun, extraRhs: [(re: [Float], im: [Float])]) {
         guard let pending = pendingAssembly, pending.caseIndex == caseIndex else {
             try fail("internal error: pipelined assembly is out of order")
         }
@@ -7173,6 +7629,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
             ? try context.beginAssembly(
                 caseIndex: caseIndex + 1,
                 neumann: caseNeumanns[caseIndex + 1],
+                extraNeumanns: caseExtraNeumanns[caseIndex + 1],
                 k: caseKs[caseIndex + 1],
                 kImag: caseKImag[caseIndex + 1],
                 robinBetas: caseRobinBetas[caseIndex + 1],
@@ -7195,19 +7652,30 @@ func assembleSolveEvaluateStandardNeumannBatch(
                 solveSemaphore.signal()
             }
             do {
-                let assembly = try assemblyRun(from: finished, caseIndex: caseIndex)
-                let solve = try solveCaseDense(
+                let (assembly, extraRhs) = try assemblyRun(
+                    from: finished,
+                    caseIndex: caseIndex
+                )
+                let solve = try solveCaseDenseMulti(
                     arrays: assembly.arrays,
+                    extraRhs: extraRhs,
                     geom: geom,
                     chiefPoints: chiefPoints,
                     chiefWeight: chiefWeight,
-                    driverNeumann: caseNeumanns[caseIndex],
+                    driverNeumanns: [caseNeumanns[caseIndex]]
+                        + caseExtraNeumanns[caseIndex],
                     k: caseKs[caseIndex],
                     kImag: caseKImag[caseIndex],
                     robinBetas: caseRobinBetas[caseIndex]
                 )
                 solveResults.store(
-                    .success(SolvedCase(assembly: assembly, solve: solve)),
+                    .success(
+                        SolvedCase(
+                            assembly: assembly,
+                            extraRhs: extraRhs,
+                            solve: solve
+                        )
+                    ),
                     caseIndex: caseIndex
                 )
             } catch {
@@ -7227,6 +7695,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
                 ? try context.beginAssembly(
                     caseIndex: nextToSubmit + 1,
                     neumann: caseNeumanns[nextToSubmit + 1],
+                    extraNeumanns: caseExtraNeumanns[nextToSubmit + 1],
                     k: caseKs[nextToSubmit + 1],
                     kImag: caseKImag[nextToSubmit + 1],
                     robinBetas: caseRobinBetas[nextToSubmit + 1],
@@ -7244,6 +7713,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
         pendingAssembly = try context.beginAssembly(
             caseIndex: 0,
             neumann: caseNeumanns[0],
+            extraNeumanns: caseExtraNeumanns[0],
             k: caseKs[0],
             kImag: caseKImag[0],
             robinBetas: caseRobinBetas[0],
@@ -7291,25 +7761,30 @@ func assembleSolveEvaluateStandardNeumannBatch(
             impedanceSourceTag = try requireInt(casePayload, "impedance_source_tag")
         }
         let assembly: AssemblyRun
-        let solve: DenseSolveRun
+        let extraRhs: [(re: [Float], im: [Float])]
+        let solve: MultiDenseSolveRun
         if pipelineAssembly && solveConcurrency > 1 {
             try pumpSubmissions(upTo: caseIndex)
             let solved = try solveResults.wait(caseIndex)
             assembly = solved.assembly
+            extraRhs = solved.extraRhs
             solve = solved.solve
         } else if pipelineAssembly {
-            assembly = try pipelinedAssemblyRun(caseIndex)
-            solve = try solveCaseDense(
+            (assembly, extraRhs) = try pipelinedAssemblyRun(caseIndex)
+            solve = try solveCaseDenseMulti(
                 arrays: assembly.arrays,
+                extraRhs: extraRhs,
                 geom: geom,
                 chiefPoints: chiefPoints,
                 chiefWeight: chiefWeight,
-                driverNeumann: neumann,
+                driverNeumanns: [neumann] + caseExtraNeumanns[caseIndex],
                 k: k,
                 kImag: kImag,
                 robinBetas: robinBetas
             )
         } else {
+            // Single-source by construction: the extra_sources guard above
+            // rejects multi-source cases outside the pipelined path.
             assembly = try assembleRegular(
                 geom: geom,
                 neumann: neumann,
@@ -7318,12 +7793,14 @@ func assembleSolveEvaluateStandardNeumannBatch(
                 robinBetas: robinBetas,
                 residentContext: context
             )
-            solve = try solveCaseDense(
+            extraRhs = []
+            solve = try solveCaseDenseMulti(
                 arrays: assembly.arrays,
+                extraRhs: [],
                 geom: geom,
                 chiefPoints: chiefPoints,
                 chiefWeight: chiefWeight,
-                driverNeumann: neumann,
+                driverNeumanns: [neumann],
                 k: k,
                 kImag: kImag,
                 robinBetas: robinBetas
@@ -7332,17 +7809,23 @@ func assembleSolveEvaluateStandardNeumannBatch(
         if solve.lapackInfo != 0 {
             try fail("Accelerate dense solve failed with info=\(solve.lapackInfo)")
         }
+        if solve.pressures.count != sourcesPerCase {
+            try fail(
+                "internal error: dense solve returned \(solve.pressures.count) "
+                    + "solutions for \(sourcesPerCase) sources"
+            )
+        }
         let fieldNeumann = neumannWithRobin(
             geom: geom,
             driverNeumann: neumann,
-            pressure: solve.pressure,
+            pressure: solve.pressures[0],
             kReal: k,
             kImag: kImag,
             robinBetas: robinBetas
         )
         let field = try evaluateExterior(
             geom: geom,
-            pressure: solve.pressure,
+            pressure: solve.pressures[0],
             neumann: fieldNeumann,
             observationPoints: observationPoints,
             k: fieldK,
@@ -7353,11 +7836,11 @@ func assembleSolveEvaluateStandardNeumannBatch(
         if let pressureReDesc, let pressureImDesc {
             try writeF32(
                 try descriptorPath(root: geom.root, descriptor: pressureReDesc),
-                solve.pressure.map { $0.re }
+                solve.pressures[0].map { $0.re }
             )
             try writeF32(
                 try descriptorPath(root: geom.root, descriptor: pressureImDesc),
-                solve.pressure.map { $0.im }
+                solve.pressures[0].map { $0.im }
             )
         }
         let fieldReValues = field.values.map { $0.re }
@@ -7374,6 +7857,153 @@ func assembleSolveEvaluateStandardNeumannBatch(
                 try descriptorPath(root: geom.root, descriptor: fieldImDesc),
                 fieldImValues
             )
+        }
+
+        // Extra sources: same solved operator, per-source field evaluation,
+        // outputs, and reductions. Batched field rows land immediately after
+        // source 0's row so the layout is [case0 s0..sB, case1 s0..sB, ...].
+        let extraSourcePayloads =
+            (casePayload["extra_sources"] as? [[String: Any]]) ?? []
+        var extraSourceResults: [[String: Any]] = []
+        var extraFieldSeconds = 0.0
+        for s in 1..<sourcesPerCase {
+            let extraPayload = extraSourcePayloads[s - 1]
+            let sourceNeumann = caseExtraNeumanns[caseIndex][s - 1]
+            let sourcePressure = solve.pressures[s]
+            let extraOutputs = try requireObject(extraPayload, "outputs")
+            let extraPressureReDesc = extraOutputs["pressure_real_f32"] as? [String: Any]
+            let extraPressureImDesc = extraOutputs["pressure_imag_f32"] as? [String: Any]
+            if (extraPressureReDesc == nil) != (extraPressureImDesc == nil) {
+                try fail(
+                    "extra source pressure_real_f32 and pressure_imag_f32 "
+                        + "must be provided together"
+                )
+            }
+            let extraFieldReDesc =
+                extraOutputs["observation_pressure_real_f32"] as? [String: Any]
+            let extraFieldImDesc =
+                extraOutputs["observation_pressure_imag_f32"] as? [String: Any]
+            if batchFieldReDesc == nil && (extraFieldReDesc == nil || extraFieldImDesc == nil) {
+                try fail(
+                    "extra source observation pressure outputs are required "
+                        + "without batch_outputs"
+                )
+            }
+            if (extraFieldReDesc == nil) != (extraFieldImDesc == nil) {
+                try fail(
+                    "extra source observation_pressure_real_f32 and "
+                        + "observation_pressure_imag_f32 must be provided together"
+                )
+            }
+            let extraImpedanceTag: Int?
+            if extraPayload["impedance_source_tag"] == nil {
+                extraImpedanceTag = nil
+            } else {
+                extraImpedanceTag = try requireInt(extraPayload, "impedance_source_tag")
+            }
+            let extraFieldNeumann = neumannWithRobin(
+                geom: geom,
+                driverNeumann: sourceNeumann,
+                pressure: sourcePressure,
+                kReal: k,
+                kImag: kImag,
+                robinBetas: robinBetas
+            )
+            let extraField = try evaluateExterior(
+                geom: geom,
+                pressure: sourcePressure,
+                neumann: extraFieldNeumann,
+                observationPoints: observationPoints,
+                k: fieldK,
+                residentContext: context,
+                cachedObservationBuffer: sharedObservationBuffer,
+                cachedObservationCount: sharedObservationCount
+            )
+            extraFieldSeconds += extraField.seconds
+            if let extraPressureReDesc, let extraPressureImDesc {
+                try writeF32(
+                    try descriptorPath(root: geom.root, descriptor: extraPressureReDesc),
+                    sourcePressure.map { $0.re }
+                )
+                try writeF32(
+                    try descriptorPath(root: geom.root, descriptor: extraPressureImDesc),
+                    sourcePressure.map { $0.im }
+                )
+            }
+            let extraFieldRe = extraField.values.map { $0.re }
+            let extraFieldIm = extraField.values.map { $0.im }
+            if batchFieldReDesc != nil {
+                batchFieldReValues.append(contentsOf: extraFieldRe)
+                batchFieldImValues.append(contentsOf: extraFieldIm)
+            } else if let extraFieldReDesc, let extraFieldImDesc {
+                try writeF32(
+                    try descriptorPath(root: geom.root, descriptor: extraFieldReDesc),
+                    extraFieldRe
+                )
+                try writeF32(
+                    try descriptorPath(root: geom.root, descriptor: extraFieldImDesc),
+                    extraFieldIm
+                )
+            }
+            var sourceResult: [String: Any] = [
+                "source_index": s,
+                "pressure_shape": [geom.p1DofCount],
+                "field_shape": [observationPoints.count],
+                "field_seconds": extraField.seconds,
+            ]
+            if let extraPressureReDesc, let extraPressureImDesc {
+                sourceResult["pressure_real_f32"] = try requireString(
+                    extraPressureReDesc,
+                    "path"
+                )
+                sourceResult["pressure_imag_f32"] = try requireString(
+                    extraPressureImDesc,
+                    "path"
+                )
+            }
+            if let batchFieldReDesc, let batchFieldImDesc {
+                sourceResult["observation_pressure_real_f32"] = try requireString(
+                    batchFieldReDesc,
+                    "path"
+                )
+                sourceResult["observation_pressure_imag_f32"] = try requireString(
+                    batchFieldImDesc,
+                    "path"
+                )
+                sourceResult["field_row_index"] = caseIndex * sourcesPerCase + s
+                sourceResult["field_batch_shape"] = [
+                    cases.count * sourcesPerCase,
+                    observationPoints.count,
+                ]
+                sourceResult["field_output_layout"] = "batch_row_major_c"
+            } else if let extraFieldReDesc, let extraFieldImDesc {
+                sourceResult["observation_pressure_real_f32"] = try requireString(
+                    extraFieldReDesc,
+                    "path"
+                )
+                sourceResult["observation_pressure_imag_f32"] = try requireString(
+                    extraFieldImDesc,
+                    "path"
+                )
+            }
+            sourceResult.merge(
+                nativePressureReductionPayload(
+                    geom: geom,
+                    pressure: sourcePressure,
+                    sourceTags: sourceTags,
+                    impedanceSourceTag: extraImpedanceTag
+                )
+            ) { _, new in new }
+            if let chiefResidualRels = solve.chiefResidualRels {
+                sourceResult["chief_residual_rel"] = chiefResidualRels[s]
+            }
+            if let refineIterations = solve.refineIterations {
+                sourceResult["dense_solve_refine_iterations"] = refineIterations[s]
+            }
+            if let refineResidualRels = solve.refineResidualRels {
+                sourceResult["dense_solve_refine_residual_rel"] = refineResidualRels[s]
+            }
+            extraSourceResults.append(sourceResult)
         }
 
         let correctionSeconds = assemblyCorrectionSeconds(assembly)
@@ -7405,19 +8035,28 @@ func assembleSolveEvaluateStandardNeumannBatch(
             }
         }
         if let refineIterations = solve.refineIterations {
-            caseResult["dense_solve_refine_iterations"] = refineIterations
+            caseResult["dense_solve_refine_iterations"] = refineIterations[0]
         }
-        if let refineResidualRel = solve.refineResidualRel {
-            caseResult["dense_solve_refine_residual_rel"] = refineResidualRel
+        if let refineResidualRels = solve.refineResidualRels {
+            caseResult["dense_solve_refine_residual_rel"] = refineResidualRels[0]
         }
         caseResult["dense_solve_dtype"] = solve.dtype
         if let chiefPoints {
             caseResult["chief_points"] = true
             caseResult["chief_points_count"] = chiefPoints.count
             caseResult["chief_solver"] = "accelerate_lapack_zgels"
-            if let chiefResidualRel = solve.chiefResidualRel {
-                caseResult["chief_residual_rel"] = chiefResidualRel
+            if let chiefResidualRels = solve.chiefResidualRels {
+                caseResult["chief_residual_rel"] = chiefResidualRels[0]
             }
+        }
+        // Capability acknowledgement + per-source payloads. multi_source is
+        // reported whenever this helper handled the case, so a Python caller
+        // that requested extra sources can detect a stale binary (which would
+        // echo cases without this key) and fail loudly.
+        if sourcesPerCase > 1 {
+            caseResult["multi_source"] = true
+            caseResult["source_count"] = sourcesPerCase
+            caseResult["extra_source_results"] = extraSourceResults
         }
         if kImag != 0.0 {
             caseResult["assembly_k_imag_f32"] = kImag
@@ -7443,8 +8082,11 @@ func assembleSolveEvaluateStandardNeumannBatch(
                 batchFieldImDesc,
                 "path"
             )
-            caseResult["field_row_index"] = caseIndex
-            caseResult["field_batch_shape"] = [cases.count, observationPoints.count]
+            caseResult["field_row_index"] = caseIndex * sourcesPerCase
+            caseResult["field_batch_shape"] = [
+                cases.count * sourcesPerCase,
+                observationPoints.count,
+            ]
             caseResult["field_output_layout"] = "batch_row_major_c"
         } else if let fieldReDesc, let fieldImDesc {
             caseResult["observation_pressure_real_f32"] = try requireString(
@@ -7459,7 +8101,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
         caseResult.merge(
             nativePressureReductionPayload(
                 geom: geom,
-                pressure: solve.pressure,
+                pressure: solve.pressures[0],
                 sourceTags: sourceTags,
                 impedanceSourceTag: impedanceSourceTag
             )
@@ -7496,7 +8138,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
         totalAssemblySeconds += assembly.seconds
         totalRegularSeconds += max(0.0, assembly.seconds - correctionSeconds)
         totalDenseSolveSeconds += solve.seconds
-        totalFieldSeconds += field.seconds
+        totalFieldSeconds += field.seconds + extraFieldSeconds
     }
     if let batchFieldReDesc, let batchFieldImDesc {
         try writeF32(

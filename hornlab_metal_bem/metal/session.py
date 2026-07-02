@@ -324,6 +324,30 @@ class DenseSolveResult:
 
 
 @dataclass(frozen=True)
+class ExtraSourceSolveResult:
+    """Per-extra-source outputs of a multi-RHS case (multi-source solves).
+
+    One entry per additional velocity source sharing a case's assembled and
+    factored operator. The primary source's outputs stay on the enclosing
+    :class:`DenseSolveFieldResult` unchanged.
+    """
+
+    source_index: int
+    pressure_real_f32: Path | None
+    pressure_imag_f32: Path | None
+    pressure_shape: tuple[int]
+    field_real_f32: Path
+    field_imag_f32: Path
+    field_shape: tuple[int]
+    field_s: float = 0.0
+    field_row_index: int | None = None
+    field_batch_shape: tuple[int, int] | None = None
+    impedance: complex | None = None
+    surface_pressure_avg: dict[int, complex] | None = None
+    schema: str = METAL_STANDARD_SCHEMA
+
+
+@dataclass(frozen=True)
 class DenseSolveFieldResult:
     """Solved surface pressure plus exterior field descriptors."""
 
@@ -345,6 +369,7 @@ class DenseSolveFieldResult:
     impedance: complex | None = None
     surface_pressure_avg: dict[int, complex] | None = None
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    extra_sources: tuple[ExtraSourceSolveResult, ...] = ()
     schema: str = METAL_STANDARD_SCHEMA
 
 
@@ -858,10 +883,17 @@ def _validate_batch_assembly_solve_field_manifest(manifest: dict[str, Any]) -> N
             dtype="float32",
             rank=2,
         )
-        if field_shape[0] != len(cases):
+        # Multi-source cases append one field row per source, so the batch
+        # holds cases x sources_per_case rows (uniform across cases).
+        first_case = cases[0] if isinstance(cases[0], dict) else {}
+        extra_sources = first_case.get("extra_sources")
+        sources_per_case = 1 + (
+            len(extra_sources) if isinstance(extra_sources, list) else 0
+        )
+        if field_shape[0] != len(cases) * sources_per_case:
             raise ValueError(
                 "batch_outputs observation pressure first dimension must match "
-                "case count"
+                "case count times sources per case"
             )
         _validate_descriptor(
             batch_outputs["observation_pressure_imag_f32"],

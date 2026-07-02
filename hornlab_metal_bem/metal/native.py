@@ -747,6 +747,10 @@ class MetalNativeStandardSession:
         dense_solve_dtype: str = "float32",
         chief_points: NDArray[Any] | None = None,
         chief_weight: float = 1.0,
+        extra_neumann_dp0: NDArray[Any] | None = None,
+        extra_impedance_source_tags: (
+            list[int | None] | tuple[int | None, ...] | None
+        ) = None,
     ) -> list[Any]:
         """Assemble, solve, and evaluate field in one resident helper run.
 
@@ -757,6 +761,17 @@ class MetalNativeStandardSession:
         terminates the helper; the cases solved so far are returned. Streamed
         results do not carry whole-batch diagnostics (the batch is still in
         flight when each case completes).
+
+        ``extra_neumann_dp0`` (shape ``(n_extra, n_freq, dp0_dof_count)``)
+        adds additional velocity sources per case: the helper assembles and
+        factors each case's operator ONCE and back-substitutes one RHS per
+        source (multi-RHS). Per-extra-source outputs land in each result's
+        ``extra_sources`` tuple; the primary source's outputs are unchanged.
+        ``extra_impedance_source_tags`` optionally names the tag whose
+        area-averaged pressure becomes each extra source's ``impedance``
+        reduction (one entry per extra source, ``None`` to skip). Requires a
+        helper binary with multi-source support; the per-case ``multi_source``
+        acknowledgement fails loudly on a stale binary.
         """
         from .session import (
             BatchAssemblySolveFieldPayload,
@@ -802,6 +817,46 @@ class MetalNativeStandardSession:
             raise ValueError("neumann_dp0 must be complex")
         if not np.all(np.isfinite(neumann_values)):
             raise ValueError("neumann_dp0 must contain only finite values")
+        extra_neumann_values: NDArray[Any] | None = None
+        n_extra_sources = 0
+        if extra_neumann_dp0 is not None:
+            extra_neumann_values = np.asarray(extra_neumann_dp0)
+            if extra_neumann_values.ndim != 3 or extra_neumann_values.shape[1:] != (
+                frequencies.size,
+                self.geometry_payload.dp0_dof_count,
+            ):
+                raise ValueError(
+                    "extra_neumann_dp0 must have shape "
+                    f"(n_extra, {frequencies.size}, "
+                    f"{self.geometry_payload.dp0_dof_count}), "
+                    f"got {extra_neumann_values.shape}"
+                )
+            if extra_neumann_values.shape[0] == 0:
+                raise ValueError("extra_neumann_dp0 must be None or non-empty")
+            if not np.issubdtype(extra_neumann_values.dtype, np.complexfloating):
+                raise ValueError("extra_neumann_dp0 must be complex")
+            if not np.all(np.isfinite(extra_neumann_values)):
+                raise ValueError(
+                    "extra_neumann_dp0 must contain only finite values"
+                )
+            n_extra_sources = int(extra_neumann_values.shape[0])
+        if extra_impedance_source_tags is not None:
+            if n_extra_sources == 0:
+                raise ValueError(
+                    "extra_impedance_source_tags requires extra_neumann_dp0"
+                )
+            if len(extra_impedance_source_tags) != n_extra_sources:
+                raise ValueError(
+                    "extra_impedance_source_tags must have one entry per "
+                    f"extra source ({n_extra_sources}), got "
+                    f"{len(extra_impedance_source_tags)}"
+                )
+            for tag in extra_impedance_source_tags:
+                if tag is not None and int(tag) < 0:
+                    raise ValueError(
+                        "extra_impedance_source_tags entries must be "
+                        "non-negative integers or None"
+                    )
         def _beta_payload(
             sources: dict[int, complex] | None,
         ) -> dict[str, list[float]] | None:
@@ -849,6 +904,7 @@ class MetalNativeStandardSession:
         # this kwarg only drives the capability handshake so a stale binary that
         # predates float64 support errors loudly instead of silently running f32.
         expect_float64 = dense_solve_dtype == "float64"
+        expect_multi_source = n_extra_sources > 0
 
         points_3xn = _require_observation_points_3xn(observation_points)
         n_obs = int(points_3xn.shape[1])
@@ -895,6 +951,10 @@ class MetalNativeStandardSession:
                 relative_to=self.info.work_dir,
             )
         n = self.geometry_payload.p1_dof_count
+        # Multi-source cases append one field row per source per case, so the
+        # batched layout is (n_freq * sources_per_case, n_obs) with source 0
+        # first within each case block.
+        sources_per_case = 1 + n_extra_sources
         batch_outputs: dict[str, Any] | None = None
         if write_batched_field:
             batch_outputs = {
@@ -902,14 +962,14 @@ class MetalNativeStandardSession:
                     path=(outputs_root / "obs_pressure_re_f32.bin").relative_to(
                         self.info.work_dir
                     ).as_posix(),
-                    shape=(frequencies.size, n_obs),
+                    shape=(frequencies.size * sources_per_case, n_obs),
                     dtype="float32",
                 ).to_manifest(),
                 "observation_pressure_imag_f32": BinaryArrayDescriptor(
                     path=(outputs_root / "obs_pressure_im_f32.bin").relative_to(
                         self.info.work_dir
                     ).as_posix(),
-                    shape=(frequencies.size, n_obs),
+                    shape=(frequencies.size * sources_per_case, n_obs),
                     dtype="float32",
                 ).to_manifest(),
             }
@@ -956,6 +1016,72 @@ class MetalNativeStandardSession:
                     shape=(n,),
                     dtype="float32",
                 ).to_manifest()
+            extra_sources_payload: list[dict[str, Any]] = []
+            for extra_idx in range(n_extra_sources):
+                assert extra_neumann_values is not None
+                source_dir = case_input / f"extra-source-{extra_idx + 1:02d}"
+                source_output = case_output / f"extra-source-{extra_idx + 1:02d}"
+                extra_neumann = _write_complex_vector(
+                    np.ascontiguousarray(
+                        extra_neumann_values[extra_idx, idx], dtype=np.complex64
+                    ),
+                    source_dir / "neumann",
+                    relative_to=self.info.work_dir,
+                )
+                extra_outputs: dict[str, Any] = {}
+                if not write_batched_field:
+                    extra_outputs["observation_pressure_real_f32"] = (
+                        BinaryArrayDescriptor(
+                            path=(source_output / "obs_pressure_re_f32.bin")
+                            .relative_to(self.info.work_dir)
+                            .as_posix(),
+                            shape=(n_obs,),
+                            dtype="float32",
+                        ).to_manifest()
+                    )
+                    extra_outputs["observation_pressure_imag_f32"] = (
+                        BinaryArrayDescriptor(
+                            path=(source_output / "obs_pressure_im_f32.bin")
+                            .relative_to(self.info.work_dir)
+                            .as_posix(),
+                            shape=(n_obs,),
+                            dtype="float32",
+                        ).to_manifest()
+                    )
+                if write_surface_pressure:
+                    extra_outputs["pressure_real_f32"] = BinaryArrayDescriptor(
+                        path=(source_output / "pressure_re_f32.bin")
+                        .relative_to(self.info.work_dir)
+                        .as_posix(),
+                        shape=(n,),
+                        dtype="float32",
+                    ).to_manifest()
+                    extra_outputs["pressure_imag_f32"] = BinaryArrayDescriptor(
+                        path=(source_output / "pressure_im_f32.bin")
+                        .relative_to(self.info.work_dir)
+                        .as_posix(),
+                        shape=(n,),
+                        dtype="float32",
+                    ).to_manifest()
+                extra_tag = (
+                    extra_impedance_source_tags[extra_idx]
+                    if extra_impedance_source_tags is not None
+                    else None
+                )
+                extra_sources_payload.append(
+                    {
+                        "neumann_dp0": {
+                            key: descriptor.to_manifest()
+                            for key, descriptor in extra_neumann.items()
+                        },
+                        "outputs": extra_outputs,
+                        **(
+                            {"impedance_source_tag": int(extra_tag)}
+                            if extra_tag is not None
+                            else {}
+                        ),
+                    }
+                )
             cases.append(
                 {
                     "case_id": case_id,
@@ -969,6 +1095,11 @@ class MetalNativeStandardSession:
                     },
                     "observation_points": obs_desc.to_manifest(),
                     "outputs": outputs,
+                    **(
+                        {"extra_sources": extra_sources_payload}
+                        if extra_sources_payload
+                        else {}
+                    ),
                     **(
                         {"source_tags": source_tag_values}
                         if source_tag_values is not None
@@ -1024,6 +1155,7 @@ class MetalNativeStandardSession:
                 expect_robin_per_case=expect_robin_per_case,
                 expect_float64=expect_float64,
                 expect_chief=expect_chief,
+                expect_multi_source=expect_multi_source,
             )
 
         self._run_native_helper(
@@ -1046,6 +1178,7 @@ class MetalNativeStandardSession:
                 expect_robin=expect_robin_per_case[idx],
                 expect_float64=expect_float64,
                 expect_chief=expect_chief,
+                expect_multi_source=expect_multi_source,
             )
             for idx, case_result in enumerate(case_results)
         ]
@@ -1058,6 +1191,7 @@ class MetalNativeStandardSession:
         expect_robin: bool = False,
         expect_float64: bool = False,
         expect_chief: bool = False,
+        expect_multi_source: bool = False,
     ) -> Any:
         from .session import DenseSolveFieldResult
 
@@ -1103,6 +1237,18 @@ class MetalNativeStandardSession:
                 "hornlab_metal_bem/metal/native_helper or unset "
                 "HORNLAB_METAL_BEM_NATIVE."
             )
+        if expect_multi_source and case_result.get("multi_source") is not True:
+            raise RuntimeError(
+                "native helper acknowledged no multi-source support; the "
+                "helper binary predates extra_sources (multi-RHS). Rebuild "
+                "with `swift build -c release` in "
+                "hornlab_metal_bem/metal/native_helper or unset "
+                "HORNLAB_METAL_BEM_NATIVE."
+            )
+        extra_sources = tuple(
+            self._extra_source_solve_result(raw)
+            for raw in case_result.get("extra_source_results") or ()
+        )
         return DenseSolveFieldResult(
             session_id=str(case_result["session_id"]),
             batch_id=str(case_result["batch_id"]),
@@ -1142,6 +1288,47 @@ class MetalNativeStandardSession:
                 case_result.get("surface_pressure_avg")
             ),
             diagnostics=diagnostics,
+            extra_sources=extra_sources,
+        )
+
+    def _extra_source_solve_result(self, raw: dict[str, Any]) -> Any:
+        from .session import ExtraSourceSolveResult
+
+        pressure_real = raw.get("pressure_real_f32")
+        pressure_imag = raw.get("pressure_imag_f32")
+        return ExtraSourceSolveResult(
+            source_index=int(raw["source_index"]),
+            pressure_real_f32=(
+                self.info.work_dir / str(pressure_real)
+                if pressure_real is not None
+                else None
+            ),
+            pressure_imag_f32=(
+                self.info.work_dir / str(pressure_imag)
+                if pressure_imag is not None
+                else None
+            ),
+            pressure_shape=tuple(int(v) for v in raw["pressure_shape"]),
+            field_real_f32=self.info.work_dir
+            / raw["observation_pressure_real_f32"],
+            field_imag_f32=self.info.work_dir
+            / raw["observation_pressure_imag_f32"],
+            field_shape=tuple(int(v) for v in raw["field_shape"]),
+            field_s=float(raw.get("field_seconds", 0.0)),
+            field_row_index=(
+                int(raw["field_row_index"])
+                if raw.get("field_row_index") is not None
+                else None
+            ),
+            field_batch_shape=(
+                tuple(int(v) for v in raw["field_batch_shape"])
+                if raw.get("field_batch_shape") is not None
+                else None
+            ),
+            impedance=_complex_from_manifest(raw.get("impedance")),
+            surface_pressure_avg=_complex_map_from_manifest(
+                raw.get("surface_pressure_avg")
+            ),
         )
 
     def _stream_assemble_solve_evaluate(
@@ -1156,6 +1343,7 @@ class MetalNativeStandardSession:
         expect_robin_per_case: list[bool] | None = None,
         expect_float64: bool = False,
         expect_chief: bool = False,
+        expect_multi_source: bool = False,
     ) -> list[Any]:
         """Run one batch helper invocation, firing callbacks per case.
 
@@ -1187,6 +1375,7 @@ class MetalNativeStandardSession:
                     expect_robin=expect_robin_per_case[len(solved_fields)],
                     expect_float64=expect_float64,
                     expect_chief=expect_chief,
+                    expect_multi_source=expect_multi_source,
                 )
                 solved_fields.append(solved)
                 if on_case_result(len(solved_fields) - 1, solved) is False:
@@ -1219,6 +1408,7 @@ class MetalNativeStandardSession:
                 expect_robin=expect_robin_per_case[index],
                 expect_float64=expect_float64,
                 expect_chief=expect_chief,
+                expect_multi_source=expect_multi_source,
             )
             solved_fields.append(solved)
             if on_case_result(index, solved) is False:
