@@ -228,4 +228,6 @@ Release helper builds should use `scripts/build_metal_native_release.py`, which
 precompiles the embedded Metal assembly kernels into
 `regular_assembly.metallib` before running `swift build -c release`. At runtime
 the helper loads that binary library when present and falls back to
-`makeLibrary(source:)` if the generated metallib is missing.
+`makeLibrary(source:)` if the generated metallib is missing. Python package
+builds also try to precompile that `.metallib` on macOS before package data is
+collected; set `HORNLAB_METAL_BEM_SKIP_METALLIB=1` to skip that optional step.
