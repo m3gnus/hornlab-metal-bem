@@ -50,7 +50,10 @@ config=None)` share the same execution flow:
    an existing `LoadedMesh` is used directly.
 3. Resolve the observation frame. `frame_override` is respected first;
    otherwise `infer_frame()` uses the lowest configured velocity-source tag as
-   the source tag.
+   the source tag. When `native_symmetry_plane` is set (a mirror-reduced
+   mesh), the inferred axis and origin are projected onto the symmetry
+   plane(s) so reduced solves report the full-model frame; image-method
+   callers with a full mesh must pass `frame_override`.
 4. Route to the native path. `should_route_native_metal()` validates the narrow
    supported native symmetry options.
 5. `run_sweep_native_metal()` builds observation points, P1 and DP0 function

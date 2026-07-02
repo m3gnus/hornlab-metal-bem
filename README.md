@@ -69,6 +69,12 @@ Mesh requirements:
 The solver infers the observation frame from the source-tag element normals and
 the mesh mouth. For enclosed or unusual geometry, pass `frame_override`.
 
+`native_symmetry_plane` means a mirror-reduced half/quarter mesh: the inferred
+frame axis and origin are projected onto the requested symmetry plane(s) so
+reduced solves report the same frame as the full model. Callers that use a
+symmetry plane as a rigid-baffle image method around a full mesh must pass
+`frame_override` instead.
+
 ## Configuration
 
 Use `native_config(**overrides)` to create a supported Metal configuration.
