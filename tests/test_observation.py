@@ -18,6 +18,17 @@ from hornlab_metal_bem.observation import (
 )
 
 
+def test_observation_config_accepts_valid_sphere_points():
+    cfg = ObservationConfig(sphere_points=np.ones((5, 3)))
+    assert cfg.sphere_points.shape == (5, 3)
+
+
+@pytest.mark.parametrize("bad", [np.zeros((4, 2)), np.zeros((0, 3)), np.zeros((3,))])
+def test_observation_config_rejects_bad_sphere_points(bad):
+    with pytest.raises(ValueError, match="sphere_points"):
+        ObservationConfig(sphere_points=bad)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

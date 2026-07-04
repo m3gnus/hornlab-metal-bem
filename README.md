@@ -112,8 +112,10 @@ roughly one solve plus N-1 cheap RHS/field passes. It returns one
 `SolveResult` per source, matching sequential `solve()` calls to float32
 tolerance, and records `surface_pressure_avg` on the union of all source tags
 in every result (zero-velocity tags are legal listeners). Multi-source rides
-the default pipelined corrected/optimized assembly path; the reference/parity
-debug modes stay single-source.
+the default pipelined corrected/optimized assembly path; when
+`on_frequency_result` is set, each callback entry includes a `source_results`
+list with one per-source log entry. The reference/parity debug modes stay
+single-source.
 
 ## Observation Points
 

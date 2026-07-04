@@ -42,6 +42,14 @@ class ObservationConfig:
     # instead of constructing polar arcs from the frame.
     custom_points: dict[str, NDArray[np.float64]] | None = None
 
+    # Extra free-standing field points (M, 3) in the mesh frame, evaluated from
+    # the SAME solved system as the polar arcs and returned separately as
+    # ``observation_sphere_pressure_complex``. Used for full-sphere/balloon
+    # sampling: the caller supplies exact coordinates (e.g. a Fibonacci sphere)
+    # and pairs them with its own theta/phi metadata. None disables it (no cost,
+    # no shape change to the arc outputs).
+    sphere_points: NDArray[np.float64] | None = None
+
     def __post_init__(self) -> None:
         if not self.planes:
             raise ValueError("observation planes must not be empty")
@@ -51,6 +59,16 @@ class ObservationConfig:
             raise ValueError("angle_count must be at least 1")
         if self.origin not in {"mouth", "throat"}:
             raise ValueError("origin must be 'mouth' or 'throat'")
+        if self.sphere_points is not None:
+            import numpy as _np
+
+            pts = _np.asarray(self.sphere_points, dtype=float)
+            if pts.ndim != 2 or pts.shape[1] != 3:
+                raise ValueError("sphere_points must have shape (M, 3)")
+            if pts.shape[0] == 0:
+                raise ValueError("sphere_points must be non-empty when set")
+            if not _np.all(_np.isfinite(pts)):
+                raise ValueError("sphere_points must be finite")
 
 
 @dataclass

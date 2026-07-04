@@ -9,7 +9,9 @@ from typing import Any, Callable, Iterable, Iterator
 import numpy as np
 from scipy import signal
 
-from .config import ObservationConfig, SolveConfig, VelocityMode
+from .config import BIEFormulation, ObservationConfig, SolveConfig, VelocityMode
+
+REFERENCE_PRESSURE_PA = 20e-6
 
 try:  # Boundary Lab is optional when this package is used standalone.
     from blab.solvers.base import (
@@ -40,10 +42,20 @@ except Exception:  # pragma: no cover - exercised only outside Boundary Lab.
         horizontal_spl_db: np.ndarray | None = None
         vertical_spl_db: np.ndarray | None = None
         sphere_spl_norm_db: np.ndarray | None = None
-        observation_pressure_complex: np.ndarray | None = None
-        native_diagnostics: dict[str, Any] = field(default_factory=dict)
+        channel_names: np.ndarray | None = None
+        horizontal_pressure: np.ndarray | None = None
+        vertical_pressure: np.ndarray | None = None
+        sphere_pressure: np.ndarray | None = None
         timings: FrequencySolveTimings = field(default_factory=FrequencySolveTimings)
         diagnostics: SolverDiagnostics | None = None
+
+        @property
+        def has_channel_basis(self) -> bool:
+            return (
+                self.channel_names is not None
+                and self.horizontal_pressure is not None
+                and self.vertical_pressure is not None
+            )
 
     @dataclass(frozen=True)
     class SolveMetadata:
@@ -56,7 +68,8 @@ except Exception:  # pragma: no cover - exercised only outside Boundary Lab.
         supports_spherical_sampling: bool = False
         supports_impedance: bool = True
         supports_burton_miller: bool = False
-        supports_flat_target_normalization: bool = False
+        supports_flat_target_normalization: bool = True
+        supports_channel_resynthesis: bool = True
         supports_cancellation: bool = True
         supports_streaming: bool = True
         supports_remote_assets: bool = False
@@ -89,9 +102,10 @@ class BoundaryLabBackend:
     label: str = "HornLab Metal BEM"
     capabilities: SolverCapabilities = field(
         default_factory=lambda: SolverCapabilities(
-            supports_spherical_sampling=False,
+            supports_spherical_sampling=True,
             supports_burton_miller=False,
-            supports_flat_target_normalization=False,
+            supports_flat_target_normalization=True,
+            supports_channel_resynthesis=True,
             supports_cancellation=True,
             supports_streaming=True,
             supports_remote_assets=False,
@@ -162,10 +176,19 @@ class BoundaryLabSession:
     @property
     def metadata(self) -> SolveMetadata:
         cfg = self._simulation_config
+        sphere = _boundary_lab_sphere(cfg)
+        sphere_metadata = None
+        if sphere is not None:
+            _points, theta_polar, phi_azimuth, r_distance = sphere
+            sphere_metadata = {
+                "r_distance_m": r_distance,
+                "theta_polar_rad": theta_polar,
+                "phi_azimuth_rad": phi_azimuth,
+            }
         return SolveMetadata(
             polar_angle_deg=_boundary_lab_angles(cfg).astype(np.float32, copy=False),
             radiator_names=np.asarray(_radiator_names(cfg)),
-            sphere_metadata=None,
+            sphere_metadata=sphere_metadata,
         )
 
     def solve_stream(
@@ -173,7 +196,7 @@ class BoundaryLabSession:
         *,
         stop_requested: Callable[[], bool] | None = None,
     ) -> Iterator[FrequencyResult]:
-        from . import solve_frequencies as _solve_frequencies
+        from . import solve_multi_source as _solve_multi_source
 
         # A previous stream (even one that ran to completion) leaves _stop
         # set; reset so session reuse does not silently truncate to one
@@ -193,15 +216,28 @@ class BoundaryLabSession:
             raise BoundaryLabSolverError("Boundary Lab SimulationConfig is missing mesh_file.")
 
         result_queue: queue.Queue[FrequencyResult | BaseException | None] = queue.Queue()
+        channel_names, channel_sources = _channel_basis_sources(cfg)
+        channel_configs = _boundary_lab_channel_configs_by_name(cfg)
 
         def should_stop() -> bool:
             return self._stop or (stop_requested is not None and stop_requested())
 
         def on_frequency_result(index: int, frequency_hz: float, entry: dict[str, Any]) -> bool:
-            result_queue.put(_frequency_result_from_log_entry(frequency_hz, entry))
+            result_queue.put(
+                _frequency_result_from_channel_basis_entry(
+                    frequency_hz,
+                    entry,
+                    channel_names=channel_names,
+                    channel_configs=channel_configs,
+                )
+            )
             return not should_stop()
 
         overrides = {**self.default_overrides, "on_frequency_result": on_frequency_result}
+        overrides.update(
+            velocity_sources=dict(channel_sources[0]),
+            velocity_source_callback=None,
+        )
         solve_config, translated_frequencies = solve_config_from_boundary_lab(cfg, **overrides)
         frequencies = frequencies_hz if frequencies_hz is not None else translated_frequencies
         if frequencies is None:
@@ -209,7 +245,7 @@ class BoundaryLabSession:
 
         def run() -> None:
             try:
-                _solve_frequencies(mesh_path, frequencies, solve_config)
+                _solve_multi_source(mesh_path, channel_sources, solve_config, frequencies_hz=frequencies)
             except BaseException as exc:
                 result_queue.put(exc)
             finally:
@@ -279,6 +315,7 @@ def solve_config_from_boundary_lab(
     # publishes. With a step-based grid whose step does not divide the span,
     # the grid's last angle (not the configured max) is the true endpoint.
     boundary_angles = _boundary_lab_angles(simulation_config)
+    sphere = _boundary_lab_sphere(simulation_config)
     observation = ObservationConfig(
         planes=list(
             _first(
@@ -291,6 +328,7 @@ def solve_config_from_boundary_lab(
         distance_m=float(
             _first(
                 simulation_config,
+                "distance",
                 "distance_m",
                 "observation_distance_m",
                 default=2.0,
@@ -305,6 +343,7 @@ def solve_config_from_boundary_lab(
             "observation_origin",
             default="mouth",
         ),
+        sphere_points=None if sphere is None else sphere[0],
     )
 
     config_values: dict[str, Any] = {
@@ -345,6 +384,15 @@ def solve_config_from_boundary_lab(
         "velocity_sources": _coerce_velocity_sources(simulation_config),
         "velocity_source_callback": _coerce_velocity_source_callback(simulation_config),
         "velocity_mode": VelocityMode.VELOCITY,
+        # Boundary Lab's Burton-Miller toggle requests fictitious-eigenvalue
+        # robustness. The Metal core has no Burton-Miller operator, but its
+        # complex-wavenumber formulation solves the same non-uniqueness, so map
+        # the intent onto complex_k rather than silently ignoring it.
+        "formulation": (
+            BIEFormulation.COMPLEX_K
+            if bool(_first(simulation_config, "use_burton_miller", default=False))
+            else BIEFormulation.STANDARD
+        ),
         "mesh_scale": float(
             _first(simulation_config, "mesh_scale", "scale_factor", default=1.0)
         ),
@@ -411,6 +459,36 @@ def _coerce_velocity_sources(source: Any | None) -> dict[int, float]:
     return {source_tag: source_weight}
 
 
+def _channel_basis_sources(source: Any | None) -> tuple[np.ndarray, list[dict[int, complex]]]:
+    """Return Boundary Lab channel-basis source vectors.
+
+    Boundary Lab solves one unit source per active channel and applies channel
+    gain, polarity, delay, crossover, and flat-target correction after solving.
+    Radiator ``velocity_offset_db`` is part of the source basis because it is a
+    per-radiator scale, not a post-solve channel control.
+    """
+    radiators = tuple(_first(source, "radiators", default=()) or ())
+    if not radiators:
+        return np.asarray(["main"]), [
+            {int(tag): complex(value) for tag, value in _coerce_velocity_sources(source).items()}
+        ]
+
+    names = tuple(sorted({str(_first(radiator, "channel", default="main")) for radiator in radiators}))
+    sources: list[dict[int, complex]] = []
+    for name in names:
+        values: dict[int, complex] = {}
+        for radiator in radiators:
+            if str(_first(radiator, "channel", default="main")) != name:
+                continue
+            tag = int(_first(radiator, "tag", default=2))
+            velocity_offset = 10.0 ** (float(_first(radiator, "velocity_offset_db", default=0.0)) / 20.0)
+            values[tag] = values.get(tag, 0.0 + 0.0j) + complex(velocity_offset)
+        if not values:
+            raise BoundaryLabSolverError(f"Channel {name!r} has no driven radiators.")
+        sources.append(values)
+    return np.asarray(names), sources
+
+
 def _coerce_velocity_source_callback(source: Any | None) -> Callable[[float], dict[int, complex]] | None:
     if _first(source, "velocity_sources", default=None) is not None:
         return None
@@ -443,12 +521,45 @@ def _channel_configs_by_name(source: Any | None) -> dict[str, Any]:
     return {str(_first(channel, "name", default="main")): channel for channel in channels}
 
 
+def _boundary_lab_channel_configs_by_name(source: Any | None) -> dict[str, Any]:
+    channels = _channel_configs_by_name(source)
+    if channels:
+        return channels
+
+    resolved: dict[str, Any] = {}
+    for radiator in tuple(_first(source, "radiators", default=()) or ()):
+        name = str(_first(radiator, "channel", default="main"))
+        resolved[name] = radiator
+    return resolved
+
+
 def _radiator_drive(radiator: Any, frequency_hz: float) -> complex:
     return _level_polarity_delay_filter_drive(radiator, frequency_hz)
 
 
 def _channel_drive(channel: Any, frequency_hz: float) -> complex:
     return _level_polarity_delay_filter_drive(channel, frequency_hz)
+
+
+def _boundary_lab_channel_drive(channel: Any | None, frequency_hz: float) -> complex:
+    if channel is None:
+        return 1.0 + 0.0j
+    omega = 2.0 * np.pi * float(frequency_hz)
+    level = 10.0 ** (float(_first(channel, "level_db", default=0.0)) / 20.0)
+    polarity = int(_first(channel, "polarity", default=1))
+    if polarity not in {-1, 1}:
+        raise BoundaryLabSolverError(
+            f"polarity must be -1 or 1, got {polarity!r}"
+        )
+    delay = np.exp(-1j * omega * (float(_first(channel, "delay_ms", default=0.0)) / 1000.0))
+    crossover = 1.0 + 0.0j
+    for name in ("hpf", "lpf"):
+        crossover_config = _first(channel, name, default=None)
+        if crossover_config is not None and str(_first(crossover_config, "type", default="none")).lower() != "none":
+            # _crossover_response returns the Metal/e^{-i wt} convention.
+            # Boundary Lab's channel synthesis uses the conjugate convention.
+            crossover *= np.conj(_crossover_response(crossover_config, frequency_hz))
+    return complex(level * polarity * delay * crossover)
 
 
 def _level_polarity_delay_filter_drive(source: Any, frequency_hz: float) -> complex:
@@ -539,6 +650,45 @@ def _boundary_lab_angles(source: Any | None) -> np.ndarray:
     )
 
 
+def _boundary_lab_sphere(
+    source: Any | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Fibonacci-sphere observation points + metadata for balloon sampling.
+
+    Mirrors Boundary Lab's own ``build_fibonacci_sphere_observation_points`` so
+    the balloon is identical across solver backends: an origin-centred sphere of
+    radius = observation distance, theta measured from +Z, phi in the X-Y plane.
+    Returns ``(points_xyz (N,3), theta_polar_rad (N,), phi_azimuth_rad (N,),
+    r_distance_m (N,))`` or ``None`` when spherical sampling is disabled.
+    """
+    if not bool(_first(source, "spherical_sampling_enabled", default=False)):
+        return None
+    count = int(
+        _first(source, "spherical_sampling_points", "balloon_sampling_points", default=6000)
+    )
+    if count <= 0:
+        return None
+    distance = float(
+        _first(source, "distance", "distance_m", "observation_distance_m", default=2.0)
+    )
+    axial_offset = float(_first(source, "axial_offset", "axial_offset_m", default=0.0))
+
+    indices = np.arange(count, dtype=float)
+    golden_angle = np.pi * (3.0 - np.sqrt(5.0))
+    z = 1.0 - (2.0 * indices + 1.0) / count
+    xy_radius = np.sqrt(np.maximum(1.0 - z * z, 0.0))
+    phi = indices * golden_angle
+    x = xy_radius * np.cos(phi)
+    y = xy_radius * np.sin(phi)
+    points = distance * np.vstack([x, y, z])
+    points[2, :] += axial_offset
+    points_xyz = np.ascontiguousarray(points.T, dtype=np.float64)
+    theta_polar = np.arccos(np.clip(z, -1.0, 1.0)).astype(np.float32)
+    phi_azimuth = np.mod(np.arctan2(y, x), 2.0 * np.pi).astype(np.float32)
+    r_distance = np.full(count, distance, dtype=np.float32)
+    return points_xyz, theta_polar, phi_azimuth, r_distance
+
+
 def _radiator_names(source: Any | None) -> tuple[str, ...]:
     radiators = tuple(_first(source, "radiators", default=()) or ())
     if radiators:
@@ -580,6 +730,11 @@ def _frequency_result_from_log_entry(frequency_hz: float, entry: dict[str, Any])
     pressure_complex = (
         np.asarray(pressure, dtype=np.complex64) if pressure is not None else None
     )
+    horizontal_raw = None
+    vertical_raw = None
+    if pressure_complex is not None:
+        horizontal_raw = _pressure_to_spl(_plane_pressure(pressure_complex, planes, "horizontal"))
+        vertical_raw = _pressure_to_spl(_plane_pressure(pressure_complex, planes, "vertical"))
     impedance = _impedance_array(entry.get("impedance"))
     native_diagnostics = dict(entry.get("native_diagnostics") or {})
     timings = FrequencySolveTimings(
@@ -596,29 +751,177 @@ def _frequency_result_from_log_entry(frequency_hz: float, entry: dict[str, Any])
         "horizontal_spl_norm_db": horizontal,
         "vertical_spl_norm_db": vertical,
         "impedance": impedance,
-        "horizontal_spl_db": None,
-        "vertical_spl_db": None,
+        "horizontal_spl_db": horizontal_raw,
+        "vertical_spl_db": vertical_raw,
         "sphere_spl_norm_db": None,
-        "observation_pressure_complex": pressure_complex,
-        "native_diagnostics": native_diagnostics,
         "timings": timings,
         "diagnostics": diagnostics,
     }
-    try:
-        return FrequencyResult(**kwargs)
-    except TypeError:
-        observation_pressure_complex = kwargs.pop("observation_pressure_complex")
-        native_diagnostics = kwargs.pop("native_diagnostics")
-        result = FrequencyResult(**kwargs)
-        for name, value in (
-            ("observation_pressure_complex", observation_pressure_complex),
-            ("native_diagnostics", native_diagnostics),
-        ):
-            try:
-                object.__setattr__(result, name, value)
-            except Exception:
-                pass
-        return result
+    result = FrequencyResult(**kwargs)
+    _attach_result_extras(
+        result,
+        observation_pressure_complex=pressure_complex,
+        native_diagnostics=native_diagnostics,
+    )
+    return result
+
+
+def _frequency_result_from_channel_basis_entry(
+    frequency_hz: float,
+    entry: dict[str, Any],
+    *,
+    channel_names: np.ndarray,
+    channel_configs: dict[str, Any],
+) -> FrequencyResult:
+    source_entries = _source_entries_from_callback_entry(entry)
+    channels = np.asarray(channel_names)
+    if len(source_entries) != channels.size:
+        raise BoundaryLabSolverError(
+            "Metal multi-source result count does not match Boundary Lab channel count: "
+            f"{len(source_entries)} result(s), {channels.size} channel(s)."
+        )
+
+    planes = list(entry.get("observation_planes") or ["horizontal", "vertical"])
+    horizontal_pressure = []
+    vertical_pressure = []
+    sphere_pressure: list[np.ndarray] = []
+    impedance_rows = []
+    native_diagnostics: list[dict[str, Any]] = []
+    for source_entry in source_entries:
+        pressure = source_entry.get("observation_pressure_complex")
+        if pressure is None:
+            raise BoundaryLabSolverError("Metal result did not include observation_pressure_complex.")
+        pressure_complex = np.asarray(pressure, dtype=np.complex64)
+        # Boundary Lab's channel synthesis uses the conjugate time convention
+        # from the Metal core. Conjugating the basis keeps SPL invariant while
+        # making GUI delay/filter edits phase in the expected direction.
+        horizontal_pressure.append(np.conj(_plane_pressure(pressure_complex, planes, "horizontal")))
+        vertical_pressure.append(np.conj(_plane_pressure(pressure_complex, planes, "vertical")))
+        sphere = source_entry.get("observation_sphere_pressure_complex")
+        if sphere is not None:
+            # Same conjugate convention as the arc planes so channel synthesis
+            # combines the balloon basis consistently with the polar planes.
+            sphere_pressure.append(np.conj(np.asarray(sphere, dtype=np.complex64)))
+        impedance_rows.append(_impedance_pair(source_entry.get("impedance")))
+        native_diagnostics.append(dict(source_entry.get("native_diagnostics") or {}))
+
+    horizontal_matrix = np.vstack(horizontal_pressure).astype(np.complex64, copy=False)
+    vertical_matrix = np.vstack(vertical_pressure).astype(np.complex64, copy=False)
+    sphere_matrix = (
+        np.vstack(sphere_pressure).astype(np.complex64, copy=False)
+        if len(sphere_pressure) == channels.size and sphere_pressure
+        else None
+    )
+    angles = np.asarray(entry.get("observation_angles_deg", []), dtype=np.float32)
+    if angles.size != horizontal_matrix.shape[1]:
+        angles = np.linspace(0.0, 180.0, horizontal_matrix.shape[1], dtype=np.float32)
+
+    synthesized = _synthesize_boundary_lab_channel_basis(
+        frequency_hz=float(frequency_hz),
+        channel_names=channels,
+        channel_configs=channel_configs,
+        horizontal_pressure=horizontal_matrix,
+        vertical_pressure=vertical_matrix,
+        angles_deg=angles,
+    )
+    first = source_entries[0]
+    timings = FrequencySolveTimings(
+        assembly_s=sum(float(item.get("assembly_s", 0.0) or 0.0) for item in source_entries),
+        solve_s=sum(float(item.get("dense_solve_s", item.get("solve_s", 0.0)) or 0.0) for item in source_entries),
+        field_s=sum(float(item.get("field_s", 0.0) or 0.0) for item in source_entries),
+    )
+    diagnostics = SolverDiagnostics(
+        convergence_info=first.get("lapack_info"),
+        message=str(first.get("backend", "native_metal")),
+    )
+    result = FrequencyResult(
+        freq_hz=float(frequency_hz),
+        horizontal_spl_norm_db=synthesized["horizontal_spl_norm_db"],
+        vertical_spl_norm_db=synthesized["vertical_spl_norm_db"],
+        impedance=np.vstack(impedance_rows).astype(np.float32, copy=False),
+        horizontal_spl_db=synthesized["horizontal_spl_db"],
+        vertical_spl_db=synthesized["vertical_spl_db"],
+        sphere_spl_norm_db=None,
+        channel_names=channels,
+        horizontal_pressure=horizontal_matrix,
+        vertical_pressure=vertical_matrix,
+        sphere_pressure=sphere_matrix,
+        timings=timings,
+        diagnostics=diagnostics,
+    )
+    _attach_result_extras(
+        result,
+        observation_pressure_complex=np.asarray(
+            [item.get("observation_pressure_complex") for item in source_entries],
+            dtype=np.complex64,
+        ),
+        native_diagnostics=native_diagnostics,
+    )
+    return result
+
+
+def _source_entries_from_callback_entry(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_sources = entry.get("source_results")
+    if raw_sources is None:
+        return [entry]
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise BoundaryLabSolverError("source_results must be a non-empty list.")
+    return [dict(item) for item in raw_sources]
+
+
+def _attach_result_extras(result: FrequencyResult, **values: Any) -> None:
+    for name, value in values.items():
+        try:
+            object.__setattr__(result, name, value)
+        except Exception:
+            pass
+
+
+def _synthesize_boundary_lab_channel_basis(
+    *,
+    frequency_hz: float,
+    channel_names: np.ndarray,
+    channel_configs: dict[str, Any],
+    horizontal_pressure: np.ndarray,
+    vertical_pressure: np.ndarray,
+    angles_deg: np.ndarray,
+) -> dict[str, np.ndarray]:
+    names = [str(name) for name in np.asarray(channel_names).tolist()]
+    weights = np.asarray(
+        [
+            _boundary_lab_channel_drive(channel_configs.get(name), frequency_hz)
+            for name in names
+        ],
+        dtype=np.complex64,
+    )
+    horizontal_summed = np.sum(horizontal_pressure * weights[:, np.newaxis], axis=0)
+    vertical_summed = np.sum(vertical_pressure * weights[:, np.newaxis], axis=0)
+    horizontal_spl = _pressure_to_spl(horizontal_summed)
+    vertical_spl = _pressure_to_spl(vertical_summed)
+    on_axis_idx = int(np.argmin(np.abs(np.asarray(angles_deg, dtype=np.float32)))) if angles_deg.size else 0
+    on_axis_ref = horizontal_spl[on_axis_idx]
+    return {
+        "horizontal_spl_db": horizontal_spl.astype(np.float32, copy=False),
+        "vertical_spl_db": vertical_spl.astype(np.float32, copy=False),
+        "horizontal_spl_norm_db": (horizontal_spl - on_axis_ref).astype(np.float32, copy=False),
+        "vertical_spl_norm_db": (vertical_spl - on_axis_ref).astype(np.float32, copy=False),
+    }
+
+
+def _pressure_to_spl(pressure: np.ndarray) -> np.ndarray:
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return (20.0 * np.log10(np.abs(pressure) / REFERENCE_PRESSURE_PA)).astype(np.float32, copy=False)
+
+
+def _plane_pressure(pressure: np.ndarray, planes: list[str], plane: str) -> np.ndarray:
+    if plane in planes:
+        return np.asarray(pressure[planes.index(plane)], dtype=np.complex64)
+    return np.zeros(pressure.shape[-1], dtype=np.complex64)
+
+
+def _impedance_pair(value: Any) -> np.ndarray:
+    z = complex(0.0 if value is None else value)
+    return np.asarray([float(np.real(z)), float(np.imag(z))], dtype=np.float32)
 
 
 def _plane_spl(spl: np.ndarray, planes: list[str], plane: str) -> np.ndarray:

@@ -126,7 +126,9 @@ def solve_multi_source(
     explicit ``frame_override`` when the per-source frames would differ.
     ``config.velocity_sources`` is ignored. The shared assembly/factorization
     time is attributed to the first result's timings; later results carry
-    only their own field-evaluation time.
+    only their own field-evaluation time. If ``config.on_frequency_result`` is
+    set, callbacks stream one combined entry per frequency with per-source log
+    entries in ``source_results``.
     """
     if config is None:
         config = native_config()

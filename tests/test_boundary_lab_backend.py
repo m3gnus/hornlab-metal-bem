@@ -8,6 +8,7 @@ import pytest
 from hornlab_metal_bem.boundary_lab import BACKEND_ID, BoundaryLabSolverError, create_backend
 from hornlab_metal_bem.boundary_lab import _coerce_symmetry_plane
 from hornlab_metal_bem.boundary_lab import _crossover_response
+from hornlab_metal_bem.boundary_lab import _frequency_result_from_channel_basis_entry
 from hornlab_metal_bem.boundary_lab import _frequency_result_from_log_entry
 from hornlab_metal_bem.boundary_lab import _level_polarity_delay_filter_drive
 from hornlab_metal_bem.boundary_lab import solve_config_from_boundary_lab
@@ -72,6 +73,7 @@ def test_boundary_lab_backend_exposes_stable_id_and_session():
     session = backend.create_session({"freq_min_hz": 900.0})
 
     assert backend.backend_id == BACKEND_ID
+    assert backend.capabilities.supports_channel_resynthesis is True
     assert session.default_overrides == {"freq_count": 3}
 
 
@@ -130,6 +132,77 @@ def test_boundary_lab_metadata_angles_match_solved_grid_for_non_divisible_step()
     np.testing.assert_allclose(session.metadata.polar_angle_deg, solved)
 
 
+def test_burton_miller_maps_to_complex_k_formulation():
+    on, _ = solve_config_from_boundary_lab({"use_burton_miller": True})
+    off, _ = solve_config_from_boundary_lab({"use_burton_miller": False})
+    absent, _ = solve_config_from_boundary_lab({})
+    assert on.formulation == "complex_k"
+    assert off.formulation == "standard"
+    assert absent.formulation == "standard"
+
+
+def test_spherical_sampling_builds_sphere_points_and_metadata():
+    config = {
+        "mesh_file": "m.msh",
+        "spherical_sampling_enabled": True,
+        "spherical_sampling_points": 32,
+        "distance": 3.0,
+    }
+    solve_config, _ = solve_config_from_boundary_lab(config)
+    sphere_points = solve_config.observation.sphere_points
+    assert sphere_points is not None
+    assert sphere_points.shape == (32, 3)
+    # Points lie on the requested-radius sphere (origin-centred), matching
+    # Boundary Lab's own Fibonacci-sphere convention.
+    np.testing.assert_allclose(np.linalg.norm(sphere_points, axis=1), 3.0, atol=1e-5)
+
+    metadata = create_backend().create_session({"config": config}).metadata
+    assert metadata.sphere_metadata is not None
+    assert set(metadata.sphere_metadata) == {"r_distance_m", "theta_polar_rad", "phi_azimuth_rad"}
+    assert metadata.sphere_metadata["theta_polar_rad"].shape == (32,)
+
+
+def test_spherical_sampling_disabled_leaves_no_sphere():
+    solve_config, _ = solve_config_from_boundary_lab({"mesh_file": "m.msh"})
+    assert solve_config.observation.sphere_points is None
+    assert create_backend().create_session({"config": {"mesh_file": "m.msh"}}).metadata.sphere_metadata is None
+
+
+def test_channel_basis_entry_carries_sphere_pressure():
+    sphere = np.asarray([1.0 + 0.0j, 2.0 + 0.0j, 3.0 + 0.0j, 4.0 + 0.0j], dtype=np.complex64)
+    entry = {
+        "observation_planes": ["horizontal", "vertical"],
+        "observation_angles_deg": np.asarray([-45.0, 0.0, 45.0], dtype=np.float32),
+        "observation_pressure_complex": np.asarray(
+            [[1.0, 2.0, 1.0], [0.5, 1.0, 0.5]], dtype=np.complex64
+        ),
+        "observation_sphere_pressure_complex": sphere,
+        "impedance": 1.0 + 0.0j,
+    }
+    result = _frequency_result_from_channel_basis_entry(
+        1000.0, entry, channel_names=np.asarray(["main"]), channel_configs={}
+    )
+    assert result.sphere_pressure is not None
+    assert result.sphere_pressure.shape == (1, 4)
+    # Basis is conjugated to match the channel-synthesis time convention.
+    np.testing.assert_allclose(result.sphere_pressure[0], np.conj(sphere))
+
+
+def test_channel_basis_entry_without_sphere_pressure_stays_none():
+    entry = {
+        "observation_planes": ["horizontal", "vertical"],
+        "observation_angles_deg": np.asarray([-45.0, 0.0, 45.0], dtype=np.float32),
+        "observation_pressure_complex": np.asarray(
+            [[1.0, 2.0, 1.0], [0.5, 1.0, 0.5]], dtype=np.complex64
+        ),
+        "impedance": 1.0 + 0.0j,
+    }
+    result = _frequency_result_from_channel_basis_entry(
+        1000.0, entry, channel_names=np.asarray(["main"]), channel_configs={}
+    )
+    assert result.sphere_pressure is None
+
+
 def test_boundary_lab_solve_stream_resets_stop_flag_between_streams():
     backend = create_backend()
     session = backend.create_session({"config": {"mesh_file": "m.msh"}})
@@ -141,6 +214,72 @@ def test_boundary_lab_solve_stream_resets_stop_flag_between_streams():
     with pytest.raises(BoundaryLabSolverError, match="frequencies_hz"):
         next(stream)
     assert session._stop is False
+
+
+def test_boundary_lab_session_streams_channel_basis_from_multi_source(monkeypatch):
+    import hornlab_metal_bem
+
+    captured = {}
+
+    def fake_solve_multi_source(mesh, sources, solve_config, frequencies_hz):
+        captured["mesh"] = mesh
+        captured["sources"] = sources
+        captured["velocity_source_callback"] = solve_config.velocity_source_callback
+        pressure_lf = np.asarray(
+            [
+                [1.0 + 0.0j, 2.0 + 0.0j, 1.0 + 0.0j],
+                [0.5 + 0.0j, 1.0 + 0.0j, 0.5 + 0.0j],
+            ],
+            dtype=np.complex64,
+        )
+        pressure_hf = np.asarray(
+            [
+                [0.25 + 0.0j, 0.5 + 0.0j, 0.25 + 0.0j],
+                [0.25 + 0.0j, 0.25 + 0.0j, 0.25 + 0.0j],
+            ],
+            dtype=np.complex64,
+        )
+        source_entries = []
+        for source in sources:
+            if 7 in source:
+                source_entries.append({"observation_pressure_complex": pressure_lf, "impedance": 1.0 + 0.0j})
+            elif 8 in source:
+                source_entries.append({"observation_pressure_complex": pressure_hf, "impedance": 2.0 + 0.0j})
+        solve_config.on_frequency_result(
+            0,
+            float(np.asarray(frequencies_hz)[0]),
+            {
+                "observation_planes": ["horizontal", "vertical"],
+                "observation_angles_deg": np.asarray([-45.0, 0.0, 45.0], dtype=np.float32),
+                "source_results": source_entries,
+            },
+        )
+        return []
+
+    monkeypatch.setattr(hornlab_metal_bem, "solve_multi_source", fake_solve_multi_source)
+
+    config = SimpleNamespace(
+        mesh_file="waveguide.msh",
+        min_angle=-45.0,
+        max_angle=45.0,
+        step_size=45.0,
+        radiators=(
+            SimpleNamespace(name="woofer", tag=7, channel="LF", velocity_offset_db=6.0),
+            SimpleNamespace(name="tweeter", tag=8, channel="HF", velocity_offset_db=-6.0),
+        ),
+        channels=(SimpleNamespace(name="LF"), SimpleNamespace(name="HF")),
+    )
+    request = SimpleNamespace(config=config, frequencies_hz=np.asarray([1000.0], dtype=np.float32))
+    session = create_backend().create_session(request)
+
+    (result,) = list(session.solve_stream())
+
+    assert captured["mesh"] == "waveguide.msh"
+    assert captured["velocity_source_callback"] is None
+    assert captured["sources"][0][8] == pytest.approx(10.0 ** (-6.0 / 20.0))
+    assert captured["sources"][1][7] == pytest.approx(10.0 ** (6.0 / 20.0))
+    assert result.channel_names.tolist() == ["HF", "LF"]
+    assert result.horizontal_pressure.shape == (2, 3)
 
 
 def test_drive_delay_uses_positive_phase_for_lagging_channel():
@@ -234,5 +373,58 @@ def test_boundary_lab_frequency_result_preserves_streamed_complex_pressure():
     )
 
     np.testing.assert_allclose(result.observation_pressure_complex, pressure)
+    np.testing.assert_allclose(
+        result.horizontal_spl_db,
+        20.0 * np.log10(np.abs(pressure[0]) / 20e-6),
+    )
     assert result.native_diagnostics["assembly_implementation"] == "test"
     assert result.diagnostics.convergence_info == 0
+
+
+def test_boundary_lab_channel_basis_result_uses_standard_blab_fields():
+    pressure_lf = np.asarray(
+        [
+            [1.0 + 1.0j, 2.0 + 0.0j, 1.0 - 1.0j],
+            [0.5 + 0.0j, 1.0 + 0.0j, 0.5 + 0.0j],
+        ],
+        dtype=np.complex64,
+    )
+    pressure_hf = np.asarray(
+        [
+            [0.25 + 0.0j, 0.5 + 0.5j, 0.25 + 0.0j],
+            [0.25 + 0.0j, 0.25 + 0.25j, 0.25 + 0.0j],
+        ],
+        dtype=np.complex64,
+    )
+
+    result = _frequency_result_from_channel_basis_entry(
+        1000.0,
+        {
+            "observation_planes": ["horizontal", "vertical"],
+            "observation_angles_deg": np.asarray([-45.0, 0.0, 45.0], dtype=np.float32),
+            "source_results": [
+                {
+                    "observation_pressure_complex": pressure_lf,
+                    "impedance": 1.0 + 0.5j,
+                    "lapack_info": 0,
+                    "backend": "test",
+                },
+                {
+                    "observation_pressure_complex": pressure_hf,
+                    "impedance": 2.0 - 0.25j,
+                    "lapack_info": 0,
+                    "backend": "test",
+                },
+            ],
+        },
+        channel_names=np.asarray(["LF", "HF"]),
+        channel_configs={},
+    )
+
+    assert result.channel_names.tolist() == ["LF", "HF"]
+    assert result.horizontal_pressure.shape == (2, 3)
+    assert result.vertical_pressure.shape == (2, 3)
+    np.testing.assert_allclose(result.horizontal_pressure[0], np.conj(pressure_lf[0]))
+    np.testing.assert_allclose(result.impedance, [[1.0, 0.5], [2.0, -0.25]])
+    assert result.horizontal_spl_db.shape == (3,)
+    assert result.horizontal_spl_norm_db[1] == pytest.approx(0.0)

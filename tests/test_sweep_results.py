@@ -10,6 +10,31 @@ from hornlab_metal_bem.metal import native
 from hornlab_metal_bem.metal.native import MetalNativeRuntimeStatus
 
 
+def test_append_sphere_field_points_concatenates_and_counts():
+    arc = sweep._field_points_3xn(np.zeros((2, 3, 3)))  # 2 planes x 3 angles -> (3, 6)
+    combined, n_sphere = sweep._append_sphere_field_points(arc, np.ones((4, 3)))
+    assert n_sphere == 4
+    assert combined.shape == (3, 10)
+
+    unchanged, zero = sweep._append_sphere_field_points(arc, None)
+    assert zero == 0
+    assert unchanged.shape == (3, 6)
+
+
+def test_system_field_splits_arc_and_sphere():
+    n_planes, n_angles, n_sphere = 2, 3, 4
+    flat = np.arange(n_planes * n_angles + n_sphere, dtype=np.complex128)
+    system = SimpleNamespace(field_row_index=0)
+
+    arc, sphere = sweep._system_field(system, n_planes, n_angles, n_sphere, np.asarray([flat]))
+    np.testing.assert_array_equal(arc, flat[:6].reshape(n_planes, n_angles))
+    np.testing.assert_array_equal(sphere, flat[6:])
+
+    arc_only, no_sphere = sweep._system_field(system, n_planes, n_angles, 0, np.asarray([flat[:6]]))
+    assert no_sphere is None
+    assert arc_only.shape == (n_planes, n_angles)
+
+
 def test_discover_runtime_smoke_cached_reuses_validated_helper(monkeypatch, tmp_path):
     helper = tmp_path / "HornlabMetalBemNative"
     helper.write_text("#!/bin/sh\n", encoding="utf-8")

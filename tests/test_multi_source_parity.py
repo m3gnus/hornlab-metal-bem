@@ -219,7 +219,7 @@ def test_multi_source_matches_sequential_float64_and_chief():
             assert entry["chief_points"] is True
 
 
-def test_solve_multi_source_rejects_empty_and_callbacks():
+def test_solve_multi_source_rejects_empty_and_velocity_source_callback():
     mesh = _two_cap_sphere_mesh()
     with pytest.raises(ValueError, match="at least one velocity dict"):
         metal_bem.solve_multi_source(mesh, [], _configs())
@@ -228,12 +228,6 @@ def test_solve_multi_source_rejects_empty_and_callbacks():
 
     config = _configs(velocity_source_callback=lambda f: {2: 1.0})
     with pytest.raises(ValueError, match="velocity_source_callback"):
-        run_sweep_native_metal_multi_source(
-            mesh, np.array([100.0]), object(), config, [{2: 1.0}, {3: 1.0}]
-        )
-
-    config = _configs(on_frequency_result=lambda i, f, entry: None)
-    with pytest.raises(ValueError, match="on_frequency_result"):
         run_sweep_native_metal_multi_source(
             mesh, np.array([100.0]), object(), config, [{2: 1.0}, {3: 1.0}]
         )

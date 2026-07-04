@@ -274,6 +274,25 @@ def _field_points_3xn(obs_points: NDArray[np.float64]) -> NDArray[np.float32]:
     )
 
 
+def _append_sphere_field_points(
+    field_points: NDArray[np.float32],
+    sphere_points: NDArray[np.float64] | None,
+) -> tuple[NDArray[np.float32], int]:
+    """Append free-standing sphere points after the polar-arc field points.
+
+    The native field kernel evaluates a flat (3, M) point list, so the sphere
+    points ride along in the same solve; ``_system_field`` splits them back off
+    by count. Returns the combined (3, M) array and the sphere point count
+    (0 when disabled, leaving the arc-only behaviour bit-unchanged).
+    """
+    if sphere_points is None:
+        return field_points, 0
+    sphere_3xn = np.ascontiguousarray(
+        np.asarray(sphere_points, dtype=np.float64).T, dtype=np.float32
+    )
+    return np.concatenate([field_points, sphere_3xn], axis=1), int(sphere_3xn.shape[1])
+
+
 def _mesh_vertices_elements(
     mesh: LoadedMesh,
 ) -> tuple[NDArray[np.float64], NDArray[np.int32]]:
@@ -445,8 +464,16 @@ def _system_field(
     system,
     n_planes: int,
     n_angles: int,
+    n_sphere: int = 0,
     field_batch_complex: NDArray[np.complex128] | None = None,
-) -> NDArray[np.complex128]:
+) -> tuple[NDArray[np.complex128], NDArray[np.complex128] | None]:
+    """Return (arc_pressure, sphere_pressure).
+
+    The flat native field result holds the ``n_planes * n_angles`` polar-arc
+    points followed by ``n_sphere`` free-standing sphere points. The arc block is
+    reshaped to (n_planes, n_angles); the sphere block is returned flat, or None
+    when no sphere points were requested.
+    """
     if field_batch_complex is not None:
         if system.field_row_index is None:
             raise RuntimeError("mixed batched and per-case native field results")
@@ -457,7 +484,11 @@ def _system_field(
             Path(system.field_imag_f32),
             tuple(system.field_shape),
         ).astype(np.complex128)
-    return field_complex.reshape(n_planes, n_angles)
+    flat = np.asarray(field_complex).reshape(-1)
+    arc_count = n_planes * n_angles
+    arc = flat[:arc_count].reshape(n_planes, n_angles)
+    sphere = flat[arc_count : arc_count + n_sphere] if n_sphere else None
+    return arc, sphere
 
 
 def _system_surface_pressure(system) -> NDArray[np.complex128]:
@@ -496,6 +527,7 @@ def _append_system_result(
     n_angles: int,
     on_axis_idx: int,
     field_batch_complex: NDArray[np.complex128] | None,
+    n_sphere: int = 0,
     surface_pavg: dict[int, list[complex]],
     pressure_rows: list[NDArray[np.complex128]],
     spl_rows: list[NDArray[np.float64]],
@@ -518,7 +550,9 @@ def _append_system_result(
     for tag in source_tags:
         surface_pavg[tag].append(pavg[tag])
 
-    pressure = _system_field(system, n_planes, n_angles, field_batch_complex)
+    pressure, sphere_pressure = _system_field(
+        system, n_planes, n_angles, n_sphere, field_batch_complex
+    )
     directivity = _directivity_from_pressure(pressure, on_axis_idx)
     native_diagnostics = dict(getattr(system, "diagnostics", {}) or {})
     _apply_dense_solve_policy(
@@ -542,6 +576,7 @@ def _append_system_result(
         "lapack_info": int(system.lapack_info),
         "impedance": impedance,
         "native_diagnostics": native_diagnostics,
+        "observation_sphere_pressure_complex": sphere_pressure,
     }
 
     completed_freqs.append(frequency_hz)
@@ -637,7 +672,9 @@ def run_sweep_native_metal(
     on_axis_idx = int(np.argmin(np.abs(angles_deg)))
     impedance_source_tag = min(config.velocity_sources.keys(), default=2)
     n_planes, n_angles, _ = obs_points.shape
-    field_points = _field_points_3xn(obs_points)
+    field_points, n_sphere = _append_sphere_field_points(
+        _field_points_3xn(obs_points), config.observation.sphere_points
+    )
 
     with MetalNativeStandardSession.create_session(
         geometry_buffers=geometry_buffers,
@@ -709,6 +746,7 @@ def run_sweep_native_metal(
                     n_angles=n_angles,
                     on_axis_idx=on_axis_idx,
                     field_batch_complex=field_batch_complex,
+                    n_sphere=n_sphere,
                     surface_pavg=surface_pavg,
                     pressure_rows=pressure_rows,
                     spl_rows=spl_rows,
@@ -769,6 +807,7 @@ def run_sweep_native_metal(
                     n_angles=n_angles,
                     on_axis_idx=on_axis_idx,
                     field_batch_complex=None,
+                    n_sphere=n_sphere,
                     surface_pavg=surface_pavg,
                     pressure_rows=pressure_rows,
                     spl_rows=spl_rows,
@@ -901,8 +940,10 @@ def run_sweep_native_metal_multi_source(
     ``surface_pressure_avg`` is recorded for the sorted union of all source
     tags in EVERY result, so cross-source transfer terms (e.g. radiation-
     impedance matrix columns) come out of one call. Streaming callbacks
-    (``on_frequency_result``) and ``velocity_source_callback`` are not
-    supported here.
+    (``on_frequency_result``) are supported and receive a ``source_results``
+    list containing one log entry per source. ``velocity_source_callback``
+    remains unsupported here because each source vector is fixed for the whole
+    shared multi-RHS batch.
     """
     should_route_native_metal(config)
     if not sources:
@@ -910,10 +951,6 @@ def run_sweep_native_metal_multi_source(
     if config.velocity_source_callback is not None:
         raise ValueError(
             "multi-source solves do not support velocity_source_callback"
-        )
-    if config.on_frequency_result is not None:
-        raise ValueError(
-            "multi-source solves do not support on_frequency_result streaming"
         )
     per_source_configs = [
         replace(config, velocity_sources=dict(source)) for source in sources
@@ -999,7 +1036,9 @@ def run_sweep_native_metal_multi_source(
     completed_freqs: list[list[float]] = [[] for _ in range(n_sources)]
     on_axis_idx = int(np.argmin(np.abs(angles_deg)))
     n_planes, n_angles, _ = obs_points.shape
-    field_points = _field_points_3xn(obs_points)
+    field_points, n_sphere = _append_sphere_field_points(
+        _field_points_3xn(obs_points), config.observation.sphere_points
+    )
 
     freq_values = np.asarray(frequencies, dtype=np.float64)
     k_values, k_imag_values = _k_values_for_native(freq_values, config)
@@ -1014,6 +1053,85 @@ def run_sweep_native_metal_multi_source(
         for source_config in per_source_configs
     ]
 
+    def _append_case_results(
+        index: int,
+        system,
+        *,
+        field_batch_complex: NDArray[np.complex128] | None,
+    ) -> float:
+        frequency_hz = float(freq_values[index])
+        if len(system.extra_sources) != n_sources - 1:
+            raise RuntimeError(
+                "native multi-source case returned "
+                f"{len(system.extra_sources)} extra source(s), expected "
+                f"{n_sources - 1}"
+            )
+        timing_s = (
+            float(system.assembly_s)
+            + float(system.dense_solve_s)
+            + float(system.field_s)
+        )
+        for source_index in range(n_sources):
+            source_system = (
+                system
+                if source_index == 0
+                else _extra_source_system_view(
+                    system, system.extra_sources[source_index - 1]
+                )
+            )
+            source_timing = (
+                timing_s
+                if source_index == 0
+                else float(source_system.field_s)
+            )
+            _append_system_result(
+                frequency_hz=frequency_hz,
+                system=source_system,
+                backend="native_metal_resident_multi_source_batch",
+                timing_s=source_timing,
+                mesh=mesh,
+                p1_space=p1_space,
+                source_tags=source_tags,
+                impedance_source_tag=impedance_source_tags[source_index],
+                n_planes=n_planes,
+                n_angles=n_angles,
+                on_axis_idx=on_axis_idx,
+                field_batch_complex=field_batch_complex,
+                n_sphere=n_sphere,
+                surface_pavg=surface_pavg[source_index],
+                pressure_rows=pressure_rows[source_index],
+                spl_rows=spl_rows[source_index],
+                impedance_rows=impedance_rows[source_index],
+                surface_pressure_rows=surface_pressure_rows[source_index],
+                native_diagnostics_rows=native_diagnostics_rows[source_index],
+                solver_log=solver_logs[source_index],
+                completed_freqs=completed_freqs[source_index],
+                dense_solve_rcond_warning_threshold=(
+                    config.dense_solve_rcond_warning_threshold
+                ),
+                mesh_max_edge_m=mesh_max_edge_m,
+                mesh_elements_per_wavelength_min=(
+                    config.mesh_elements_per_wavelength_min
+                ),
+            )
+        return frequency_hz
+
+    def _multi_source_callback_entry() -> dict:
+        source_entries: list[dict] = []
+        for source_index in range(n_sources):
+            log_entry = dict(solver_logs[source_index][-1])
+            log_entry.update(
+                observation_pressure_complex=pressure_rows[source_index][-1],
+                observation_directivity_db=spl_rows[source_index][-1],
+                observation_angles_deg=angles_deg,
+                observation_planes=config.observation.planes,
+            )
+            source_entries.append(log_entry)
+        return {
+            **source_entries[0],
+            "source_results": source_entries,
+        }
+
     with MetalNativeStandardSession.create_session(
         geometry_buffers=geometry_buffers,
         symmetry_plane=config.native_symmetry_plane,
@@ -1026,6 +1144,20 @@ def run_sweep_native_metal_multi_source(
             len(freq_values),
             n_sources,
         )
+        def _on_case_result(i: int, system) -> bool | None:
+            frequency_hz = _append_case_results(
+                i,
+                system,
+                field_batch_complex=None,
+            )
+            if config.progress_callback is not None:
+                config.progress_callback(i, len(freq_values), frequency_hz)
+            if config.on_frequency_result is not None:
+                if config.on_frequency_result(i, frequency_hz, _multi_source_callback_entry()) is False:
+                    logger.info("Early stop requested after %.1f Hz", frequency_hz)
+                    return False
+            return None
+
         systems = session.assemble_solve_evaluate_standard_neumann_batch(
             freq_values,
             k_values,
@@ -1038,13 +1170,17 @@ def run_sweep_native_metal_multi_source(
             source_tags=source_tags,
             impedance_source_tag=impedance_source_tags[0],
             write_surface_pressure=config.return_surface_pressure,
-            write_batched_field=True,
+            write_batched_field=config.on_frequency_result is None,
+            on_case_result=_on_case_result if config.on_frequency_result is not None else None,
             dense_solve_dtype=config.dense_solve_dtype,
             chief_points=chief_points_3xm,
             chief_weight=config.chief_weight,
             extra_neumann_dp0=np.stack(per_source_neumann[1:], axis=0),
             extra_impedance_source_tags=impedance_source_tags[1:],
         )
+        if config.on_frequency_result is not None:
+            systems = []
+
         field_batch_complex: NDArray[np.complex128] | None = None
         if systems and systems[0].field_row_index is not None:
             first = systems[0]
@@ -1057,60 +1193,11 @@ def run_sweep_native_metal_multi_source(
             ).astype(np.complex128)
 
         for i, (freq, system) in enumerate(zip(freq_values, systems)):
-            frequency_hz = float(freq)
-            if len(system.extra_sources) != n_sources - 1:
-                raise RuntimeError(
-                    "native multi-source case returned "
-                    f"{len(system.extra_sources)} extra source(s), expected "
-                    f"{n_sources - 1}"
-                )
-            timing_s = (
-                float(system.assembly_s)
-                + float(system.dense_solve_s)
-                + float(system.field_s)
+            frequency_hz = _append_case_results(
+                i,
+                system,
+                field_batch_complex=field_batch_complex,
             )
-            for source_index in range(n_sources):
-                source_system = (
-                    system
-                    if source_index == 0
-                    else _extra_source_system_view(
-                        system, system.extra_sources[source_index - 1]
-                    )
-                )
-                source_timing = (
-                    timing_s
-                    if source_index == 0
-                    else float(source_system.field_s)
-                )
-                _append_system_result(
-                    frequency_hz=frequency_hz,
-                    system=source_system,
-                    backend="native_metal_resident_multi_source_batch",
-                    timing_s=source_timing,
-                    mesh=mesh,
-                    p1_space=p1_space,
-                    source_tags=source_tags,
-                    impedance_source_tag=impedance_source_tags[source_index],
-                    n_planes=n_planes,
-                    n_angles=n_angles,
-                    on_axis_idx=on_axis_idx,
-                    field_batch_complex=field_batch_complex,
-                    surface_pavg=surface_pavg[source_index],
-                    pressure_rows=pressure_rows[source_index],
-                    spl_rows=spl_rows[source_index],
-                    impedance_rows=impedance_rows[source_index],
-                    surface_pressure_rows=surface_pressure_rows[source_index],
-                    native_diagnostics_rows=native_diagnostics_rows[source_index],
-                    solver_log=solver_logs[source_index],
-                    completed_freqs=completed_freqs[source_index],
-                    dense_solve_rcond_warning_threshold=(
-                        config.dense_solve_rcond_warning_threshold
-                    ),
-                    mesh_max_edge_m=mesh_max_edge_m,
-                    mesh_elements_per_wavelength_min=(
-                        config.mesh_elements_per_wavelength_min
-                    ),
-                )
             if config.progress_callback is not None:
                 config.progress_callback(i, len(freq_values), frequency_hz)
 
