@@ -110,6 +110,26 @@ exposes experimental opt-in `formulation="complex_k"` and
 legacy OpenCL/Bempp fallback configuration or Burton-Miller as user-facing
 features.
 
+## CircSym Axisymmetric Solver
+
+`solve_circsym()` and `solve_circsym_frequencies()` run the axisymmetric
+`m=0` DP0 meridian solver for circular bodies of revolution. Use it only for
+circular/axisymmetric geometries; non-round cross sections, morphing, and
+enclosures are outside the current validity envelope. Infinite-baffle CircSym
+is not supported yet because the image-plane meridian needs aperture coupling;
+use the full 3D solver for infinite-baffle jobs.
+
+With the wavelength-scaled meridian budget, CircSym is intended for waveguide
+sweeps up to roughly 30-40 kHz when the meridian resolves the requested band.
+The default `complex_k` formulation avoids closed-surface irregular
+frequencies, but the complex shift adds an `O(shift)` bias to surface
+impedance, about 0.03 dB for the default shift. Observation fields are still
+evaluated with the real acoustic wavenumber.
+
+The returned `impedance` is the area-weighted average pressure on the driven
+source cap per unit drive. It is not a throat-plane radiation impedance and is
+not normalized by `rho*c`.
+
 Use `solve_frequencies(mesh, frequencies_hz, config=None)` when frequency order
 comes from the caller instead of a generated sweep.
 

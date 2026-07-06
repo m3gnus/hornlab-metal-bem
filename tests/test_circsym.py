@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from scipy.special import j1, spherical_jn, spherical_yn
+from scipy.special import j1, spherical_jn, spherical_yn, struve
 
 import hornlab_metal_bem as metal_bem
 from hornlab_metal_bem._constants import SPEED_OF_SOUND
 from hornlab_metal_bem.circsym import (
     MeridianMesh,
+    _assemble_boundary_matrices,
     _integrate_segment_kernel,
     ring_kernel_m0,
 )
@@ -40,6 +41,10 @@ def _pulsating_sphere_impedance(ka: np.ndarray) -> np.ndarray:
     # With this package's e^(+ikR), q=+i*rho*omega*v convention, the textbook
     # e^(-iwt) impedance ika/(1+ika) appears conjugated.
     return np.conjugate(1j * ka / (1.0 + 1j * ka))
+
+
+def _baffled_piston_impedance(ka: np.ndarray) -> np.ndarray:
+    return 1.0 - j1(2.0 * ka) / ka - 1j * struve(1, 2.0 * ka) / ka
 
 
 def _spherical_hankel1(order: int, x: float) -> complex:
@@ -142,6 +147,32 @@ def test_ring_kernels_match_dense_azimuth_quadrature_off_diagonal_and_near():
     )
     assert np.isfinite(g_self)
     assert np.isfinite(h_self)
+
+
+def test_vectorized_boundary_assembly_matches_scalar_segment_integrals():
+    k = 19.0 + 0.03j
+    meridian = _sphere_meridian(radius=0.1, segments=14)
+    geom = meridian.segment_geometry()
+    S, H = _assemble_boundary_matrices(meridian, k, baffle_z=None, n_psi=96)
+
+    S_ref = np.empty_like(S)
+    H_ref = np.empty_like(H)
+    for i, target in enumerate(geom.midpoints):
+        for j in range(meridian.segment_count):
+            S_ref[i, j], H_ref[i, j] = _integrate_segment_kernel(
+                target_rho=float(target[0]),
+                target_z=float(target[1]),
+                meridian=meridian,
+                geom=geom,
+                source_index=j,
+                k=k,
+                baffle_z=None,
+                n_psi=96,
+                target_index=i,
+            )
+
+    np.testing.assert_allclose(S, S_ref, rtol=2e-13, atol=2e-14)
+    np.testing.assert_allclose(H, H_ref, rtol=2e-13, atol=2e-14)
 
 
 def test_pulsating_sphere_recovers_analytic_impedance_and_uniform_directivity():
@@ -270,6 +301,32 @@ def test_baffled_flat_piston_matches_airy_directivity_and_first_null():
     assert abs(null_angle - first_null) <= 1.0
 
 
+def test_baffled_flat_piston_surface_impedance_matches_analytic_value():
+    radius = 0.1
+    ka = np.array([2.0], dtype=np.float64)
+    config = SolveConfig(
+        velocity_sources={2: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        formulation="standard",
+        circsym_baffle_z=0.0,
+        observation=ObservationConfig(
+            distance_m=10.0,
+            angle_count=3,
+            planes=["horizontal"],
+            origin="throat",
+        ),
+    )
+
+    result = metal_bem.solve_circsym_frequencies(
+        _piston_meridian(radius=radius, segments=60),
+        [_freq_for_ka(float(ka[0]), radius)],
+        config,
+    )
+
+    z_norm = result.impedance / (config.air_density * SPEED_OF_SOUND)
+    np.testing.assert_allclose(z_norm, _baffled_piston_impedance(ka), rtol=3e-3, atol=3e-4)
+
+
 def test_circsym_default_complex_k_wiring_and_chief_tames_sphere_irregularity():
     radius = 0.1
     meridian = _sphere_meridian(radius=radius, segments=48)
@@ -310,3 +367,25 @@ def test_circsym_default_complex_k_wiring_and_chief_tames_sphere_irregularity():
     assert chief.native_diagnostics[0]["chief_points_count"] == 1
     assert chief_error < 0.01
     assert chief_error < 0.1 * standard_error
+
+
+def test_open_meridian_without_baffle_solves():
+    # An open meridian is valid: a bare (zero-wall) free-standing horn is a
+    # genuine open shell -- throat cap on the axis + inner wall radiating from an
+    # open mouth -- and matches the full-3D open shell. CircSym must solve it
+    # (the degenerate sealed-aperture case is the infinite-baffle image, blocked
+    # upstream in the mesher's build_meridian).
+    meridian = MeridianMesh.from_polyline(
+        np.array([[0.0, 0.0], [0.04, 0.03], [0.08, 0.06]], dtype=np.float64),
+        tags=2,
+    )
+    config = SolveConfig(
+        velocity_sources={2: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        formulation="standard",
+        observation=ObservationConfig(angle_count=3, planes=["horizontal"]),
+    )
+
+    result = metal_bem.solve_circsym_frequencies(meridian, [1000.0], config)
+    assert np.all(np.isfinite(result.pressure_complex))
+    assert np.any(np.abs(result.pressure_complex) > 0.0)

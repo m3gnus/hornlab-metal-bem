@@ -8,10 +8,12 @@ introduced, so axis nodes are regular for m=0.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 import logging
 import math
+import os
 import time
 from types import SimpleNamespace
 from typing import Iterable
@@ -218,6 +220,12 @@ def run_sweep_circsym(
             f"velocity_sources tags {missing_tags} are not present in the meridian; "
             f"available physical tags: {sorted(mesh_tags)}"
         )
+    # NOTE: an OPEN meridian (endpoints not both on the axis) is valid -- a bare
+    # (zero-wall-thickness) free-standing horn is a genuine open shell (throat cap
+    # + inner wall radiating from an open mouth), which matches the full-3D open
+    # shell it is compared against. The earlier "endpoints must close on the axis"
+    # guard wrongly rejected that common case. The degenerate sealed-aperture case
+    # is the infinite-baffle image, which is blocked upstream in build_meridian.
 
     t_total = time.time()
     geom = meridian.segment_geometry()
@@ -235,6 +243,7 @@ def run_sweep_circsym(
     rho_max = float(np.max(meridian.nodes[:, 0])) if meridian.nodes.size else 0.0
     mesh_max_segment = float(np.max(geom.lengths))
     impedance_source_tag = min(config.velocity_sources.keys(), default=2)
+    boundary_free_terms = _boundary_free_terms(meridian, config.circsym_baffle_z)
 
     pressure_rows: list[NDArray[np.complex128]] = []
     directivity_rows: list[NDArray[np.float64]] = []
@@ -274,7 +283,7 @@ def run_sweep_circsym(
             meridian, k, config.circsym_baffle_z, n_psi=n_psi
         )
         A = H.copy()
-        A[np.diag_indices_from(A)] -= 0.5
+        A[np.diag_indices_from(A)] -= boundary_free_terms
         if np.any(beta != 0.0):
             A -= S * (1j * k * beta)[None, :]
         rhs = S @ q_driver
@@ -285,6 +294,7 @@ def run_sweep_circsym(
         solve_rhs = rhs
         chief_residual_rel = None
         chief_rows_count = 0
+        dense_solve_rcond: float | None = None
         if config.chief_points is not None:
             chief_S, chief_H = _assemble_chief_matrices(
                 meridian,
@@ -307,8 +317,10 @@ def run_sweep_circsym(
             chief_residual_rel = float(np.linalg.norm(scale * chief_residual) / denom)
             lapack_info = 0
         else:
+            anorm = float(np.linalg.norm(solve_matrix, ord=1))
             lu, piv = linalg.lu_factor(solve_matrix)
             pressure = linalg.lu_solve((lu, piv), solve_rhs)
+            dense_solve_rcond = _rcond_from_lu_factor(lu, anorm)
             lapack_info = 0
         dense_solve_s = time.time() - t_solve
 
@@ -320,7 +332,7 @@ def run_sweep_circsym(
         # with frequency (e.g. ~-29 dB at 18 kHz over 2 m with shift 0.005). The
         # 3D solver likewise reconstructs the field at real k.
         k_field = complex(float(k.real), 0.0)
-        q_total = q_driver + 1j * k_field * beta * pressure
+        q_total = q_driver + 1j * k * beta * pressure
 
         t_field = time.time()
         field_pressure = _evaluate_observation_pressure(
@@ -372,7 +384,10 @@ def run_sweep_circsym(
                 if config.circsym_baffle_z is None
                 else float(config.circsym_baffle_z)
             ),
-            "dense_solve_rcond": float(1.0 / np.linalg.cond(A)),
+            "dense_solve_rcond": dense_solve_rcond,
+            "dense_solve_rcond_estimator": (
+                "lapack_gecon_1norm" if dense_solve_rcond is not None else None
+            ),
             "mesh_max_edge_m": mesh_max_segment,
             "mesh_elements_per_wavelength": SPEED_OF_SOUND
             / (frequency * mesh_max_segment)
@@ -747,21 +762,186 @@ def _assemble_boundary_matrices(
     n = meridian.segment_count
     S = np.empty((n, n), dtype=np.complex128)
     H = np.empty((n, n), dtype=np.complex128)
-    for i in range(n):
-        target = geom.midpoints[i]
-        for j in range(n):
-            S[i, j], H[i, j] = _integrate_segment_kernel(
-                target_rho=float(target[0]),
-                target_z=float(target[1]),
+    workers = _assembly_worker_count(n)
+    if workers <= 1:
+        for i in range(n):
+            _, S[i], H[i] = _assemble_boundary_row(
+                i,
                 meridian=meridian,
                 geom=geom,
-                source_index=j,
                 k=k,
                 baffle_z=baffle_z,
                 n_psi=n_psi,
-                target_index=i,
             )
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            rows = executor.map(
+                lambda i: _assemble_boundary_row(
+                    i,
+                    meridian=meridian,
+                    geom=geom,
+                    k=k,
+                    baffle_z=baffle_z,
+                    n_psi=n_psi,
+                ),
+                range(n),
+            )
+            for i, s_row, h_row in rows:
+                S[i] = s_row
+                H[i] = h_row
     return S, H
+
+
+def _assembly_worker_count(segment_count: int) -> int:
+    if int(segment_count) < 32:
+        return 1
+    raw = os.environ.get("HORNLAB_CIRCSYM_ASSEMBLY_THREADS")
+    if raw is not None:
+        try:
+            return max(1, min(int(segment_count), int(raw)))
+        except ValueError:
+            return 1
+    return max(1, min(int(segment_count), 8, os.cpu_count() or 1))
+
+
+def _assemble_boundary_row(
+    row_index: int,
+    *,
+    meridian: MeridianMesh,
+    geom: SimpleNamespace,
+    k: complex,
+    baffle_z: float | None,
+    n_psi: int,
+) -> tuple[int, NDArray[np.complex128], NDArray[np.complex128]]:
+    n = meridian.segment_count
+    target = geom.midpoints[int(row_index)]
+    s_row = np.empty(n, dtype=np.complex128)
+    h_row = np.empty(n, dtype=np.complex128)
+    far_mask = _ordinary_far_source_mask(target, geom, target_index=int(row_index))
+    far_indices = np.nonzero(far_mask)[0]
+    if far_indices.size:
+        s_row[far_indices], h_row[far_indices] = _integrate_ordinary_segment_kernels_batched(
+            target_rho=float(target[0]),
+            target_z=float(target[1]),
+            meridian=meridian,
+            geom=geom,
+            source_indices=far_indices,
+            k=k,
+            baffle_z=baffle_z,
+            n_psi=n_psi,
+        )
+    near_indices = np.nonzero(~far_mask)[0]
+    for j in near_indices:
+        s_row[j], h_row[j] = _integrate_segment_kernel(
+            target_rho=float(target[0]),
+            target_z=float(target[1]),
+            meridian=meridian,
+            geom=geom,
+            source_index=int(j),
+            k=k,
+            baffle_z=baffle_z,
+            n_psi=n_psi,
+            target_index=int(row_index),
+        )
+    return int(row_index), s_row, h_row
+
+
+def _ordinary_far_source_mask(
+    target: NDArray[np.float64],
+    geom: SimpleNamespace,
+    *,
+    target_index: int | None,
+) -> NDArray[np.bool_]:
+    target_arr = np.asarray(target, dtype=np.float64)
+    denom = np.maximum(geom.lengths * geom.lengths, 1.0e-30)
+    u_star = np.sum((target_arr[None, :] - geom.p0) * geom.delta, axis=1) / denom
+    u_clamped = np.clip(u_star, 0.0, 1.0)
+    closest = geom.p0 + u_clamped[:, None] * geom.delta
+    distance = np.linalg.norm(target_arr[None, :] - closest, axis=1)
+    far = distance > 1.25 * geom.lengths
+    if target_index is not None:
+        far[int(target_index)] = False
+    return far
+
+
+def _integrate_ordinary_segment_kernels_batched(
+    *,
+    target_rho: float,
+    target_z: float,
+    meridian: MeridianMesh,
+    geom: SimpleNamespace,
+    source_indices: NDArray[np.int64] | NDArray[np.int32],
+    k: complex,
+    baffle_z: float | None,
+    n_psi: int,
+) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    indices = np.asarray(source_indices, dtype=np.int64)
+    if indices.size == 0:
+        return (
+            np.empty(0, dtype=np.complex128),
+            np.empty(0, dtype=np.complex128),
+        )
+
+    u, w = _ordinary_interval(0.0, 1.0)
+    p0 = geom.p0[indices]
+    delta = geom.delta[indices]
+    lengths = geom.lengths[indices]
+    source = p0[:, None, :] + u[None, :, None] * delta[:, None, :]
+    rho_s = source[:, :, 0]
+    z_s = source[:, :, 1]
+    measure = rho_s * lengths[:, None] * w[None, :]
+    normal = meridian.normals[indices]
+    normal_rho = normal[:, 0:1]
+    normal_z = normal[:, 1:2]
+
+    g_static, h_static = _ring_static_kernel_m0_batched(
+        target_rho,
+        target_z,
+        rho_s,
+        z_s,
+        normal_rho,
+        normal_z,
+    )
+    g_rem, h_rem = _ring_remainder_kernel_m0_batched(
+        target_rho,
+        target_z,
+        rho_s,
+        z_s,
+        normal_rho,
+        normal_z,
+        k,
+        n_psi=n_psi,
+    )
+    g = g_static + g_rem
+    h = h_static + h_rem
+
+    if baffle_z is not None:
+        z_img = 2.0 * float(baffle_z) - z_s
+        g_static_i, h_static_i = _ring_static_kernel_m0_batched(
+            target_rho,
+            target_z,
+            rho_s,
+            z_img,
+            normal_rho,
+            -normal_z,
+        )
+        g_rem_i, h_rem_i = _ring_remainder_kernel_m0_batched(
+            target_rho,
+            target_z,
+            rho_s,
+            z_img,
+            normal_rho,
+            -normal_z,
+            k,
+            n_psi=n_psi,
+        )
+        g = g + g_static_i + g_rem_i
+        h = h + h_static_i + h_rem_i
+
+    return (
+        np.asarray(np.sum(g * measure, axis=1), dtype=np.complex128),
+        np.asarray(np.sum(h * measure, axis=1), dtype=np.complex128),
+    )
 
 
 def _assemble_chief_matrices(
@@ -897,6 +1077,40 @@ def _is_flat_baffled_sheet(meridian: MeridianMesh, baffle_z: float | None) -> bo
         np.abs(np.abs(normals[:, 1]) - 1.0) <= 1e-10
     )
     return bool(z_close and normal_close)
+
+
+def _boundary_free_terms(
+    meridian: MeridianMesh,
+    baffle_z: float | None,
+) -> NDArray[np.float64]:
+    terms = np.full(meridian.segment_count, 0.5, dtype=np.float64)
+    if _is_flat_baffled_sheet(meridian, baffle_z):
+        terms[:] = 1.0
+    return terms
+
+
+def _validate_closed_or_baffled_meridian(
+    meridian: MeridianMesh,
+    baffle_z: float | None,
+) -> None:
+    if baffle_z is not None:
+        return
+    endpoint_rho = np.asarray([meridian.nodes[0, 0], meridian.nodes[-1, 0]], dtype=np.float64)
+    if np.any(endpoint_rho > 1.0e-9):
+        raise ValueError(
+            "CircSym meridian endpoints must close on the symmetry axis when "
+            "circsym_baffle_z is not set; open meridians need an explicit baffle plane."
+        )
+
+
+def _rcond_from_lu_factor(lu: NDArray[np.complex128], anorm: float) -> float | None:
+    if not math.isfinite(float(anorm)) or float(anorm) <= 0.0:
+        return None
+    gecon = linalg.lapack.get_lapack_funcs("gecon", (lu,))
+    rcond, info = gecon(lu, float(anorm), norm="1")
+    if int(info) != 0:
+        return None
+    return float(rcond)
 
 
 def _surface_pressure_average(
@@ -1087,6 +1301,45 @@ def _ring_static_kernel_m0(
     return np.asarray(G, dtype=np.complex128), np.asarray(H, dtype=np.complex128)
 
 
+def _ring_static_kernel_m0_batched(
+    target_rho: float,
+    target_z: float,
+    source_rho: NDArray[np.float64],
+    source_z: NDArray[np.float64],
+    normal_rho: NDArray[np.float64],
+    normal_z: NDArray[np.float64],
+) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    rt = float(target_rho)
+    zt = float(target_z)
+    rs = np.asarray(source_rho, dtype=np.float64)
+    zs = np.asarray(source_z, dtype=np.float64)
+    n_rho = np.asarray(normal_rho, dtype=np.float64)
+    n_z = np.asarray(normal_z, dtype=np.float64)
+    D = (rt + rs) ** 2 + (zt - zs) ** 2
+    sqrtD = np.sqrt(D)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        m = np.where(D > 0.0, 4.0 * rt * rs / D, 0.0)
+    m = np.clip(m, 0.0, 1.0 - 1e-15)
+    K = ellipk(m)
+    E = ellipe(m)
+    G = K / (np.pi * sqrtD)
+
+    dKdm = _ellipk_derivative(m, K, E)
+    dD_dr = 2.0 * (rt + rs)
+    dD_dz = 2.0 * (zs - zt)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dm_dr = 4.0 * rt / D - (4.0 * rt * rs / (D * D)) * dD_dr
+        dm_dz = -(4.0 * rt * rs / (D * D)) * dD_dz
+        dF_dr = (
+            dKdm * dm_dr / sqrtD - 0.5 * K * dD_dr / (D * sqrtD)
+        ) / np.pi
+        dF_dz = (
+            dKdm * dm_dz / sqrtD - 0.5 * K * dD_dz / (D * sqrtD)
+        ) / np.pi
+    H = n_rho * dF_dr + n_z * dF_dz
+    return np.asarray(G, dtype=np.complex128), np.asarray(H, dtype=np.complex128)
+
+
 def _ellipk_derivative(
     m: NDArray[np.float64],
     K: NDArray[np.float64],
@@ -1095,7 +1348,7 @@ def _ellipk_derivative(
     m_arr = np.asarray(m, dtype=np.float64)
     out = np.empty_like(m_arr)
     small = m_arr < 1e-8
-    out[small] = (np.pi / 8.0) * (1.0 + 0.75 * m_arr[small])
+    out[small] = (np.pi / 8.0) * (1.0 + 1.125 * m_arr[small])
     regular = ~small
     out[regular] = (
         E[regular] - (1.0 - m_arr[regular]) * K[regular]
@@ -1157,6 +1410,56 @@ def _ring_remainder_kernel_m0(
     if np.ndim(source_rho) == 0:
         return G[0], H[0]
     return G, H
+
+
+def _ring_remainder_kernel_m0_batched(
+    target_rho: float,
+    target_z: float,
+    source_rho: NDArray[np.float64],
+    source_z: NDArray[np.float64],
+    normal_rho: NDArray[np.float64],
+    normal_z: NDArray[np.float64],
+    k: complex,
+    *,
+    n_psi: int,
+) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    rs = np.asarray(source_rho, dtype=np.float64)
+    zs = np.asarray(source_z, dtype=np.float64)
+    psi, weights = _leggauss_psi(int(n_psi))
+    cos_psi = np.cos(psi)[None, None, :]
+    rt = float(target_rho)
+    zt = float(target_z)
+    n_rho = np.asarray(normal_rho, dtype=np.float64)[:, :, None]
+    n_z = np.asarray(normal_z, dtype=np.float64)[:, :, None]
+
+    rs3 = rs[:, :, None]
+    dz = zs[:, :, None] - zt
+    R2 = rt * rt + rs3 * rs3 - 2.0 * rt * rs3 * cos_psi + dz * dz
+    R = np.sqrt(np.maximum(R2, 0.0))
+    q = complex(k) * R
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rem_g = np.expm1(1j * q) / (4.0 * np.pi * R)
+    rem_g = np.where(R > 1e-13, rem_g, 1j * complex(k) / (4.0 * np.pi))
+
+    num = (rs3 - rt * cos_psi) * n_rho + dz * n_z
+    expr = np.exp(1j * q) * (1j * q - 1.0) + 1.0
+    small = np.abs(q) < 1e-5
+    if np.any(small):
+        qs = q[small]
+        expr = expr.astype(np.complex128, copy=True)
+        expr[small] = (
+            -0.5 * qs * qs
+            - (1j / 3.0) * qs ** 3
+            + 0.125 * qs ** 4
+            + (1j / 30.0) * qs ** 5
+        )
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rem_h = expr * num / (4.0 * np.pi * R ** 3)
+    rem_h = np.where(R > 1e-13, rem_h, 0.0 + 0.0j)
+
+    G = 2.0 * np.sum(rem_g * weights[None, None, :], axis=2)
+    H = 2.0 * np.sum(rem_h * weights[None, None, :], axis=2)
+    return np.asarray(G, dtype=np.complex128), np.asarray(H, dtype=np.complex128)
 
 
 def ring_kernel_m0(
