@@ -6,7 +6,15 @@ from unittest.mock import MagicMock
 
 import numpy as np
 
-from hornlab_metal_bem.config import SolveConfig, SourceMotion, VelocityMode
+from hornlab_metal_bem.config import (
+    AnnularProfile,
+    CallableProfile,
+    PerFaceProfile,
+    SolveConfig,
+    SourceMotion,
+    TaperProfile,
+    VelocityMode,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +440,45 @@ def _two_face_cap_grid(theta_rad: float) -> SimpleNamespace:
     return SimpleNamespace(vertices=verts.T, elements=elements.T)
 
 
+def _flat_radial_source_grid(radii: list[float]) -> SimpleNamespace:
+    """Flat +z triangles whose centroids sit on the x-axis at ``radii``."""
+    eps = 0.01
+    verts = []
+    elements = []
+    for radius in radii:
+        base = len(verts)
+        r = float(radius)
+        verts.extend(
+            [
+                [r - eps, -eps, 0.0],
+                [r + eps, -eps, 0.0],
+                [r, 2.0 * eps, 0.0],
+            ]
+        )
+        elements.append([base, base + 1, base + 2])
+    return SimpleNamespace(
+        vertices=np.asarray(verts, dtype=np.float64).T,
+        elements=np.asarray(elements, dtype=np.int32).T,
+    )
+
+
+def _two_sided_diaphragm_grid() -> SimpleNamespace:
+    """Two equal-area faces with one normal +z and one normal -z."""
+    verts = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, -0.01],
+            [0.0, 1.0, -0.01],
+            [1.0, 0.0, -0.01],
+        ],
+        dtype=np.float64,
+    )
+    elements = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int32)
+    return SimpleNamespace(vertices=verts.T, elements=elements.T)
+
+
 class TestAxialFaceScale:
 
     AXIS = np.array([0.0, 0.0, 1.0])  # forward (throat->mouth) axis for the fixture
@@ -483,6 +530,174 @@ class TestAxialFaceScale:
         grid = _two_face_cap_grid(np.deg2rad(20.0))
         tags = np.array([2, 2], dtype=np.int32)
         assert _build_axial_face_scale(grid, tags, [2], np.zeros(3)) is None
+
+    def test_two_sided_tag_is_axial_dipole_path(self):
+        """Dipole path: one source tag covering both diaphragm sides under
+        source_motion='axial' preserves opposite front/back drive signs."""
+        from hornlab_metal_bem.bie import (
+            _build_driver_neumann_coeffs,
+            _build_source_face_scale,
+        )
+
+        grid = _two_sided_diaphragm_grid()
+        tags = np.array([2, 2], dtype=np.int32)
+        config = SolveConfig(
+            velocity_sources={2: 1.0},
+            velocity_mode=VelocityMode.VELOCITY,
+            source_motion=SourceMotion.AXIAL,
+        )
+
+        scale = _build_source_face_scale(grid, tags, config, self.AXIS, np.zeros(3))
+        np.testing.assert_allclose(scale, [1.0, -1.0], atol=1e-12)
+
+        coeffs = _build_driver_neumann_coeffs(
+            SimpleNamespace(global_dof_count=2),
+            tags,
+            2 * np.pi * 1000.0,
+            config,
+            np.complex128,
+            source_face_scale=scale,
+        )
+        np.testing.assert_allclose(coeffs[0], -coeffs[1], rtol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# General source velocity profiles: _build_source_face_scale
+# ---------------------------------------------------------------------------
+
+
+class TestSourceFaceScaleProfiles:
+
+    AXIS = np.array([0.0, 0.0, 1.0])
+    CENTER = np.array([0.0, 0.0, 0.0])
+
+    def test_default_normal_returns_none_for_scalar_path(self):
+        from hornlab_metal_bem.bie import (
+            _build_driver_neumann_coeffs,
+            _build_source_face_scale,
+        )
+
+        dp0_space = SimpleNamespace(global_dof_count=2)
+        grid = _two_face_cap_grid(0.0)
+        tags = np.array([2, 2], dtype=np.int32)
+        omega = 2 * np.pi * 1000.0
+        config = SolveConfig(velocity_sources={2: 1.0})
+
+        scale = _build_source_face_scale(grid, tags, config, self.AXIS, self.CENTER)
+        assert scale is None
+
+        direct = _build_driver_neumann_coeffs(
+            dp0_space, tags, omega, config, np.complex64
+        )
+        via_scale = _build_driver_neumann_coeffs(
+            dp0_space,
+            tags,
+            omega,
+            config,
+            np.complex64,
+            source_face_scale=scale,
+        )
+        assert np.array_equal(direct, via_scale)
+
+    def test_axial_source_motion_matches_legacy_helper(self):
+        from hornlab_metal_bem.bie import (
+            _build_axial_face_scale,
+            _build_source_face_scale,
+        )
+
+        theta = np.deg2rad(35.0)
+        grid = _two_face_cap_grid(theta)
+        tags = np.array([2, 2], dtype=np.int32)
+        config = SolveConfig(
+            velocity_sources={2: 1.0}, source_motion=SourceMotion.AXIAL
+        )
+
+        legacy = _build_axial_face_scale(grid, tags, [2], self.AXIS)
+        general = _build_source_face_scale(grid, tags, config, self.AXIS, self.CENTER)
+        assert np.array_equal(general, legacy)
+
+    def test_degenerate_axis_axial_matches_legacy_none(self):
+        from hornlab_metal_bem.bie import _build_source_face_scale
+
+        grid = _two_face_cap_grid(np.deg2rad(20.0))
+        tags = np.array([2, 2], dtype=np.int32)
+        config = SolveConfig(
+            velocity_sources={2: 1.0}, source_motion=SourceMotion.AXIAL
+        )
+
+        assert (
+            _build_source_face_scale(grid, tags, config, np.zeros(3), self.CENTER)
+            is None
+        )
+
+    def test_raised_cosine_taper_decreases_with_normalized_radius(self):
+        from hornlab_metal_bem.bie import _build_source_face_scale
+
+        grid = _flat_radial_source_grid([0.0, 0.5, 1.0])
+        tags = np.array([2, 2, 2], dtype=np.int32)
+        config = SolveConfig(
+            velocity_sources={2: 1.0},
+            source_velocity_profiles={2: TaperProfile(start=0.0)},
+        )
+
+        scale = _build_source_face_scale(grid, tags, config, self.AXIS, self.CENTER)
+        np.testing.assert_allclose(scale[0], 1.0, atol=1e-12)
+        assert scale[0] >= scale[1] >= scale[2]
+        np.testing.assert_allclose(scale[1], 0.5, atol=1e-12)
+        np.testing.assert_allclose(scale[2], 0.0, atol=1e-12)
+
+    def test_annular_profile_selects_normalized_radius_band(self):
+        from hornlab_metal_bem.bie import _build_source_face_scale
+
+        grid = _flat_radial_source_grid([0.1, 0.5, 0.9])
+        tags = np.array([2, 2, 2], dtype=np.int32)
+        config = SolveConfig(
+            velocity_sources={2: 1.0},
+            source_velocity_profiles={2: AnnularProfile(0.4, 0.7)},
+        )
+
+        scale = _build_source_face_scale(grid, tags, config, self.AXIS, self.CENTER)
+        np.testing.assert_allclose(scale, [0.0, 1.0, 0.0], atol=1e-12)
+
+    def test_per_face_profile_applies_in_physical_tag_face_order(self):
+        from hornlab_metal_bem.bie import _build_source_face_scale
+
+        grid = _flat_radial_source_grid([0.0, 1.0])
+        tags = np.array([2, 2], dtype=np.int32)
+        weights = np.array([1.0 + 0.5j, 0.25 - 0.25j], dtype=np.complex128)
+        config = SolveConfig(
+            velocity_sources={2: 1.0},
+            source_velocity_profiles={2: PerFaceProfile(weights)},
+        )
+
+        scale = _build_source_face_scale(grid, tags, config, self.AXIS, self.CENTER)
+        np.testing.assert_allclose(scale, weights, rtol=1e-12)
+
+    def test_callable_profile_receives_geometry_and_applies_weights(self):
+        from hornlab_metal_bem.bie import _build_source_face_scale
+
+        grid = _flat_radial_source_grid([0.0, 1.0])
+        tags = np.array([2, 2], dtype=np.int32)
+        seen = {}
+
+        def callback(centroids, normals, axis, source_center):
+            seen["centroids"] = centroids
+            seen["normals"] = normals
+            seen["axis"] = axis
+            seen["source_center"] = source_center
+            return np.array([0.75 + 0.25j, 0.25 + 0.0j], dtype=np.complex128)
+
+        config = SolveConfig(
+            velocity_sources={2: 1.0},
+            source_velocity_profiles={2: CallableProfile(callback)},
+        )
+
+        scale = _build_source_face_scale(grid, tags, config, self.AXIS, self.CENTER)
+        np.testing.assert_allclose(scale, [0.75 + 0.25j, 0.25 + 0.0j])
+        assert seen["centroids"].shape == (2, 3)
+        np.testing.assert_allclose(seen["normals"], [[0.0, 0.0, 1.0]] * 2)
+        np.testing.assert_allclose(seen["axis"], self.AXIS)
+        np.testing.assert_allclose(seen["source_center"], self.CENTER)
 
 
 # ---------------------------------------------------------------------------

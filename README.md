@@ -88,7 +88,13 @@ Common fields:
 - `source_motion`, either `SourceMotion.NORMAL` (default; uniform normal
   velocity, a breathing cap) or `SourceMotion.AXIAL` (rigid piston along the
   source axis, `v_n = weight * (n_hat . axis)` — the realistic wavefront for a
-  dome/cone/diaphragm; a flat disc reduces exactly to `NORMAL`)
+  dome/cone/diaphragm; a flat disc reduces exactly to `NORMAL`; one tag covering
+  both front/back faces of a thin diaphragm gives the dipole path because axial
+  preserves the opposite per-face signs)
+- `source_velocity_profiles`, optional per-tag overrides for `source_motion`:
+  `NormalProfile`, `AxialProfile`, `TaperProfile(kind="raised_cosine"|"linear",
+  start=0.7)`, `AnnularProfile(r_inner, r_outer)`, plus `PerFaceProfile(weights)`
+  and `CallableProfile(callback)` hooks for explicit/modal/measured maps
 - `observation`, an `ObservationConfig`
 - `mesh_scale`
 - `air_density`

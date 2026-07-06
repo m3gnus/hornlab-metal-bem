@@ -25,6 +25,11 @@ def test_public_namespace_exports_only_metal_bem_surface():
     assert "native_config" in hornlab_metal_bem.__all__
     assert "SolveConfig" in hornlab_metal_bem.__all__
     assert "SolveResult" in hornlab_metal_bem.__all__
+    assert "SourceProfile" in hornlab_metal_bem.__all__
+    assert "TaperProfile" in hornlab_metal_bem.__all__
+    assert "AnnularProfile" in hornlab_metal_bem.__all__
+    assert "PerFaceProfile" in hornlab_metal_bem.__all__
+    assert "CallableProfile" in hornlab_metal_bem.__all__
 
     assert "BIEFormulation" not in hornlab_metal_bem.__all__
     assert "LinearSolver" not in hornlab_metal_bem.__all__

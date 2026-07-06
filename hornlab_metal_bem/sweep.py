@@ -15,8 +15,8 @@ from numpy.typing import NDArray
 from ._constants import REFERENCE_PRESSURE, SPEED_OF_SOUND
 from .backends import AssemblyBackendUnavailable
 from .bie import (
-    _build_axial_face_scale,
     _build_driver_neumann_coeffs,
+    _build_source_face_scale,
     _compute_impedance,
     compute_surface_pressure_avg,
 )
@@ -24,7 +24,6 @@ from .config import (
     BIEFormulation,
     NATIVE_SYMMETRY_PLANES,
     SolveConfig,
-    SourceMotion,
 )
 from .mesh import LoadedMesh, make_pure_function_spaces
 from .observation import ObservationFrame, build_observation_points
@@ -243,6 +242,7 @@ def _build_neumann_rows(
     config: SolveConfig,
     impedance_sources: list[dict[int, complex]] | dict[int, complex],
     axial_face_scale: NDArray[np.float64] | None = None,
+    source_face_scale: NDArray | None = None,
 ) -> NDArray[np.complex64]:
     """Stack per-frequency Neumann RHS rows.
 
@@ -253,11 +253,17 @@ def _build_neumann_rows(
     re-evaluated inside ``bie`` and the skipped tags cannot diverge from the
     Robin tags the solver applies.
 
-    ``axial_face_scale`` is the frequency-independent per-face piston projection
-    (``config.source_motion == "axial"``); ``None`` keeps the uniform-normal BC.
-    It is geometry-only, so the caller builds it once and reuses it for every
+    ``source_face_scale`` is the frequency-independent per-face source profile
+    multiplier. ``axial_face_scale`` is kept as a back-compat alias for the
+    original piston projection. ``None`` keeps the uniform-normal BC. The scale
+    is geometry-only, so the caller builds it once and reuses it for every
     frequency row here.
     """
+    if source_face_scale is not None:
+        if axial_face_scale is not None:
+            raise ValueError("pass only one of source_face_scale or axial_face_scale")
+        axial_face_scale = source_face_scale
+
     per_case_list = isinstance(impedance_sources, list)
     rows = []
     for idx, freq in enumerate(frequencies):
@@ -273,7 +279,7 @@ def _build_neumann_rows(
                 config,
                 np.complex64,
                 impedance_tags=impedance_tags,
-                axial_face_scale=axial_face_scale,
+                source_face_scale=axial_face_scale,
             )
         )
     return np.stack(rows, axis=0)
@@ -653,16 +659,15 @@ def run_sweep_native_metal(
     mesh_max_edge_m = _mesh_max_edge_m(mesh)
 
     source_tags = list(config.velocity_sources.keys())
-    # Rigid-axial (piston) per-face projection onto the frame's forward axis,
-    # built once (geometry-only) and reused for every frequency row. The frame
-    # axis is symmetry-projected, so reduced (half/quarter) caps stay on-axis.
-    # None keeps the uniform-normal BC.
-    axial_face_scale = (
-        _build_axial_face_scale(
-            mesh.grid, mesh.physical_tags, source_tags, frame.axis
-        )
-        if config.source_motion == SourceMotion.AXIAL
-        else None
+    # Per-face source profile multiplier, built once (geometry-only) and reused
+    # for every frequency row. The frame axis is symmetry-projected, so reduced
+    # (half/quarter) caps stay on-axis. None keeps the uniform-normal BC.
+    source_face_scale = _build_source_face_scale(
+        mesh.grid,
+        mesh.physical_tags,
+        config,
+        frame.axis,
+        frame.source_center,
     )
     # Per-frequency beta dicts when impedance_source_callback is set, else a
     # single static dict. Computed once here (before the streaming/non-streaming
@@ -716,7 +721,7 @@ def run_sweep_native_metal(
                 freq_values,
                 config,
                 impedance_sources_arg,
-                axial_face_scale=axial_face_scale,
+                source_face_scale=source_face_scale,
             )
 
             logger.info(
@@ -799,7 +804,7 @@ def run_sweep_native_metal(
                 freq_values,
                 config,
                 impedance_sources_arg,
-                axial_face_scale=axial_face_scale,
+                source_face_scale=source_face_scale,
             )
             logger.info(
                 "Running %d-frequency native Metal streamed assembly/solve/field batch.",
@@ -1028,14 +1033,18 @@ def run_sweep_native_metal_multi_source(
     # velocity), which is exactly the cross-term data an aperture radiation
     # matrix needs.
     source_tags = sorted({int(tag) for source in sources for tag in source})
-    # Rigid-axial (piston) per-face projection over the union of source tags onto
-    # the shared frame forward axis (geometry-only). None keeps uniform-normal.
-    axial_face_scale = (
-        _build_axial_face_scale(
-            mesh.grid, mesh.physical_tags, source_tags, frame.axis
-        )
-        if config.source_motion == SourceMotion.AXIAL
-        else None
+    # Per-face source profile multiplier over the union of source tags, built
+    # once (geometry-only) on the shared frame. None keeps uniform-normal.
+    scale_config = replace(
+        config,
+        velocity_sources={tag: 1.0 for tag in source_tags},
+    )
+    source_face_scale = _build_source_face_scale(
+        mesh.grid,
+        mesh.physical_tags,
+        scale_config,
+        frame.axis,
+        frame.source_center,
     )
     impedance_source_tags = [
         min(source.keys(), default=2) for source in sources
@@ -1084,7 +1093,7 @@ def run_sweep_native_metal_multi_source(
             freq_values,
             source_config,
             impedance_sources_arg,
-            axial_face_scale=axial_face_scale,
+            source_face_scale=source_face_scale,
         )
         for source_config in per_source_configs
     ]

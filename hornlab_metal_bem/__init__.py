@@ -5,7 +5,19 @@ from dataclasses import replace as _replace
 
 import numpy as np
 
-from .config import ObservationConfig, SolveConfig, SourceMotion, VelocityMode
+from .config import (
+    AnnularProfile,
+    AxialProfile,
+    CallableProfile,
+    NormalProfile,
+    ObservationConfig,
+    PerFaceProfile,
+    SolveConfig,
+    SourceMotion,
+    SourceProfile,
+    TaperProfile,
+    VelocityMode,
+)
 from .mesh import LoadedMesh, MeshError, load_mesh
 from .observation import ObservationFrame, infer_frame
 from .result import MeshInfo, SolveResult
@@ -21,6 +33,13 @@ __all__ = [
     "ObservationConfig",
     "VelocityMode",
     "SourceMotion",
+    "SourceProfile",
+    "NormalProfile",
+    "AxialProfile",
+    "TaperProfile",
+    "AnnularProfile",
+    "PerFaceProfile",
+    "CallableProfile",
     "LoadedMesh",
     "MeshInfo",
     "MeshError",

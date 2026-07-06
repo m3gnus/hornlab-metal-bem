@@ -9,7 +9,15 @@ from hornlab_metal_bem.backends import (
     resolve_assembly_backend,
 )
 import hornlab_metal_bem.backends as backends
-from hornlab_metal_bem.config import BIEFormulation, ObservationConfig, SolveConfig
+from hornlab_metal_bem.config import (
+    AnnularProfile,
+    CallableProfile,
+    PerFaceProfile,
+    BIEFormulation,
+    ObservationConfig,
+    SolveConfig,
+    TaperProfile,
+)
 from hornlab_metal_bem.sweep import should_route_native_metal
 
 
@@ -87,6 +95,49 @@ def test_solve_config_accepts_axial_source_motion():
 def test_solve_config_rejects_unknown_source_motion():
     with pytest.raises(ValueError, match="source_motion"):
         SolveConfig(source_motion="radial")  # type: ignore[arg-type]
+
+
+def test_solve_config_source_velocity_profiles_default_none():
+    assert SolveConfig().source_velocity_profiles is None
+
+
+def test_solve_config_accepts_source_velocity_profiles():
+    import numpy as np
+
+    cfg = SolveConfig(
+        source_velocity_profiles={
+            2: TaperProfile(kind="linear", start=0.25),
+            3: AnnularProfile(0.2, 0.8),
+            4: PerFaceProfile(np.array([1.0 + 0.0j])),
+            5: CallableProfile(lambda centroids, normals, axis, center: [1.0]),
+        }
+    )
+
+    assert isinstance(cfg.source_velocity_profiles[2], TaperProfile)
+    assert isinstance(cfg.source_velocity_profiles[3], AnnularProfile)
+    assert isinstance(cfg.source_velocity_profiles[4], PerFaceProfile)
+    assert isinstance(cfg.source_velocity_profiles[5], CallableProfile)
+
+
+@pytest.mark.parametrize(
+    ("profiles", "match"),
+    [
+        ({-1: TaperProfile()}, "source_velocity_profiles tags"),
+        ({2: "raised_cosine"}, "SourceProfile"),
+        ({2: TaperProfile(kind="hann")}, "TaperProfile.kind"),
+        ({2: TaperProfile(start=-0.1)}, "TaperProfile.start"),
+        ({2: TaperProfile(start=1.0)}, "TaperProfile.start"),
+        ({2: AnnularProfile(-0.1, 0.5)}, "AnnularProfile"),
+        ({2: AnnularProfile(0.7, 0.5)}, "AnnularProfile"),
+        ({2: AnnularProfile(0.0, 1.1)}, "AnnularProfile"),
+        ({2: PerFaceProfile([[1.0, 1.0]])}, "PerFaceProfile.weights"),
+        ({2: PerFaceProfile([complex(float("nan"), 0.0)])}, "finite"),
+        ({2: CallableProfile(None)}, "CallableProfile.callback"),
+    ],
+)
+def test_solve_config_rejects_invalid_source_velocity_profiles(profiles, match):
+    with pytest.raises(ValueError, match=match):
+        SolveConfig(source_velocity_profiles=profiles)
 
 
 def test_solve_config_accepts_experimental_complex_k_and_robin():

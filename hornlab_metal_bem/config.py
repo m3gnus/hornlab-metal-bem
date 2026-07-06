@@ -32,6 +32,60 @@ class SourceMotion:
     AXIAL = "axial"
 
 
+@dataclass(frozen=True)
+class NormalProfile:
+    """Uniform normal source velocity on every face of a source tag."""
+
+
+@dataclass(frozen=True)
+class AxialProfile:
+    """Rigid piston source velocity: ``v_n = U * (n_hat . axis)``."""
+
+
+@dataclass(frozen=True)
+class TaperProfile:
+    """Axial piston velocity with a radial edge taper.
+
+    ``start`` is the normalized radius below which the multiplier is 1.0.
+    From ``start`` to the tag's outer radius, the selected taper falls to 0.0.
+    """
+
+    kind: Literal["raised_cosine", "linear"] = "raised_cosine"
+    start: float = 0.7
+
+
+@dataclass(frozen=True)
+class AnnularProfile:
+    """Axial piston velocity limited to a normalized radial ring."""
+
+    r_inner: float
+    r_outer: float
+
+
+@dataclass(frozen=True)
+class PerFaceProfile:
+    """Explicit per-face source multiplier in physical-tag face order."""
+
+    weights: object
+
+
+@dataclass(frozen=True)
+class CallableProfile:
+    """Callable source multiplier hook for measured/modal maps."""
+
+    callback: Callable[[object, object, object, object], object]
+
+
+SourceProfile = (
+    NormalProfile
+    | AxialProfile
+    | TaperProfile
+    | AnnularProfile
+    | PerFaceProfile
+    | CallableProfile
+)
+
+
 class BIEFormulation:
     STANDARD = "standard"
     COMPLEX_K = "complex_k"
@@ -108,6 +162,10 @@ class SolveConfig:
     # normal velocity is U*(n_hat . axis). See SourceMotion. Default "normal"
     # leaves every existing solve bit-for-bit unchanged.
     source_motion: Literal["normal", "axial"] = SourceMotion.NORMAL
+    # Optional per-physical-tag source velocity profiles. A configured tag
+    # overrides source_motion for that tag; tags with no profile fall back to
+    # source_motion. None leaves historical normal/axial behavior unchanged.
+    source_velocity_profiles: dict[int, SourceProfile] | None = None
     velocity_sources: dict[int, float] = field(
         default_factory=lambda: {2: 1.0}
     )
@@ -245,6 +303,16 @@ class SolveConfig:
             raise ValueError("velocity_mode must be 'velocity' or 'acceleration'")
         if self.source_motion not in {SourceMotion.NORMAL, SourceMotion.AXIAL}:
             raise ValueError("source_motion must be 'normal' or 'axial'")
+        if self.source_velocity_profiles is not None:
+            if not isinstance(self.source_velocity_profiles, dict):
+                raise ValueError("source_velocity_profiles must be a dict or None")
+            for tag, profile in self.source_velocity_profiles.items():
+                tag_int = int(tag)
+                if tag_int < 0:
+                    raise ValueError(
+                        "source_velocity_profiles tags must be non-negative integers"
+                    )
+                _validate_source_profile(profile)
         for tag, beta in self.impedance_sources.items():
             if int(tag) < 0:
                 raise ValueError("impedance_sources tags must be non-negative integers")
@@ -296,3 +364,50 @@ class SolveConfig:
             value = getattr(self, name)
             if value is not None and value <= 0:
                 raise ValueError(f"{name} must be positive")
+
+
+def _validate_source_profile(profile: SourceProfile) -> None:
+    if isinstance(profile, (NormalProfile, AxialProfile)):
+        return
+    if isinstance(profile, TaperProfile):
+        if profile.kind not in {"raised_cosine", "linear"}:
+            raise ValueError(
+                "TaperProfile.kind must be 'raised_cosine' or 'linear'"
+            )
+        if not (math.isfinite(profile.start) and 0.0 <= profile.start < 1.0):
+            raise ValueError("TaperProfile.start must be finite and in [0, 1)")
+        return
+    if isinstance(profile, AnnularProfile):
+        if not (
+            math.isfinite(profile.r_inner)
+            and math.isfinite(profile.r_outer)
+            and 0.0 <= profile.r_inner <= profile.r_outer <= 1.0
+        ):
+            raise ValueError(
+                "AnnularProfile radii must be finite with "
+                "0 <= r_inner <= r_outer <= 1"
+            )
+        return
+    if isinstance(profile, PerFaceProfile):
+        import numpy as _np
+
+        try:
+            values = _np.asarray(profile.weights, dtype=_np.complex128)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "PerFaceProfile.weights must be convertible to a complex array"
+            ) from exc
+        if values.ndim != 1 or values.size == 0:
+            raise ValueError(
+                "PerFaceProfile.weights must be a non-empty 1D array"
+            )
+        if not _np.all(_np.isfinite(values)):
+            raise ValueError("PerFaceProfile.weights must be finite")
+        return
+    if isinstance(profile, CallableProfile):
+        if not callable(profile.callback):
+            raise ValueError("CallableProfile.callback must be callable")
+        return
+    raise ValueError(
+        "source_velocity_profiles values must be SourceProfile instances"
+    )
