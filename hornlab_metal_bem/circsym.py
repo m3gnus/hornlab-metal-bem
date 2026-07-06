@@ -312,7 +312,15 @@ def run_sweep_circsym(
             lapack_info = 0
         dense_solve_s = time.time() - t_solve
 
-        q_total = q_driver + 1j * k * beta * pressure
+        # Evaluate the radiated field at the observation points with the
+        # PHYSICAL (real) wavenumber. The complex-k shift regularizes the surface
+        # BIE (fictitious-eigenfrequency avoidance) but must NOT attenuate the
+        # free-field propagation to the mic: with k complex, the exp(-Im(k)*r)
+        # term over-damps the response over the observation distance and grows
+        # with frequency (e.g. ~-29 dB at 18 kHz over 2 m with shift 0.005). The
+        # 3D solver likewise reconstructs the field at real k.
+        k_field = complex(float(k.real), 0.0)
+        q_total = q_driver + 1j * k_field * beta * pressure
 
         t_field = time.time()
         field_pressure = _evaluate_observation_pressure(
@@ -320,7 +328,7 @@ def run_sweep_circsym(
             pressure,
             q_total,
             obs_points,
-            k,
+            k_field,
             config,
             n_psi=n_psi,
         )
@@ -330,7 +338,7 @@ def run_sweep_circsym(
                 pressure,
                 q_total,
                 np.asarray(config.observation.sphere_points, dtype=np.float64),
-                k,
+                k_field,
                 config.circsym_baffle_z,
                 n_psi=n_psi,
             )
