@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
+from numbers import Integral
 from typing import TYPE_CHECKING, Callable, Literal
 
 if TYPE_CHECKING:
@@ -219,6 +220,10 @@ class SolveConfig:
     # z-coordinate enables a same-sign rigid/Neumann image source plane for
     # body-of-revolution m=0 solves.
     circsym_baffle_z: float | None = None
+    # Axisymmetric exact infinite-baffle coupled solve. Names the meridian
+    # segment tag that represents the flush mouth-aperture disc; None keeps the
+    # existing CircSym path unchanged.
+    circsym_aperture_tag: int | None = None
 
     # Observation
     observation: ObservationConfig = field(default_factory=ObservationConfig)
@@ -340,6 +345,15 @@ class SolveConfig:
             float(self.circsym_baffle_z)
         ):
             raise ValueError("circsym_baffle_z must be finite or None")
+        if self.circsym_aperture_tag is not None:
+            if (
+                isinstance(self.circsym_aperture_tag, bool)
+                or not isinstance(self.circsym_aperture_tag, Integral)
+                or self.circsym_aperture_tag <= 0
+            ):
+                raise ValueError(
+                    "circsym_aperture_tag must be a positive int or None"
+                )
         if (
             self.native_symmetry_plane is not None
             and self.native_symmetry_plane not in NATIVE_SYMMETRY_PLANES

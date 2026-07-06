@@ -207,6 +207,10 @@ def run_sweep_circsym(
     """
     if not isinstance(meridian, MeridianMesh):
         raise TypeError("meridian must be a MeridianMesh")
+    if config.circsym_aperture_tag is not None and int(
+        config.circsym_aperture_tag
+    ) in {int(tag) for tag in np.unique(meridian.physical_tags)}:
+        return run_sweep_coupled_ib(meridian, frequencies, config)
     frequencies_arr = np.asarray(frequencies, dtype=np.float64).reshape(-1)
     if frequencies_arr.size == 0:
         raise ValueError("frequencies must contain at least one value")
@@ -435,6 +439,337 @@ def run_sweep_circsym(
         int(tag): np.asarray(values, dtype=np.complex128)
         for tag, values in surface_pavg.items()
     }
+    timings = {
+        "solve_s": sum(float(entry["timing_s"]) for entry in solver_log),
+        "assembly_s": sum(float(entry["assembly_s"]) for entry in solver_log),
+        "dense_solve_s": sum(float(entry["dense_solve_s"]) for entry in solver_log),
+        "directivity_s": sum(float(entry["field_s"]) for entry in solver_log),
+        "total_s": time.time() - t_total,
+    }
+
+    return SolveResult(
+        frequencies_hz=np.asarray(completed_freqs, dtype=np.float64),
+        pressure_complex=np.stack(pressure_rows, axis=0),
+        directivity_db=np.stack(directivity_rows, axis=0),
+        impedance=np.asarray(impedance_rows, dtype=np.complex128),
+        observation_angles_deg=angles_deg,
+        observation_points=obs_points,
+        observation_planes=list(config.observation.planes),
+        config=config,
+        mesh_info=_mesh_info(meridian),
+        timings=timings,
+        solver_log=solver_log,
+        surface_pressure_avg=sp_avg if sp_avg else None,
+        surface_pressure_complex=(
+            np.stack(surface_pressure_rows, axis=0)
+            if surface_pressure_rows is not None
+            else None
+        ),
+        native_diagnostics=native_diagnostics,
+    )
+
+
+def run_sweep_coupled_ib(
+    meridian: MeridianMesh,
+    frequencies: NDArray[np.float64] | Iterable[float],
+    config: SolveConfig,
+) -> SolveResult:
+    """Run the exact coupled interior/Rayleigh infinite-baffle CircSym sweep."""
+    if not isinstance(meridian, MeridianMesh):
+        raise TypeError("meridian must be a MeridianMesh")
+    if config.circsym_aperture_tag is None:
+        raise ValueError("circsym_aperture_tag must be set for coupled IB solves")
+
+    frequencies_arr = np.asarray(frequencies, dtype=np.float64).reshape(-1)
+    if frequencies_arr.size == 0:
+        raise ValueError("frequencies must contain at least one value")
+    if not np.all(np.isfinite(frequencies_arr)) or np.any(frequencies_arr <= 0.0):
+        raise ValueError("frequencies must be finite and positive")
+
+    tags = meridian.physical_tags
+    aperture_tag = int(config.circsym_aperture_tag)
+    mesh_tags = {int(tag) for tag in np.unique(tags)}
+    if aperture_tag not in mesh_tags:
+        raise ValueError(
+            f"circsym_aperture_tag {aperture_tag} is not present in the meridian; "
+            f"available physical tags: {sorted(mesh_tags)}"
+        )
+
+    source_tags = [int(tag) for tag in config.velocity_sources]
+    missing_tags = sorted(set(source_tags) - mesh_tags)
+    if missing_tags:
+        raise ValueError(
+            f"velocity_sources tags {missing_tags} are not present in the meridian; "
+            f"available physical tags: {sorted(mesh_tags)}"
+        )
+    if aperture_tag in set(source_tags):
+        raise ValueError(
+            "circsym_aperture_tag must not also be listed in velocity_sources"
+        )
+
+    t_total = time.time()
+    geom = meridian.segment_geometry()
+    frame = _infer_circsym_frame(meridian, config)
+    source_scale = _build_source_segment_scale(meridian, config, frame)
+
+    idx_a = np.where(tags == aperture_tag)[0]
+    n = meridian.segment_count
+    m = int(idx_a.size)
+    if m == 0:
+        raise ValueError("circsym_aperture_tag must select at least one segment")
+
+    idx_t = np.where(np.isin(tags, source_tags))[0]
+    if idx_t.size == 0:
+        raise ValueError("velocity_sources must select at least one throat segment")
+    throat_weights = geom.area_weights[idx_t]
+    throat_area = float(np.sum(throat_weights))
+    if throat_area <= 1e-30:
+        raise ValueError("velocity_sources throat area must be positive")
+
+    if config.observation.custom_points is not None:
+        angles_deg = np.linspace(
+            config.observation.angle_min_deg,
+            config.observation.angle_max_deg,
+            config.observation.angle_count,
+        )
+        plane_points = []
+        for plane in config.observation.planes:
+            if plane not in config.observation.custom_points:
+                raise ValueError(
+                    f"custom_points missing plane {plane!r}; "
+                    f"available: {list(config.observation.custom_points.keys())}"
+                )
+            pts = np.asarray(
+                config.observation.custom_points[plane],
+                dtype=np.float64,
+            )
+            if pts.ndim != 2 or pts.shape[1] != 3:
+                raise ValueError(
+                    f"custom_points[{plane!r}] must be (N, 3), got {pts.shape}"
+                )
+            plane_points.append(pts)
+        counts = [points.shape[0] for points in plane_points]
+        if len(set(counts)) > 1:
+            raise ValueError(
+                "All custom_points planes must have the same number of "
+                f"points, got {dict(zip(config.observation.planes, counts))}"
+            )
+        if counts[0] != config.observation.angle_count:
+            angles_deg = np.linspace(
+                config.observation.angle_min_deg,
+                config.observation.angle_max_deg,
+                counts[0],
+            )
+        obs_points = np.stack(plane_points, axis=0)
+    else:
+        angles_deg = np.linspace(
+            config.observation.angle_min_deg,
+            config.observation.angle_max_deg,
+            config.observation.angle_count,
+        )
+        angles_rad = np.deg2rad(angles_deg)
+        radius = float(config.observation.distance_m)
+        transverse = radius * np.sin(angles_rad)
+        axial = radius * np.cos(angles_rad)
+        zeros = np.zeros_like(transverse)
+
+        plane_points = []
+        for plane in config.observation.planes:
+            if plane == "horizontal":
+                pts = np.column_stack([transverse, zeros, axial])
+            elif plane == "vertical":
+                pts = np.column_stack([zeros, transverse, axial])
+            elif plane == "diagonal":
+                diagonal = transverse / np.sqrt(2.0)
+                pts = np.column_stack([diagonal, diagonal, axial])
+            else:
+                raise ValueError(f"Unknown plane: {plane!r}")
+            plane_points.append(pts)
+        obs_points = np.stack(plane_points, axis=0)
+
+    n_planes, n_angles, _ = obs_points.shape
+    on_axis_idx = int(np.argmin(np.abs(angles_deg)))
+
+    pressure_rows: list[NDArray[np.complex128]] = []
+    directivity_rows: list[NDArray[np.float64]] = []
+    impedance_rows: list[complex] = []
+    solver_log: list[dict] = []
+    completed_freqs: list[float] = []
+    native_diagnostics: list[dict] = []
+    surface_pressure_rows: list[NDArray[np.complex128]] | None = (
+        [] if config.return_surface_pressure else None
+    )
+    surface_pavg: dict[int, list[complex]] | None = (
+        {int(tag): [] for tag in source_tags}
+        if config.return_surface_pressure
+        else None
+    )
+
+    for freq_index, frequency_hz in enumerate(frequencies_arr):
+        frequency = float(frequency_hz)
+        t_case = time.time()
+        omega = 2.0 * np.pi * frequency
+        k = complex(omega / SPEED_OF_SOUND, 0.0)
+        rho_max = float(np.max(meridian.nodes[:, 0]))
+        n_psi = _azimuth_order(k, rho_max)
+
+        t_assembly = time.time()
+        S, H = _assemble_boundary_matrices(meridian, k, None, n_psi=n_psi)
+        q_driver = _build_driver_neumann_segments(
+            meridian,
+            omega,
+            frequency,
+            config,
+            impedance_tags=set(),
+            source_scale=source_scale,
+        )
+        if np.any(q_driver[idx_a] != 0.0):
+            raise ValueError(
+                "circsym_aperture_tag must not be driven by velocity_sources"
+            )
+        free = _boundary_free_terms(meridian, None)
+
+        A = np.zeros((n + m, n + m), dtype=np.complex128)
+        b = np.zeros(n + m, dtype=np.complex128)
+        A[:n, :n] = H
+        A[np.arange(n), np.arange(n)] -= free
+        A[:n, n:] = -S[:, idx_a]
+        b[:n] = S @ q_driver
+        A[n + np.arange(m), idx_a] = 1.0
+        A[n:, n:] = -2.0 * S[np.ix_(idx_a, idx_a)]
+        assembly_s = time.time() - t_assembly
+
+        t_solve = time.time()
+        anorm = float(np.linalg.norm(A, ord=1))
+        lu, piv = linalg.lu_factor(A)
+        x = linalg.lu_solve((lu, piv), b)
+        dense_solve_rcond = _rcond_from_lu_factor(lu, anorm)
+        dense_solve_s = time.time() - t_solve
+
+        p_srf = np.asarray(x[:n], dtype=np.complex128)
+        q_a = np.asarray(x[n:], dtype=np.complex128)
+
+        t_field = time.time()
+        flat_obs = obs_points.reshape(-1, 3)
+        flat_pressure = np.zeros(flat_obs.shape[0], dtype=np.complex128)
+        for point_index, point in enumerate(flat_obs):
+            target_z = float(point[2])
+            if target_z < 0.0:
+                continue
+            target_rho = float(math.hypot(float(point[0]), float(point[1])))
+            val = 0.0 + 0.0j
+            for aperture_local, aperture_index in enumerate(idx_a):
+                s_val, _ = _integrate_segment_kernel(
+                    target_rho=target_rho,
+                    target_z=target_z,
+                    meridian=meridian,
+                    geom=geom,
+                    source_index=int(aperture_index),
+                    k=k,
+                    baffle_z=None,
+                    n_psi=n_psi,
+                    target_index=None,
+                )
+                val += 2.0 * s_val * q_a[aperture_local]
+            flat_pressure[point_index] = val
+        field_pressure = flat_pressure.reshape(n_planes, n_angles)
+
+        sphere_pressure = None
+        if config.observation.sphere_points is not None:
+            sphere_points = np.asarray(
+                config.observation.sphere_points,
+                dtype=np.float64,
+            )
+            sphere_pressure = np.zeros(sphere_points.shape[0], dtype=np.complex128)
+            for point_index, point in enumerate(sphere_points):
+                target_z = float(point[2])
+                if target_z < 0.0:
+                    continue
+                target_rho = float(math.hypot(float(point[0]), float(point[1])))
+                val = 0.0 + 0.0j
+                for aperture_local, aperture_index in enumerate(idx_a):
+                    s_val, _ = _integrate_segment_kernel(
+                        target_rho=target_rho,
+                        target_z=target_z,
+                        meridian=meridian,
+                        geom=geom,
+                        source_index=int(aperture_index),
+                        k=k,
+                        baffle_z=None,
+                        n_psi=n_psi,
+                        target_index=None,
+                    )
+                    val += 2.0 * s_val * q_a[aperture_local]
+                sphere_pressure[point_index] = val
+        field_s = time.time() - t_field
+
+        directivity = _directivity_from_pressure(field_pressure, on_axis_idx)
+        impedance = complex(np.sum(p_srf[idx_t] * throat_weights) / throat_area)
+
+        pressure_rows.append(field_pressure)
+        directivity_rows.append(directivity)
+        impedance_rows.append(impedance)
+        completed_freqs.append(frequency)
+        if surface_pressure_rows is not None:
+            surface_pressure_rows.append(p_srf)
+        if surface_pavg is not None:
+            pavg = _surface_pressure_average(meridian, p_srf, source_tags)
+            for tag in source_tags:
+                surface_pavg[int(tag)].append(pavg[int(tag)])
+
+        diagnostics = {
+            "circsym": True,
+            "coupled_ib": True,
+            "m_mode": 0,
+            "aperture_tag": int(aperture_tag),
+            "aperture_segments": int(m),
+            "azimuth_quadrature_points": int(n_psi),
+            "dense_solve_rcond": dense_solve_rcond,
+            "dense_solve_rcond_estimator": "lapack_gecon_1norm",
+        }
+        native_diagnostics.append(diagnostics)
+
+        timing_s = time.time() - t_case
+        log_entry = {
+            "frequency_hz": frequency,
+            "iterations": None,
+            "timing_s": timing_s,
+            "backend": "circsym_python_dp0_m0_coupled_ib",
+            "assembly_s": assembly_s,
+            "dense_solve_s": dense_solve_s,
+            "field_s": field_s,
+            "lapack_info": 0,
+            "impedance": impedance,
+            "native_diagnostics": diagnostics,
+            "observation_sphere_pressure_complex": sphere_pressure,
+        }
+        solver_log.append(log_entry)
+
+        if config.progress_callback is not None:
+            config.progress_callback(freq_index, len(frequencies_arr), frequency)
+        if config.on_frequency_result is not None:
+            callback_entry = {
+                **log_entry,
+                "observation_pressure_complex": field_pressure,
+                "observation_directivity_db": directivity,
+                "observation_angles_deg": angles_deg,
+                "observation_planes": config.observation.planes,
+            }
+            if (
+                config.on_frequency_result(freq_index, frequency, callback_entry)
+                is False
+            ):
+                logger.info("Early stop requested after %.1f Hz", frequency)
+                break
+
+    sp_avg = (
+        {
+            int(tag): np.asarray(values, dtype=np.complex128)
+            for tag, values in surface_pavg.items()
+        }
+        if surface_pavg is not None
+        else None
+    )
     timings = {
         "solve_s": sum(float(entry["timing_s"]) for entry in solver_log),
         "assembly_s": sum(float(entry["assembly_s"]) for entry in solver_log),
