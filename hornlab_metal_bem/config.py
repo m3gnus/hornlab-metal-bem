@@ -215,6 +215,11 @@ class SolveConfig:
     # boundary rows; override only to bias the interior constraint harder/softer.
     chief_weight: float = 1.0
 
+    # Axisymmetric pure-Python solver option. None is free field; a finite
+    # z-coordinate enables a same-sign rigid/Neumann image source plane for
+    # body-of-revolution m=0 solves.
+    circsym_baffle_z: float | None = None
+
     # Observation
     observation: ObservationConfig = field(default_factory=ObservationConfig)
 
@@ -331,6 +336,10 @@ class SolveConfig:
                 raise ValueError("chief_points must be finite")
         if not (math.isfinite(self.chief_weight) and self.chief_weight > 0):
             raise ValueError("chief_weight must be finite and positive")
+        if self.circsym_baffle_z is not None and not math.isfinite(
+            float(self.circsym_baffle_z)
+        ):
+            raise ValueError("circsym_baffle_z must be finite or None")
         if (
             self.native_symmetry_plane is not None
             and self.native_symmetry_plane not in NATIVE_SYMMETRY_PLANES
