@@ -85,6 +85,10 @@ Common fields:
 - `velocity_sources`, mapping physical tag to source weight
 - `velocity_source_callback`, for frequency-dependent complex source weights
 - `velocity_mode`, either `VelocityMode.ACCELERATION` or `VelocityMode.VELOCITY`
+- `source_motion`, either `SourceMotion.NORMAL` (default; uniform normal
+  velocity, a breathing cap) or `SourceMotion.AXIAL` (rigid piston along the
+  source axis, `v_n = weight * (n_hat . axis)` — the realistic wavefront for a
+  dome/cone/diaphragm; a flat disc reduces exactly to `NORMAL`)
 - `observation`, an `ObservationConfig`
 - `mesh_scale`
 - `air_density`

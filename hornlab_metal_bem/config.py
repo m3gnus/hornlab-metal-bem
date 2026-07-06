@@ -14,6 +14,24 @@ class VelocityMode:
     ACCELERATION = "acceleration"
 
 
+class SourceMotion:
+    """How a driven source tag's prescribed velocity maps onto its faces.
+
+    NORMAL: each source face vibrates along its own outward normal at the same
+    speed -- a uniformly "breathing"/pulsating cap. On a curved (dome) cap this
+    radiates like a pulsating spherical cap.
+
+    AXIAL: the source moves as a rigid piston along its axis, so the normal
+    velocity on each face is ``U * (n_hat . axis)`` -- full at the pole, tapering
+    to zero toward the rim. This is the realistic wavefront for a rigid dome /
+    diaphragm / cone piston. For a flat disc every normal is the axis, so AXIAL
+    reduces exactly to NORMAL.
+    """
+
+    NORMAL = "normal"
+    AXIAL = "axial"
+
+
 class BIEFormulation:
     STANDARD = "standard"
     COMPLEX_K = "complex_k"
@@ -84,6 +102,12 @@ class SolveConfig:
     formulation: Literal["standard", "complex_k"] = BIEFormulation.STANDARD
     complex_k_shift: float = 0.005
     velocity_mode: Literal["velocity", "acceleration"] = VelocityMode.ACCELERATION
+    # Direction the prescribed source velocity acts in. "normal" (default) drives
+    # each source face along its own outward normal (uniform breathing cap);
+    # "axial" drives the source as a rigid piston along its axis, so the per-face
+    # normal velocity is U*(n_hat . axis). See SourceMotion. Default "normal"
+    # leaves every existing solve bit-for-bit unchanged.
+    source_motion: Literal["normal", "axial"] = SourceMotion.NORMAL
     velocity_sources: dict[int, float] = field(
         default_factory=lambda: {2: 1.0}
     )
@@ -219,6 +243,8 @@ class SolveConfig:
             raise ValueError("complex_k_shift must be non-negative")
         if self.velocity_mode not in {VelocityMode.VELOCITY, VelocityMode.ACCELERATION}:
             raise ValueError("velocity_mode must be 'velocity' or 'acceleration'")
+        if self.source_motion not in {SourceMotion.NORMAL, SourceMotion.AXIAL}:
+            raise ValueError("source_motion must be 'normal' or 'axial'")
         for tag, beta in self.impedance_sources.items():
             if int(tag) < 0:
                 raise ValueError("impedance_sources tags must be non-negative integers")

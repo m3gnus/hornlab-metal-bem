@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 
-from hornlab_metal_bem.config import SolveConfig, VelocityMode
+from hornlab_metal_bem.config import SolveConfig, SourceMotion, VelocityMode
 
 
 # ---------------------------------------------------------------------------
@@ -406,3 +406,213 @@ class TestComputeSurfacePressureAvg:
 
         np.testing.assert_allclose(result[2], 50.0, rtol=1e-10)
         np.testing.assert_allclose(result[3], 150.0, rtol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Axial (rigid-piston) source motion: _build_axial_face_scale
+# ---------------------------------------------------------------------------
+
+
+def _two_face_cap_grid(theta_rad: float) -> SimpleNamespace:
+    """Two triangles whose outward unit normals sit at +/- ``theta`` from +z,
+    area-equal. The area-weighted mean normal (piston axis) is therefore +z and
+    each face projects to ``cos(theta)``. ``theta == 0`` is a flat disc (both
+    normals +z, projection 1). Vertices are chosen so ``cross(P1-P0, P2-P0)``
+    equals the target unit normal exactly (triangle area 0.5)."""
+    c = float(np.cos(theta_rad))
+    s = float(np.sin(theta_rad))
+    verts = np.array(
+        [
+            [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-c, 0.0, s],    # face A -> ( s,0,c)
+            [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [-c, 0.0, -s],   # face B -> (-s,0,c)
+        ],
+        dtype=np.float64,
+    )
+    elements = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int32)
+    return SimpleNamespace(vertices=verts.T, elements=elements.T)
+
+
+class TestAxialFaceScale:
+
+    AXIS = np.array([0.0, 0.0, 1.0])  # forward (throat->mouth) axis for the fixture
+
+    def test_flat_disc_projects_to_unity(self):
+        from hornlab_metal_bem.bie import _build_axial_face_scale
+
+        grid = _two_face_cap_grid(0.0)
+        tags = np.array([2, 2], dtype=np.int32)
+        scale = _build_axial_face_scale(grid, tags, [2], self.AXIS)
+        np.testing.assert_allclose(scale, [1.0, 1.0], atol=1e-12)
+
+    def test_tilted_cap_projects_to_cos_theta(self):
+        from hornlab_metal_bem.bie import _build_axial_face_scale
+
+        theta = np.deg2rad(35.0)
+        grid = _two_face_cap_grid(theta)
+        tags = np.array([2, 2], dtype=np.int32)
+        scale = _build_axial_face_scale(grid, tags, [2], self.AXIS)
+        # Both faces sit at theta off the axis -> both project to cos(theta).
+        np.testing.assert_allclose(
+            scale, [np.cos(theta), np.cos(theta)], rtol=1e-9
+        )
+
+    def test_non_source_faces_stay_zero(self):
+        from hornlab_metal_bem.bie import _build_axial_face_scale
+
+        theta = np.deg2rad(40.0)
+        grid = _two_face_cap_grid(theta)
+        tags = np.array([2, 7], dtype=np.int32)  # only face 0 is the source
+        scale = _build_axial_face_scale(grid, tags, [2], self.AXIS)
+        np.testing.assert_allclose(scale[0], np.cos(theta), rtol=1e-9)
+        assert scale[1] == 0.0  # tag 7 is not a source face
+
+    def test_absent_source_tag_returns_none(self):
+        """No source faces -> None, so the caller keeps the bit-identical
+        uniform-normal path."""
+        from hornlab_metal_bem.bie import _build_axial_face_scale
+
+        grid = _two_face_cap_grid(np.deg2rad(20.0))
+        tags = np.array([2, 2], dtype=np.int32)
+        assert _build_axial_face_scale(grid, tags, [99], self.AXIS) is None
+
+    def test_degenerate_axis_returns_none(self):
+        """A zero-length axis -> None (fall back to uniform normal) rather than
+        dividing by zero."""
+        from hornlab_metal_bem.bie import _build_axial_face_scale
+
+        grid = _two_face_cap_grid(np.deg2rad(20.0))
+        tags = np.array([2, 2], dtype=np.int32)
+        assert _build_axial_face_scale(grid, tags, [2], np.zeros(3)) is None
+
+
+# ---------------------------------------------------------------------------
+# Axial source motion applied through _build_driver_neumann_coeffs
+# ---------------------------------------------------------------------------
+
+
+class TestAxialNeumannCoeffs:
+
+    def test_axial_scale_applied_per_face(self):
+        from hornlab_metal_bem.bie import _build_driver_neumann_coeffs
+
+        dp0_space = SimpleNamespace(global_dof_count=3)
+        tags = np.array([2, 2, 1], dtype=np.int32)
+        omega = 2 * np.pi * 1500.0
+        config = SolveConfig(
+            velocity_sources={2: 1.0},
+            velocity_mode=VelocityMode.VELOCITY,
+            source_motion=SourceMotion.AXIAL,
+        )
+        scale = np.array([1.0, 0.5, 0.0], dtype=np.float64)
+
+        coeffs = _build_driver_neumann_coeffs(
+            dp0_space, tags, omega, config, np.complex64,
+            axial_face_scale=scale,
+        )
+
+        base = 1j * config.air_density * omega
+        # Pole face full, rim face halved, non-source face untouched.
+        np.testing.assert_allclose(coeffs[0], base * 1.0, rtol=1e-6)
+        np.testing.assert_allclose(coeffs[1], base * 0.5, rtol=1e-6)
+        assert coeffs[2] == 0.0
+
+    def test_axial_all_ones_matches_uniform_normal(self):
+        """A flat-disc projection (all ones) reproduces the uniform-normal
+        coefficients -- the axial<->normal degeneracy for a flat piston."""
+        from hornlab_metal_bem.bie import _build_driver_neumann_coeffs
+
+        dp0_space = SimpleNamespace(global_dof_count=3)
+        tags = np.array([2, 2, 1], dtype=np.int32)
+        omega = 2 * np.pi * 1000.0
+        config = SolveConfig(velocity_sources={2: 1.0})
+
+        normal = _build_driver_neumann_coeffs(
+            dp0_space, tags, omega, config, np.complex128,
+        )
+        axial = _build_driver_neumann_coeffs(
+            dp0_space, tags, omega, config, np.complex128,
+            axial_face_scale=np.ones(3, dtype=np.float64),
+        )
+        np.testing.assert_allclose(axial, normal, rtol=1e-12)
+
+    def test_axial_acceleration_mode_divides_per_face(self):
+        from hornlab_metal_bem.bie import _build_driver_neumann_coeffs
+
+        dp0_space = SimpleNamespace(global_dof_count=2)
+        tags = np.array([2, 2], dtype=np.int32)
+        omega = 2 * np.pi * 800.0
+        # Acceleration mode (default): v_n = weight*scale/(1j*omega), so the
+        # coefficient 1j*rho*omega*v_n collapses to rho*weight*scale (real).
+        config = SolveConfig(
+            velocity_sources={2: 2.0}, source_motion=SourceMotion.AXIAL,
+        )
+        scale = np.array([1.0, 0.25], dtype=np.float64)
+
+        coeffs = _build_driver_neumann_coeffs(
+            dp0_space, tags, omega, config, np.complex128,
+            axial_face_scale=scale,
+        )
+        expected = config.air_density * 2.0 * scale
+        np.testing.assert_allclose(coeffs, expected, rtol=1e-9)
+
+    def test_axial_respects_impedance_skip(self):
+        """A Robin (impedance) tag is still skipped under axial motion -- no
+        double boundary condition."""
+        from hornlab_metal_bem.bie import _build_driver_neumann_coeffs
+
+        dp0_space = SimpleNamespace(global_dof_count=2)
+        tags = np.array([2, 5], dtype=np.int32)
+        config = SolveConfig(
+            velocity_sources={2: 1.0, 5: 1.0},
+            impedance_sources={5: 0.05 + 0.0j},
+            source_motion=SourceMotion.AXIAL,
+        )
+        scale = np.array([1.0, 1.0], dtype=np.float64)
+
+        coeffs = _build_driver_neumann_coeffs(
+            dp0_space, tags, 2 * np.pi * 1000.0, config, np.complex64,
+            axial_face_scale=scale,
+        )
+        assert coeffs[0] != 0.0  # tag 2 driven
+        assert coeffs[1] == 0.0  # tag 5 carried by Robin BC, not velocity
+
+
+class TestNeumannRowsAxial:
+    """The sweep row-stacker forwards the geometry-only axial scale to every
+    frequency's Neumann builder call."""
+
+    def test_axial_face_scale_forwarded_to_every_row(self):
+        from hornlab_metal_bem.sweep import _build_neumann_rows
+
+        dp0_space = SimpleNamespace(global_dof_count=2)
+        physical_tags = np.array([2, 2], dtype=np.int32)
+        frequencies = np.array([500.0, 1000.0, 2000.0], dtype=np.float64)
+        config = SolveConfig(
+            velocity_sources={2: 1.0}, source_motion=SourceMotion.AXIAL,
+        )
+        scale = np.array([1.0, 0.4], dtype=np.float64)
+
+        rows = _build_neumann_rows(
+            dp0_space, physical_tags, frequencies, config, {},
+            axial_face_scale=scale,
+        )
+
+        assert rows.shape == (len(frequencies), 2)
+        # Rim face is 0.4x the pole face in every frequency row.
+        for r in range(rows.shape[0]):
+            np.testing.assert_allclose(rows[r, 1] / rows[r, 0], 0.4, rtol=1e-6)
+
+    def test_no_scale_is_uniform_across_source_faces(self):
+        """Regression: without a scale (default), both source faces share the
+        same coefficient -- the uniform-normal breathing cap."""
+        from hornlab_metal_bem.sweep import _build_neumann_rows
+
+        dp0_space = SimpleNamespace(global_dof_count=2)
+        physical_tags = np.array([2, 2], dtype=np.int32)
+        frequencies = np.array([750.0], dtype=np.float64)
+        config = SolveConfig(velocity_sources={2: 1.0})
+
+        rows = _build_neumann_rows(
+            dp0_space, physical_tags, frequencies, config, {},
+        )
+        np.testing.assert_allclose(rows[0, 0], rows[0, 1], rtol=1e-12)

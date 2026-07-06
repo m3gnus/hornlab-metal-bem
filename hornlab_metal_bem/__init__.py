@@ -5,7 +5,7 @@ from dataclasses import replace as _replace
 
 import numpy as np
 
-from .config import ObservationConfig, SolveConfig, VelocityMode
+from .config import ObservationConfig, SolveConfig, SourceMotion, VelocityMode
 from .mesh import LoadedMesh, MeshError, load_mesh
 from .observation import ObservationFrame, infer_frame
 from .result import MeshInfo, SolveResult
@@ -20,6 +20,7 @@ __all__ = [
     "SolveResult",
     "ObservationConfig",
     "VelocityMode",
+    "SourceMotion",
     "LoadedMesh",
     "MeshInfo",
     "MeshError",

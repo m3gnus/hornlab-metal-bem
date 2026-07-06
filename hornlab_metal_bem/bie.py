@@ -7,6 +7,75 @@ from numpy.typing import NDArray
 from .config import SolveConfig, VelocityMode
 
 
+def _build_axial_face_scale(
+    grid,
+    physical_tags: NDArray[np.int32],
+    source_tags,
+    axis: NDArray[np.float64],
+) -> NDArray[np.float64] | None:
+    """Per-face ``n_hat . axis`` projection for a rigid axial (piston) source.
+
+    ``axis`` is the forward (throat->mouth) unit axis: pass the observation
+    frame's axis, which is already oriented AND, on a symmetry-reduced mesh,
+    projected onto the symmetry subspace so a half/quarter cap is not biased off
+    the true axis. Each source face is scaled by the cosine between its outward
+    normal and that axis -- 1 at the pole, tapering toward the rim. A flat disc
+    (every normal along the axis) gives 1.0 on every face, so an axial source
+    reduces exactly to the uniform-normal BC there. Faces outside the source tags
+    stay 0.0 (never read by the Neumann builder).
+
+    The projection is oriented PER SOURCE TAG so the cap drives outward-positive,
+    matching the sign convention of the uniform-normal BC (which drives every
+    face at +weight along its outward normal). This only flips a globally
+    inverted axis (the frame axis points throat->mouth, which may be opposite the
+    cap's outward normals); it is a single scalar sign per tag, so it does NOT
+    rectify per-face signs -- a future front/back dipole tag keeps its opposite
+    faces opposite.
+
+    Returns ``None`` when the axis is degenerate or no source face is present, so
+    the caller keeps the bit-for-bit uniform-normal path.
+    """
+    axis = np.asarray(axis, dtype=np.float64).reshape(-1)
+    if axis.shape[0] != 3:
+        return None
+    axis_norm = float(np.linalg.norm(axis))
+    if not np.isfinite(axis_norm) or axis_norm <= 1e-12:
+        return None
+    axis = axis / axis_norm
+
+    vertices = np.asarray(grid.vertices.T, dtype=np.float64)
+    elements = np.asarray(grid.elements.T, dtype=np.int32)
+    n_faces = elements.shape[0]
+
+    p0 = vertices[elements[:, 0]]
+    p1 = vertices[elements[:, 1]]
+    p2 = vertices[elements[:, 2]]
+    # Outward face normals (canonical meshes carry outward winding); the cross
+    # magnitude is twice the triangle area (used to normalize per face and to
+    # area-weight the per-tag orientation vote).
+    raw = np.cross(p1 - p0, p2 - p0)
+    mags = np.linalg.norm(raw, axis=1)
+
+    scale = np.zeros(n_faces, dtype=np.float64)
+    any_source = False
+    for tag in sorted({int(t) for t in source_tags}):
+        idx = np.where(physical_tags == tag)[0]
+        if idx.size == 0:
+            continue
+        tag_mags = mags[idx]
+        safe_mags = np.where(tag_mags > 1e-15, tag_mags, 1.0)
+        unit_normals = raw[idx] / safe_mags[:, None]
+        proj = unit_normals @ axis
+        # Orient this tag outward-positive (area-weighted), matching the normal
+        # BC. Flips the whole tag by one sign; per-face relative signs are kept.
+        if float(np.dot(proj, tag_mags)) < 0.0:
+            proj = -proj
+        scale[idx] = proj
+        any_source = True
+
+    return scale if any_source else None
+
+
 def _build_driver_neumann_coeffs(
     dp0_space,
     physical_tags: NDArray[np.int32],
@@ -14,6 +83,7 @@ def _build_driver_neumann_coeffs(
     config: SolveConfig,
     dtype: type,
     impedance_tags: set[int] | None = None,
+    axial_face_scale: NDArray | None = None,
 ) -> NDArray:
     """Build DP0 Neumann coefficients for velocity source tags.
 
@@ -26,6 +96,14 @@ def _build_driver_neumann_coeffs(
     a double BC or an undriven tag. When ``None`` (back-compat: a direct call
     that did not resolve the tags upstream) the set is reconstructed locally from
     the static ``impedance_sources`` plus a single callback evaluation.
+
+    ``axial_face_scale`` is the per-face ``n_hat . axis`` projection from
+    ``_build_axial_face_scale`` (config.source_motion == "axial"). When ``None``
+    (default / config.source_motion == "normal") every source face gets the same
+    normal velocity -- the historical uniform-normal (breathing cap) BC, bit for
+    bit unchanged. When supplied, each source face is driven at ``weight`` scaled
+    by its projection, i.e. a rigid axial piston (full at the pole, tapering to
+    the rim).
     """
     coeffs = np.zeros(dp0_space.global_dof_count, dtype=dtype)
     air_density = config.air_density
@@ -55,10 +133,19 @@ def _build_driver_neumann_coeffs(
         mask = physical_tags == tag
         if not np.any(mask):
             continue
-        v_n = weight
-        if config.velocity_mode == VelocityMode.ACCELERATION:
-            v_n = weight / (1j * omega) if omega > 0 else 0.0
-        coeffs[np.where(mask)[0]] = 1j * air_density * omega * v_n
+        idx = np.where(mask)[0]
+        if axial_face_scale is None:
+            # Uniform normal velocity (breathing cap). Unchanged historical path.
+            v_n = weight
+            if config.velocity_mode == VelocityMode.ACCELERATION:
+                v_n = weight / (1j * omega) if omega > 0 else 0.0
+            coeffs[idx] = 1j * air_density * omega * v_n
+        else:
+            # Rigid axial (piston) motion: v_n(face) = weight * (n_hat . axis).
+            v_n = weight * axial_face_scale[idx]
+            if config.velocity_mode == VelocityMode.ACCELERATION:
+                v_n = v_n / (1j * omega) if omega > 0 else np.zeros_like(v_n)
+            coeffs[idx] = 1j * air_density * omega * v_n
     return coeffs
 
 

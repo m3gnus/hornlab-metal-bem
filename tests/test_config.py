@@ -71,6 +71,24 @@ def test_solve_config_rejects_unknown_velocity_mode():
         SolveConfig(velocity_mode="force")  # type: ignore[arg-type]
 
 
+def test_solve_config_source_motion_defaults_normal():
+    from hornlab_metal_bem.config import SourceMotion
+
+    assert SolveConfig().source_motion == SourceMotion.NORMAL
+
+
+def test_solve_config_accepts_axial_source_motion():
+    from hornlab_metal_bem.config import SourceMotion
+
+    cfg = SolveConfig(source_motion=SourceMotion.AXIAL)
+    assert cfg.source_motion == "axial"
+
+
+def test_solve_config_rejects_unknown_source_motion():
+    with pytest.raises(ValueError, match="source_motion"):
+        SolveConfig(source_motion="radial")  # type: ignore[arg-type]
+
+
 def test_solve_config_accepts_experimental_complex_k_and_robin():
     cfg = SolveConfig(
         formulation=BIEFormulation.COMPLEX_K,
