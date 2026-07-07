@@ -63,7 +63,7 @@ Mesh requirements:
 - triangle cells must have physical-group tags
 - triangle winding must be outward for exterior-domain canonical meshes; coupled
   infinite-baffle meshes with an aperture tag use the interior-domain contract
-  and carry negative signed volume
+  and carry negative signed volume, with mouth-aperture normals pointing `-Z`
 - physical tag `1` is the rigid-wall convention
 - source/radiator tags must match `config.velocity_sources`
 - the default source tag is `2`

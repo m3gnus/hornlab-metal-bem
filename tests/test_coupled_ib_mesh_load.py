@@ -101,3 +101,33 @@ def test_load_mesh_rejects_inverse_coupled_ib_winding(tmp_path: Path) -> None:
             scale=1.0,
             aperture_tag=int(result.metadata["apertureTag"]),
         )
+
+
+def test_load_mesh_rejects_legacy_plus_z_coupled_ib_aperture(tmp_path: Path) -> None:
+    meshio = pytest.importorskip("meshio")
+    result = build_from_config(_ib_config(1234), tmp_path / "coupled-ib.msh")
+    mesh = meshio.read(result.mesh_path)
+    triangles = np.asarray(mesh.cells_dict["triangle"], dtype=np.int32)
+    tags = np.asarray(mesh.cell_data_dict["gmsh:physical"]["triangle"], dtype=np.int32)
+    aperture_tag = int(result.metadata["apertureTag"])
+    mixed = np.array(triangles, copy=True)
+    aperture = tags == aperture_tag
+    mixed[aperture] = mixed[aperture][:, [0, 2, 1]]
+    mixed_path = tmp_path / "coupled-ib-legacy-plus-z-aperture.msh"
+    mixed_mesh = meshio.Mesh(
+        points=mesh.points,
+        cells=[("triangle", mixed)],
+        cell_data={
+            "gmsh:physical": [tags],
+            "gmsh:geometrical": [tags],
+        },
+        field_data=mesh.field_data,
+    )
+    meshio.write(mixed_path, mixed_mesh, file_format="gmsh22", binary=False)
+
+    with pytest.raises(MeshError, match="aperture normals must point -Z"):
+        load_mesh(
+            mixed_path,
+            scale=1.0,
+            aperture_tag=aperture_tag,
+        )

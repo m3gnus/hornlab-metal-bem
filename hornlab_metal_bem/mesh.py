@@ -122,6 +122,13 @@ def load_mesh(
             repair=repair_normals,
             coupled_ib_aperture_tag=coupled_ib_aperture_tag,
         )
+        if coupled_ib_aperture_tag is not None:
+            _validate_coupled_ib_aperture_normals(
+                verts,
+                triangles,
+                phys_tags,
+                aperture_tag=coupled_ib_aperture_tag,
+            )
         _validate_physical_groups(
             phys_tags,
             coupled_ib_aperture_tag=coupled_ib_aperture_tag,
@@ -417,7 +424,7 @@ def _validate_outward_normals(
             "Coupled infinite-baffle mesh winding appears inverse "
             f"(aperture_tag={coupled_ib_aperture_tag}, signed volume positive). "
             "Coupled IB meshes are interior-domain surfaces and must keep "
-            "negative signed volume with the aperture normals pointing +Z."
+            "negative signed volume with the aperture normals pointing -Z."
         )
 
     if signed_vol >= 0:
@@ -442,6 +449,38 @@ def _signed_mesh_volume_indicator(
     """Return the signed volume indicator used for closed-surface winding."""
     p0, p1, p2 = verts[tris[:, 0]], verts[tris[:, 1]], verts[tris[:, 2]]
     return float(np.sum(p0 * np.cross(p1, p2)))
+
+
+def _validate_coupled_ib_aperture_normals(
+    verts: NDArray[np.float64],
+    tris: NDArray[np.int32],
+    phys_tags: NDArray[np.int32],
+    *,
+    aperture_tag: int,
+    tolerance: float = 1.0e-6,
+) -> None:
+    mask = np.asarray(phys_tags, dtype=np.int32) == int(aperture_tag)
+    if not np.any(mask):
+        return
+    aperture_tris = tris[mask]
+    p0 = verts[aperture_tris[:, 0]]
+    p1 = verts[aperture_tris[:, 1]]
+    p2 = verts[aperture_tris[:, 2]]
+    normals = np.cross(p1 - p0, p2 - p0)
+    lengths = np.linalg.norm(normals, axis=1)
+    valid = lengths > 0.0
+    if not np.any(valid):
+        raise MeshError("Coupled infinite-baffle aperture contains only degenerate triangles")
+    unit_z = normals[valid, 2] / lengths[valid]
+    bad = unit_z >= -1.0 + float(tolerance)
+    if np.any(bad):
+        first_local = int(np.flatnonzero(valid)[int(np.flatnonzero(bad)[0])])
+        first = int(np.flatnonzero(mask)[first_local])
+        raise MeshError(
+            "Coupled infinite-baffle aperture normals must point -Z for the "
+            "interior-domain BIE; regenerate meshes emitted with the old +Z "
+            f"aperture contract (triangle {first}, normal_z={unit_z[bad][0]:.6g})."
+        )
 
 
 def _resolve_coupled_ib_aperture_tag(

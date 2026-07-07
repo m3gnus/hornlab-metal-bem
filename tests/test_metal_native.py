@@ -119,7 +119,7 @@ def _ib_box_geometry_buffers():
             [3, 0, 4],
         ],
         dtype=np.int64,
-    )
+    )[:, [0, 2, 1]]
     grid = SimpleNamespace(
         vertices=vertices,
         elements=triangles_nx3.T,
@@ -159,7 +159,7 @@ def _ib_quarter_box_mesh(scale: float = 0.1, depth: float = 0.05):
             [3, 6, 7],
         ],
         dtype=np.int64,
-    )
+    )[:, [0, 2, 1]]
     tags = np.array([7, 7, 1, 1, 2, 2, 2, 2], dtype=np.int32)
     return vertices, triangles_nx3, tags
 

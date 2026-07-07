@@ -214,7 +214,11 @@ def _straight_channel_mesh(
         triangles.append([bottom0, top1, top0])
         tags.extend([TAG_WALL, TAG_WALL])
 
-    triangles_arr = np.asarray(triangles, dtype=np.int32)
+    # Coupled-IB 3D meshes use the same interior-domain orientation as the
+    # CircSym meridian: source +Z into the cavity, wall normals inward, and
+    # aperture -Z into the cavity. Rayleigh exterior evaluation is selected by
+    # aperture_tag rather than aperture triangle winding.
+    triangles_arr = np.asarray(triangles, dtype=np.int32)[:, [0, 2, 1]]
     tags_arr = np.asarray(tags, dtype=np.int32)
     grid = make_pure_grid(vertices, triangles_arr)
     return LoadedMesh(
@@ -340,4 +344,63 @@ def test_native_coupled_ib_straight_circular_channel_matches_circsym(
         for entry in native_result.native_diagnostics
     )
     assert native_directivity[:, -1].min() > -20.0
+    assert max_error_db < 1.0
+
+
+def test_native_coupled_ib_deep_circular_channel_matches_circsym(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    radius = 0.04
+    depth = 0.10
+    frequencies_hz = np.array([900.0, 1400.0, 1800.0], dtype=np.float64)
+    observation = ObservationConfig(
+        distance_m=1.5,
+        angle_min_deg=0.0,
+        angle_max_deg=90.0,
+        angle_count=13,
+        planes=["horizontal"],
+        origin="mouth",
+    )
+    native_config = SolveConfig(
+        velocity_sources={TAG_THROAT: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        aperture_tag=TAG_APERTURE,
+        observation=observation,
+        metal_native_assembly_mode="corrected",
+        dense_solve_dtype="float64",
+    )
+    circsym_config = SolveConfig(
+        velocity_sources={TAG_THROAT: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        circsym_aperture_tag=TAG_APERTURE,
+        observation=observation,
+    )
+
+    native_result = metal_bem.solve_frequencies(
+        _straight_channel_mesh(radius, depth, rings=5, sectors=32),
+        frequencies_hz,
+        native_config,
+    )
+    circsym_result = metal_bem.solve_circsym_frequencies(
+        _straight_channel_meridian(radius, depth, target_edge=radius / 5.0),
+        frequencies_hz,
+        circsym_config,
+    )
+
+    native_directivity = native_result.directivity_db[:, 0, :]
+    circsym_directivity = circsym_result.directivity_db[:, 0, :]
+    max_error_db = float(
+        np.max(np.abs(native_directivity[:, :-1] - circsym_directivity[:, :-1]))
+    )
+
+    assert all(entry.get("coupled_ib") is True for entry in native_result.native_diagnostics)
     assert max_error_db < 1.0

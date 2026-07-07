@@ -257,8 +257,8 @@ def _aperture_buffers(
     )
 
 
-def test_validate_native_infinite_baffle_aperture_accepts_z0_plus_z_disc():
-    buffers = _aperture_buffers()
+def test_validate_native_infinite_baffle_aperture_accepts_z0_minus_z_disc():
+    buffers = _aperture_buffers(reversed_normal=True)
 
     assert validate_native_infinite_baffle_aperture(buffers, 7) == 7
     assert (
@@ -296,11 +296,11 @@ def test_validate_native_infinite_baffle_aperture_rejects_xy_image_mode():
 def test_validate_native_infinite_baffle_aperture_rejects_nonplanar_or_flipped():
     with pytest.raises(MetalGeometryError, match="coplanar at Z=0"):
         validate_native_infinite_baffle_aperture(
-            _aperture_buffers(z_offset=1.0e-4),
+            _aperture_buffers(z_offset=1.0e-4, reversed_normal=True),
             7,
         )
-    with pytest.raises(MetalGeometryError, match="normals pointing \\+Z"):
+    with pytest.raises(MetalGeometryError, match="normals pointing -Z"):
         validate_native_infinite_baffle_aperture(
-            _aperture_buffers(reversed_normal=True),
+            _aperture_buffers(),
             7,
         )

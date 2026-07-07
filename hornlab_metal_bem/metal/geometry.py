@@ -291,14 +291,14 @@ def validate_native_infinite_baffle_aperture(
     off_axis = np.hypot(normals[0], normals[1])
     bad = (
         (off_axis > normal_tol)
-        | (normals[2] < 1.0 - normal_tol)
-        | (normals[2] <= 0.0)
+        | (normals[2] > -1.0 + normal_tol)
+        | (normals[2] >= 0.0)
     )
     if np.any(bad):
         first = int(np.flatnonzero(aperture_mask)[int(np.flatnonzero(bad)[0])])
         normal = normals[:, int(np.flatnonzero(bad)[0])]
         raise MetalGeometryError(
-            "aperture_tag triangles must have normals pointing +Z; "
+            "aperture_tag triangles must have normals pointing -Z; "
             f"triangle {first} normal is "
             f"({normal[0]:.6g}, {normal[1]:.6g}, {normal[2]:.6g})"
         )
