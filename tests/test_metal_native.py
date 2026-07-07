@@ -3817,6 +3817,13 @@ def test_native_executable_coupled_ib_gpu_schur_matches_cpu_augmented(
         == "accelerate_lapack_cgesv_coupled_ib_schur"
     )
     assert "ib_aperture_metal_dispatch" in gpu_schur.diagnostics
+    aperture_dispatch = gpu_schur.diagnostics["ib_aperture_metal_dispatch"]
+    for projection_name in ("interior_slp", "rayleigh_slp"):
+        duffy = aperture_dispatch[projection_name]["duffy_corrections"]
+        assert duffy["implementation"] == "metal_duffy_blocks_cpu_aperture_reduction"
+        assert duffy["block_source"] == "reused_main_assembly"
+        assert duffy["metal_dispatch"]["kernel"] == "duffy_delta_blocks"
+        assert duffy["aperture_pair_count"] > 0
     assert cpu_augmented.diagnostics["ib_aperture_assembly_implementation"] == (
         "swift_native_cpu_aperture_slp_blocks"
     )

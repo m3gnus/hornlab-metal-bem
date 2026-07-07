@@ -1073,6 +1073,108 @@ func applyApertureAverageSlpProjectionDuffyCorrections(
     }
 }
 
+func validateApertureDuffyBlocks(
+    _ blocks: MetalDuffyBlockOutput,
+    pairList: DuffyPairList
+) throws {
+    let pairCount = pairList.pairs.count
+    if blocks.slpRe.count != pairCount * 3
+        || blocks.slpIm.count != pairCount * 3
+        || blocks.dlpRe.count != pairCount * 9
+        || blocks.dlpIm.count != pairCount * 9 {
+        try fail("aperture Duffy block dimensions do not match the resident pair list")
+    }
+}
+
+func applyApertureSlpProjectionDuffyBlockCorrections(
+    re: inout [Float],
+    im: inout [Float],
+    geom: Geometry,
+    aperture: ApertureGeometry,
+    pairList: DuffyPairList,
+    blocks: MetalDuffyBlockOutput,
+    testTriangles: [Int]? = nil
+) throws -> [String: Any] {
+    let start = CFAbsoluteTimeGetCurrent()
+    try validateApertureDuffyBlocks(blocks, pairList: pairList)
+    let d = aperture.triangles.count
+    let pairCount = pairList.pairs.count
+    let testSet = testTriangles.map { Set($0) }
+    let apertureTriangleLocalByGlobal = apertureTriangleLocalByGlobal(aperture)
+    var appliedPairs = 0
+    for pairIndex in pairList.pairs.indices {
+        let pair = pairList.pairs[pairIndex]
+        if let testSet, !testSet.contains(pair.test) {
+            continue
+        }
+        guard let apertureTriIndex = apertureTriangleLocalByGlobal[pair.trial] else {
+            continue
+        }
+        appliedPairs += 1
+        for i in 0..<3 {
+            let row = geom.p1Dof(pair.test, i)
+            let slpIndex = pairIndex + i * pairCount
+            let base = row * d
+            re[base + apertureTriIndex] += blocks.slpRe[slpIndex]
+            im[base + apertureTriIndex] += blocks.slpIm[slpIndex]
+        }
+    }
+    return [
+        "implementation": "metal_duffy_blocks_cpu_aperture_reduction",
+        "projection": "p1_dp0_slp",
+        "pair_count": pairCount,
+        "aperture_pair_count": appliedPairs,
+        "corrected_values": appliedPairs * 3,
+        "reduction_seconds": CFAbsoluteTimeGetCurrent() - start,
+    ]
+}
+
+func applyApertureAverageSlpProjectionDuffyBlockCorrections(
+    re: inout [Float],
+    im: inout [Float],
+    geom: Geometry,
+    aperture: ApertureGeometry,
+    pairList: DuffyPairList,
+    blocks: MetalDuffyBlockOutput
+) throws -> [String: Any] {
+    let start = CFAbsoluteTimeGetCurrent()
+    try validateApertureDuffyBlocks(blocks, pairList: pairList)
+    let m = aperture.triangles.count
+    let pairCount = pairList.pairs.count
+    let apertureTriangleLocalByGlobal = apertureTriangleLocalByGlobal(aperture)
+    var appliedPairs = 0
+    for pairIndex in pairList.pairs.indices {
+        let pair = pairList.pairs[pairIndex]
+        guard pair.testImageMask == 0,
+              let rowLocal = apertureTriangleLocalByGlobal[pair.test],
+              let colLocal = apertureTriangleLocalByGlobal[pair.trial] else {
+            continue
+        }
+        appliedPairs += 1
+        var delta = Complex32.zero
+        for i in 0..<3 {
+            let slpIndex = pairIndex + i * pairCount
+            delta = delta + Complex32(
+                re: blocks.slpRe[slpIndex],
+                im: blocks.slpIm[slpIndex]
+            )
+        }
+        let invArea = Float(1.0) / max(geom.areas[pair.test], Float.leastNonzeroMagnitude)
+        let value = delta * invArea
+        let idx = rowLocal * m + colLocal
+        re[idx] += value.re
+        im[idx] += value.im
+    }
+    return [
+        "implementation": "metal_duffy_blocks_cpu_aperture_reduction",
+        "projection": "dp0_dp0_average_slp",
+        "pair_count": pairCount,
+        "aperture_pair_count": appliedPairs,
+        "corrected_values": appliedPairs,
+        "reduction_seconds": CFAbsoluteTimeGetCurrent() - start,
+    ]
+}
+
 func assembleApertureSlpProjection(
     geom: Geometry,
     aperture: ApertureGeometry,
@@ -1197,7 +1299,8 @@ func buildCoupledIBCoupling(
     kImag: Float,
     fieldK: Float,
     includeDuffy: Bool,
-    residentContext: ResidentMetalContext? = nil
+    residentContext: ResidentMetalContext? = nil,
+    duffyBlocks: MetalDuffyBlockOutput? = nil
 ) throws -> ApertureCoupling {
     let start = CFAbsoluteTimeGetCurrent()
     let aperture = try buildApertureGeometry(geom: geom, tag: apertureTag)
@@ -1229,13 +1332,18 @@ func buildCoupledIBCoupling(
             aperture: aperture,
             k: k,
             kImag: kImag,
-            includeDuffy: includeDuffy
+            includeDuffy: includeDuffy,
+            duffyBlocks: duffyBlocks,
+            duffyBlockSource: duffyBlocks == nil ? nil : "reused_main_assembly"
         )
+        let canReuseRayleighDuffy = duffyBlocks != nil && kImag == 0.0 && fieldK == k
         let rayleigh = try residentContext.assembleApertureAverageSlpProjectionMetal(
             aperture: aperture,
             k: fieldK,
             kImag: 0.0,
-            includeDuffy: includeDuffy
+            includeDuffy: includeDuffy,
+            duffyBlocks: canReuseRayleighDuffy ? duffyBlocks : nil,
+            duffyBlockSource: canReuseRayleighDuffy ? "reused_main_assembly" : nil
         )
         interiorSlp = interior.projection
         rayleighSlp = rayleigh.projection
@@ -5665,7 +5773,9 @@ final class ResidentMetalContext {
         aperture: ApertureGeometry,
         k: Float,
         kImag: Float,
-        includeDuffy: Bool
+        includeDuffy: Bool,
+        duffyBlocks: MetalDuffyBlockOutput? = nil,
+        duffyBlockSource: String? = nil
     ) throws -> MetalSlpProjectionOutput {
         let start = CFAbsoluteTimeGetCurrent()
         let n = geom.p1DofCount
@@ -5723,16 +5833,39 @@ final class ResidentMetalContext {
         var re = readFloatBuffer(outRe, count: n * m)
         var im = readFloatBuffer(outIm, count: n * m)
         if includeDuffy {
-            try applyApertureSlpProjectionDuffyCorrections(
+            let blocks: MetalDuffyBlockOutput
+            let blockSource: String
+            let blockSeconds: Double?
+            if let duffyBlocks {
+                blocks = duffyBlocks
+                blockSource = duffyBlockSource ?? "reused"
+                blockSeconds = nil
+            } else {
+                let blockStart = CFAbsoluteTimeGetCurrent()
+                blocks = try HornlabMetalBemNative.computeDuffyDeltaBlocksMetal(
+                    geom: geom,
+                    pairList: pairList,
+                    rules: rules,
+                    k: k,
+                    kImag: kImag
+                )
+                blockSource = "computed_standalone"
+                blockSeconds = CFAbsoluteTimeGetCurrent() - blockStart
+            }
+            var duffyReport = try applyApertureSlpProjectionDuffyBlockCorrections(
                 re: &re,
                 im: &im,
                 geom: geom,
                 aperture: aperture,
                 pairList: pairList,
-                rules: rules,
-                k: k,
-                kImag: kImag
+                blocks: blocks
             )
+            duffyReport["block_source"] = blockSource
+            if let blockSeconds {
+                duffyReport["block_seconds"] = blockSeconds
+            }
+            duffyReport["metal_dispatch"] = blocks.dispatch
+            dispatch["duffy_corrections"] = duffyReport
         }
         dispatch["kernel"] = "assemble_aperture_slp_projection"
         dispatch["rows"] = n
@@ -5749,7 +5882,9 @@ final class ResidentMetalContext {
         aperture: ApertureGeometry,
         k: Float,
         kImag: Float,
-        includeDuffy: Bool
+        includeDuffy: Bool,
+        duffyBlocks: MetalDuffyBlockOutput? = nil,
+        duffyBlockSource: String? = nil
     ) throws -> MetalSlpProjectionOutput {
         let start = CFAbsoluteTimeGetCurrent()
         let m = aperture.triangles.count
@@ -5803,16 +5938,39 @@ final class ResidentMetalContext {
         var re = readFloatBuffer(outRe, count: m * m)
         var im = readFloatBuffer(outIm, count: m * m)
         if includeDuffy {
-            try applyApertureAverageSlpProjectionDuffyCorrections(
+            let blocks: MetalDuffyBlockOutput
+            let blockSource: String
+            let blockSeconds: Double?
+            if let duffyBlocks {
+                blocks = duffyBlocks
+                blockSource = duffyBlockSource ?? "reused"
+                blockSeconds = nil
+            } else {
+                let blockStart = CFAbsoluteTimeGetCurrent()
+                blocks = try HornlabMetalBemNative.computeDuffyDeltaBlocksMetal(
+                    geom: geom,
+                    pairList: pairList,
+                    rules: rules,
+                    k: k,
+                    kImag: kImag
+                )
+                blockSource = "computed_standalone"
+                blockSeconds = CFAbsoluteTimeGetCurrent() - blockStart
+            }
+            var duffyReport = try applyApertureAverageSlpProjectionDuffyBlockCorrections(
                 re: &re,
                 im: &im,
                 geom: geom,
                 aperture: aperture,
                 pairList: pairList,
-                rules: rules,
-                k: k,
-                kImag: kImag
+                blocks: blocks
             )
+            duffyReport["block_source"] = blockSource
+            if let blockSeconds {
+                duffyReport["block_seconds"] = blockSeconds
+            }
+            duffyReport["metal_dispatch"] = blocks.dispatch
+            dispatch["duffy_corrections"] = duffyReport
         }
         dispatch["kernel"] = "assemble_aperture_average_slp_projection"
         dispatch["rows"] = m
@@ -8942,7 +9100,8 @@ func assembleSolveEvaluateStandardNeumannBatch(
             let (transformed, apertureCoupling) = try applyCoupledIBIfNeeded(
                 run: run,
                 caseIndex: caseIndex,
-                includeDuffy: false
+                includeDuffy: false,
+                duffyBlocks: nil
             )
             return (transformed, nearExtra, apertureCoupling)
         }
@@ -8996,7 +9155,8 @@ func assembleSolveEvaluateStandardNeumannBatch(
         let (transformed, apertureCoupling) = try applyCoupledIBIfNeeded(
             run: run,
             caseIndex: caseIndex,
-            includeDuffy: true
+            includeDuffy: true,
+            duffyBlocks: blocks
         )
         return (transformed, nearExtra, apertureCoupling)
     }
@@ -9029,7 +9189,8 @@ func assembleSolveEvaluateStandardNeumannBatch(
     func applyCoupledIBIfNeeded(
         run: AssemblyRun,
         caseIndex: Int,
-        includeDuffy: Bool
+        includeDuffy: Bool,
+        duffyBlocks: MetalDuffyBlockOutput? = nil
     ) throws -> (AssemblyRun, ApertureCoupling?) {
         guard let apertureTag = caseApertureTags[caseIndex] else {
             return (run, nil)
@@ -9041,7 +9202,8 @@ func assembleSolveEvaluateStandardNeumannBatch(
             kImag: caseKImag[caseIndex],
             fieldK: caseFieldKs[caseIndex],
             includeDuffy: includeDuffy,
-            residentContext: context
+            residentContext: context,
+            duffyBlocks: duffyBlocks
         )
         return (
             AssemblyRun(
@@ -9235,7 +9397,8 @@ func assembleSolveEvaluateStandardNeumannBatch(
             (assembly, apertureCoupling) = try applyCoupledIBIfNeeded(
                 run: rawAssembly,
                 caseIndex: caseIndex,
-                includeDuffy: rawAssembly.duffyStats != nil
+                includeDuffy: rawAssembly.duffyStats != nil,
+                duffyBlocks: nil
             )
             extraRhs = []
             solve = try solveDenseForCase(
