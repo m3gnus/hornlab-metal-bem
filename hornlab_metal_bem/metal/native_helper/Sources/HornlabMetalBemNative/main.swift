@@ -9021,6 +9021,8 @@ func assembleSolveEvaluateStandardNeumannBatch(
     let sourcesPerCase = extraSourceCount + 1
     let hasCoupledIB = caseApertureTags.contains { $0 != nil }
     if hasCoupledIB && chiefPoints != nil {
+        // Keep coupled-IB CHIEF handling explicit: this path intentionally
+        // relies on the aperture radiation block plus complex_k, not CHIEF rows.
         try fail("coupled IB aperture_tag does not support chief_points yet")
     }
 
@@ -9227,6 +9229,10 @@ func assembleSolveEvaluateStandardNeumannBatch(
         caseIndex: Int
     ) throws -> MultiDenseSolveRun {
         if let apertureCoupling {
+            // Coupled infinite-baffle solves intentionally skip CHIEF rows. The
+            // Rayleigh aperture block adds exterior radiation damping, and the
+            // default complex_k formulation moves resonant wavenumbers off the
+            // real axis; server coupled-IB parity tests exercise this contract.
             return try solveCoupledIBDenseMulti(
                 arrays: assembly.arrays,
                 extraRhs: extraRhs,
