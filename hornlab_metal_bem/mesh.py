@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import warnings
 from dataclasses import dataclass
+from numbers import Integral
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,8 @@ from .result import MeshInfo
 logger = logging.getLogger(__name__)
 
 _SYMMETRY_SNAP_TOLERANCE = 1.0e-6
+_CANONICAL_COUPLED_IB_APERTURE_TAG = 12
+_CANONICAL_COUPLED_IB_APERTURE_NAME = "mouth_aperture"
 
 
 @dataclass
@@ -52,6 +55,7 @@ def load_mesh(
     merge_tol: float = 1e-9,
     repair_normals: bool = False,
     native_symmetry_plane: str | None = None,
+    aperture_tag: int | None = None,
 ) -> LoadedMesh:
     """Load a .msh file into a lightweight grid with physical group tags.
 
@@ -105,13 +109,23 @@ def load_mesh(
         triangles = triangles[valid]
         phys_tags = phys_tags[valid]
 
+    coupled_ib_aperture_tag = _resolve_coupled_ib_aperture_tag(
+        phys_tags,
+        phys_group_names,
+        aperture_tag=aperture_tag,
+    )
+
     if validate:
         _validate_outward_normals(
             verts,
             triangles,
             repair=repair_normals,
+            coupled_ib_aperture_tag=coupled_ib_aperture_tag,
         )
-        _validate_physical_groups(phys_tags)
+        _validate_physical_groups(
+            phys_tags,
+            coupled_ib_aperture_tag=coupled_ib_aperture_tag,
+        )
 
     _warn_if_reduced_symmetry_mesh(
         verts,
@@ -392,9 +406,20 @@ def _validate_outward_normals(
     tris: NDArray[np.int32],
     *,
     repair: bool = False,
+    coupled_ib_aperture_tag: int | None = None,
 ) -> None:
     """Validate outward winding, optionally repairing legacy external meshes."""
     signed_vol = _signed_mesh_volume_indicator(verts, tris)
+    if coupled_ib_aperture_tag is not None:
+        if signed_vol <= 0:
+            return
+        raise MeshError(
+            "Coupled infinite-baffle mesh winding appears inverse "
+            f"(aperture_tag={coupled_ib_aperture_tag}, signed volume positive). "
+            "Coupled IB meshes are interior-domain surfaces and must keep "
+            "negative signed volume with the aperture normals pointing +Z."
+        )
+
     if signed_vol >= 0:
         return
 
@@ -419,9 +444,50 @@ def _signed_mesh_volume_indicator(
     return float(np.sum(p0 * np.cross(p1, p2)))
 
 
-def _validate_physical_groups(phys_tags: NDArray[np.int32]) -> None:
+def _resolve_coupled_ib_aperture_tag(
+    phys_tags: NDArray[np.int32],
+    phys_group_names: dict[int, str],
+    *,
+    aperture_tag: int | None,
+) -> int | None:
+    """Return the aperture tag when physical tags identify coupled IB topology."""
+    present = {int(tag) for tag in np.unique(phys_tags)}
+    explicit = _coerce_aperture_tag(aperture_tag)
+    if explicit is not None:
+        return explicit if explicit in present else None
+
+    for tag, name in phys_group_names.items():
+        if str(name).strip().lower() == _CANONICAL_COUPLED_IB_APERTURE_NAME:
+            tag_int = int(tag)
+            return tag_int if tag_int in present else None
+
+    if _CANONICAL_COUPLED_IB_APERTURE_TAG in present:
+        return _CANONICAL_COUPLED_IB_APERTURE_TAG
+    return None
+
+
+def _coerce_aperture_tag(aperture_tag: int | None) -> int | None:
+    if aperture_tag is None:
+        return None
+    if (
+        isinstance(aperture_tag, bool)
+        or not isinstance(aperture_tag, Integral)
+        or int(aperture_tag) <= 0
+    ):
+        raise MeshError("aperture_tag must be a positive int or None")
+    return int(aperture_tag)
+
+
+def _validate_physical_groups(
+    phys_tags: NDArray[np.int32],
+    *,
+    coupled_ib_aperture_tag: int | None = None,
+) -> None:
     unique = np.unique(phys_tags)
-    if not np.any(unique >= 2):
+    source_candidates = unique
+    if coupled_ib_aperture_tag is not None:
+        source_candidates = unique[unique != int(coupled_ib_aperture_tag)]
+    if not np.any(source_candidates >= 2):
         raise MeshError(
             f"No velocity source (tag >= 2) found. Tags: {unique.tolist()}"
         )

@@ -61,7 +61,9 @@ Mesh requirements:
 - coordinates are metres unless `mesh_scale` is set
 - mesh cells must contain triangles
 - triangle cells must have physical-group tags
-- triangle winding must be outward for canonical meshes
+- triangle winding must be outward for exterior-domain canonical meshes; coupled
+  infinite-baffle meshes with an aperture tag use the interior-domain contract
+  and carry negative signed volume
 - physical tag `1` is the rigid-wall convention
 - source/radiator tags must match `config.velocity_sources`
 - the default source tag is `2`

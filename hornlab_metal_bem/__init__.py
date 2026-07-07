@@ -74,6 +74,7 @@ def _resolve_mesh(mesh, config: SolveConfig) -> LoadedMesh:
         merge_tol=config.mesh_merge_tol,
         repair_normals=config.mesh_repair_normals,
         native_symmetry_plane=config.native_symmetry_plane,
+        aperture_tag=config.aperture_tag,
     )
 
 
