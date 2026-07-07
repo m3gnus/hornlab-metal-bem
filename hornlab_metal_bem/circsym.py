@@ -267,9 +267,9 @@ def run_sweep_circsym(
         ],
         dtype=np.int32,
     )
-    # Use one conservative azimuth rule across the sweep so the cached
-    # ring-quadrature geometry is truly frequency-invariant.
-    n_psi_by_frequency[:] = int(np.max(n_psi_by_frequency))
+    # Keep the quadrature order frequency-local. The assembly cache is keyed by
+    # n_psi, so repeated orders still reuse geometry without forcing low
+    # frequencies to pay the sweep's high-frequency field/assembly cost.
     n_psi_use_counts = _int_value_counts(n_psi_by_frequency)
     assembly_cache = _BoundaryAssemblyGeometryCache(
         meridian,
@@ -277,6 +277,7 @@ def run_sweep_circsym(
         geom=geom,
         reusable_n_psi=set(n_psi_use_counts),
         n_psi_use_counts=n_psi_use_counts,
+        cache_single_use=False,
     )
 
     pressure_rows: list[NDArray[np.complex128]] = []
@@ -380,6 +381,7 @@ def run_sweep_circsym(
             obs_points,
             k_field,
             config,
+            geom=geom,
             n_psi=n_psi,
         )
         sphere_pressure = (
@@ -390,6 +392,7 @@ def run_sweep_circsym(
                 np.asarray(config.observation.sphere_points, dtype=np.float64),
                 k_field,
                 config.circsym_baffle_z,
+                geom=geom,
                 n_psi=n_psi,
             )
             if config.observation.sphere_points is not None
@@ -634,7 +637,8 @@ def run_sweep_coupled_ib(
         ],
         dtype=np.int32,
     )
-    n_psi_by_frequency[:] = int(np.max(n_psi_by_frequency))
+    # Keep the quadrature order frequency-local; cached assembly geometry is
+    # stored per n_psi so wide sweeps do not run every case at the HF order.
     n_psi_use_counts = _int_value_counts(n_psi_by_frequency)
     assembly_cache = _BoundaryAssemblyGeometryCache(
         meridian,
@@ -642,6 +646,7 @@ def run_sweep_coupled_ib(
         geom=geom,
         reusable_n_psi=set(n_psi_use_counts),
         n_psi_use_counts=n_psi_use_counts,
+        cache_single_use=False,
     )
 
     pressure_rows: list[NDArray[np.complex128]] = []
@@ -1239,6 +1244,7 @@ class _BoundaryAssemblyGeometryCache:
         geom: SimpleNamespace | None = None,
         reusable_n_psi: set[int] | None = None,
         n_psi_use_counts: dict[int, int] | None = None,
+        cache_single_use: bool = True,
     ) -> None:
         self.meridian = meridian
         self.baffle_z = baffle_z
@@ -1251,6 +1257,7 @@ class _BoundaryAssemblyGeometryCache:
             if n_psi_use_counts is None
             else {int(key): int(value) for key, value in n_psi_use_counts.items()}
         )
+        self._cache_single_use = bool(cache_single_use)
         self._exhausted_n_psi: set[int] = set()
         self._static_s: NDArray[np.complex128] | None = None
         self._static_h: NDArray[np.complex128] | None = None
@@ -1290,10 +1297,10 @@ class _BoundaryAssemblyGeometryCache:
             None if self._remaining_uses is None else self._remaining_uses.get(n_psi_int)
         )
         if (
-            c_kernel is None
-            and remaining_uses is not None
+            remaining_uses is not None
             and remaining_uses <= 1
             and n_psi_int not in self._quadrature
+            and (c_kernel is None or not self._cache_single_use)
         ):
             return None
 
@@ -2787,6 +2794,7 @@ def _evaluate_observation_pressure(
     k: complex,
     config: SolveConfig,
     *,
+    geom: SimpleNamespace | None = None,
     n_psi: int,
 ) -> NDArray[np.complex128]:
     if config.observation.custom_points is None:
@@ -2797,6 +2805,7 @@ def _evaluate_observation_pressure(
             obs_points[0],
             k,
             config.circsym_baffle_z,
+            geom=geom,
             n_psi=n_psi,
         )
         return np.tile(first[None, :], (obs_points.shape[0], 1))
@@ -2810,6 +2819,7 @@ def _evaluate_observation_pressure(
             obs_points[plane_index],
             k,
             config.circsym_baffle_z,
+            geom=geom,
             n_psi=n_psi,
         )
     return out
@@ -2823,6 +2833,7 @@ def _evaluate_points_pressure(
     k: complex,
     baffle_z: float | None,
     *,
+    geom: SimpleNamespace | None = None,
     n_psi: int,
 ) -> NDArray[np.complex128]:
     pts = np.asarray(points, dtype=np.float64)
@@ -2830,7 +2841,8 @@ def _evaluate_points_pressure(
         raise ValueError(f"points must have shape (N, 3), got {pts.shape}")
     if pts.shape[0] == 0:
         return np.empty(0, dtype=np.complex128)
-    geom = meridian.segment_geometry()
+    if geom is None:
+        geom = meridian.segment_geometry()
     target_rho, target_z = _points_target_rho_z(pts)
     source_indices = np.arange(meridian.segment_count, dtype=np.int64)
     s_mat, h_mat = _integrate_field_segment_kernels_batched(
@@ -2843,7 +2855,7 @@ def _evaluate_points_pressure(
         baffle_z=baffle_z,
         n_psi=n_psi,
     )
-    rayleigh_sheet = _is_flat_baffled_sheet(meridian, baffle_z)
+    rayleigh_sheet = _is_flat_baffled_sheet(meridian, baffle_z, geom=geom)
     if rayleigh_sheet:
         # A coplanar baffled disk is an open Rayleigh radiator. The direct
         # closed-surface representation's double-layer pressure term is not
@@ -3140,10 +3152,16 @@ def _ring_dynamic_kernel_m0_targets_direct(
     )
 
 
-def _is_flat_baffled_sheet(meridian: MeridianMesh, baffle_z: float | None) -> bool:
+def _is_flat_baffled_sheet(
+    meridian: MeridianMesh,
+    baffle_z: float | None,
+    *,
+    geom: SimpleNamespace | None = None,
+) -> bool:
     if baffle_z is None:
         return False
-    geom = meridian.segment_geometry()
+    if geom is None:
+        geom = meridian.segment_geometry()
     active = geom.area_weights > 1e-30
     if not np.any(active):
         return False
