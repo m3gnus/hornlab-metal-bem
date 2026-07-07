@@ -9,6 +9,8 @@ from hornlab_metal_bem._constants import SPEED_OF_SOUND
 from hornlab_metal_bem.circsym import (
     MeridianMesh,
     _assemble_boundary_matrices,
+    _evaluate_points_pressure,
+    _is_flat_baffled_sheet,
     _integrate_segment_kernel,
     ring_kernel_m0,
 )
@@ -56,6 +58,44 @@ def _spherical_hankel1_derivative(order: int, x: float) -> complex:
         spherical_jn(order, x, derivative=True)
         + 1j * spherical_yn(order, x, derivative=True)
     )
+
+
+def _scalar_points_pressure(
+    meridian: MeridianMesh,
+    pressure: np.ndarray,
+    q_total: np.ndarray,
+    points: np.ndarray,
+    k: complex,
+    baffle_z: float | None,
+    *,
+    n_psi: int,
+) -> np.ndarray:
+    geom = meridian.segment_geometry()
+    out = np.empty(points.shape[0], dtype=np.complex128)
+    rayleigh_sheet = _is_flat_baffled_sheet(meridian, baffle_z)
+    for i, point in enumerate(points):
+        target_rho = float(np.hypot(float(point[0]), float(point[1])))
+        target_z = float(point[2])
+        s_row = np.empty(meridian.segment_count, dtype=np.complex128)
+        h_row = np.empty(meridian.segment_count, dtype=np.complex128)
+        for j in range(meridian.segment_count):
+            s_row[j], h_row[j] = _integrate_segment_kernel(
+                target_rho=target_rho,
+                target_z=target_z,
+                meridian=meridian,
+                geom=geom,
+                source_index=j,
+                k=k,
+                baffle_z=baffle_z,
+                n_psi=n_psi,
+                target_index=None,
+            )
+        out[i] = (
+            -(s_row @ q_total)
+            if rayleigh_sheet
+            else h_row @ pressure - s_row @ q_total
+        )
+    return out
 
 
 def _brute_force_ring_kernel(
@@ -173,6 +213,62 @@ def test_vectorized_boundary_assembly_matches_scalar_segment_integrals():
 
     np.testing.assert_allclose(S, S_ref, rtol=2e-13, atol=2e-14)
     np.testing.assert_allclose(H, H_ref, rtol=2e-13, atol=2e-14)
+
+
+def test_vectorized_field_evaluation_matches_scalar_closed_meridian():
+    k = 31.0 + 0.0j
+    meridian = _sphere_meridian(radius=0.1, segments=18)
+    rng = np.random.default_rng(12345)
+    pressure = rng.normal(size=meridian.segment_count) + 1j * rng.normal(
+        size=meridian.segment_count
+    )
+    q_total = rng.normal(size=meridian.segment_count) + 1j * rng.normal(
+        size=meridian.segment_count
+    )
+    theta = np.linspace(0.0, np.pi, 19)
+    points = np.column_stack(
+        [2.0 * np.sin(theta), np.zeros_like(theta), 2.0 * np.cos(theta)]
+    )
+    points = np.vstack(
+        [
+            points,
+            np.array([[0.052, 0.0, 0.092]], dtype=np.float64),
+        ]
+    )
+
+    vectorized = _evaluate_points_pressure(
+        meridian, pressure, q_total, points, k, None, n_psi=96
+    )
+    scalar = _scalar_points_pressure(
+        meridian, pressure, q_total, points, k, None, n_psi=96
+    )
+
+    np.testing.assert_allclose(vectorized, scalar, rtol=1e-10, atol=1e-12)
+
+
+def test_vectorized_field_evaluation_matches_scalar_baffled_sheet_rayleigh_branch():
+    k = 47.0 + 0.0j
+    meridian = _piston_meridian(radius=0.1, segments=16)
+    rng = np.random.default_rng(6789)
+    pressure = rng.normal(size=meridian.segment_count) + 1j * rng.normal(
+        size=meridian.segment_count
+    )
+    q_total = rng.normal(size=meridian.segment_count) + 1j * rng.normal(
+        size=meridian.segment_count
+    )
+    theta = np.linspace(0.0, 0.5 * np.pi, 17)
+    points = np.column_stack(
+        [3.0 * np.sin(theta), np.zeros_like(theta), 3.0 * np.cos(theta)]
+    )
+
+    vectorized = _evaluate_points_pressure(
+        meridian, pressure, q_total, points, k, 0.0, n_psi=96
+    )
+    scalar = _scalar_points_pressure(
+        meridian, pressure, q_total, points, k, 0.0, n_psi=96
+    )
+
+    np.testing.assert_allclose(vectorized, scalar, rtol=1e-10, atol=1e-12)
 
 
 def test_pulsating_sphere_recovers_analytic_impedance_and_uniform_directivity():

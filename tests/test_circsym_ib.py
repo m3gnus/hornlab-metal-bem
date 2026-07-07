@@ -13,7 +13,11 @@ from scipy.special import j1
 
 import hornlab_metal_bem as metal_bem
 from hornlab_metal_bem._constants import SPEED_OF_SOUND
-from hornlab_metal_bem.circsym import MeridianMesh
+from hornlab_metal_bem.circsym import (
+    MeridianMesh,
+    _evaluate_coupled_ib_points_pressure,
+    _integrate_segment_kernel,
+)
 from hornlab_metal_bem.config import ObservationConfig, SolveConfig, VelocityMode
 
 TAG_THROAT, TAG_WALL, TAG_DISC = 2, 3, 4
@@ -59,6 +63,49 @@ def test_coupled_ib_dispatch_is_taken_when_aperture_tag_present():
     res = _solve(_channel_meridian(0.05, 0.05, 0.002, h=0.0025), [4000.0])
     assert res.native_diagnostics[0].get("coupled_ib") is True
     assert res.native_diagnostics[0].get("aperture_tag") == TAG_DISC
+
+
+def test_vectorized_coupled_ib_field_matches_scalar_aperture_sum():
+    k = 52.0 + 0.0j
+    meridian = _channel_meridian(0.025, 0.05, 0.04, h=0.0025)
+    geom = meridian.segment_geometry()
+    aperture_indices = np.where(meridian.physical_tags == TAG_DISC)[0]
+    rng = np.random.default_rng(2468)
+    q_a = rng.normal(size=aperture_indices.size) + 1j * rng.normal(
+        size=aperture_indices.size
+    )
+    theta = np.linspace(0.0, np.pi, 20)
+    points = np.column_stack(
+        [2.0 * np.sin(theta), np.zeros_like(theta), 2.0 * np.cos(theta)]
+    )
+
+    vectorized = _evaluate_coupled_ib_points_pressure(
+        meridian, q_a, aperture_indices, points, k, geom=geom, n_psi=96
+    )
+    scalar = np.zeros(points.shape[0], dtype=np.complex128)
+    for point_index, point in enumerate(points):
+        target_z = float(point[2])
+        if target_z < 0.0:
+            continue
+        target_rho = float(np.hypot(float(point[0]), float(point[1])))
+        val = 0.0 + 0.0j
+        for aperture_local, aperture_index in enumerate(aperture_indices):
+            s_val, _ = _integrate_segment_kernel(
+                target_rho=target_rho,
+                target_z=target_z,
+                meridian=meridian,
+                geom=geom,
+                source_index=int(aperture_index),
+                k=k,
+                baffle_z=None,
+                n_psi=96,
+                target_index=None,
+            )
+            val += 2.0 * s_val * q_a[aperture_local]
+        scalar[point_index] = val
+
+    np.testing.assert_allclose(vectorized, scalar, rtol=1e-10, atol=1e-12)
+    assert vectorized[-1] == 0.0
 
 
 @pytest.mark.parametrize("ka", [1.0, 2.0, 3.0])

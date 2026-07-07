@@ -52,6 +52,10 @@ _AZIMUTH_POINTS_PER_KRHO = 4.0
 _LINE_QUAD_ORDER = 16
 _SINGULAR_LINE_QUAD_ORDER = 24
 _GRADED_POWER = 3.0
+_FIELD_KERNEL_BLOCK_ELEMENTS = 8_000_000
+_FIELD_KERNEL_MAX_TARGET_BLOCK = 64
+_FIELD_KERNEL_PARALLEL_TARGET_BLOCK = 8
+_FIELD_KERNEL_MAX_WORKERS = 8
 
 
 @dataclass
@@ -651,27 +655,15 @@ def run_sweep_coupled_ib(
 
         t_field = time.time()
         flat_obs = obs_points.reshape(-1, 3)
-        flat_pressure = np.zeros(flat_obs.shape[0], dtype=np.complex128)
-        for point_index, point in enumerate(flat_obs):
-            target_z = float(point[2])
-            if target_z < 0.0:
-                continue
-            target_rho = float(math.hypot(float(point[0]), float(point[1])))
-            val = 0.0 + 0.0j
-            for aperture_local, aperture_index in enumerate(idx_a):
-                s_val, _ = _integrate_segment_kernel(
-                    target_rho=target_rho,
-                    target_z=target_z,
-                    meridian=meridian,
-                    geom=geom,
-                    source_index=int(aperture_index),
-                    k=k,
-                    baffle_z=None,
-                    n_psi=n_psi,
-                    target_index=None,
-                )
-                val += 2.0 * s_val * q_a[aperture_local]
-            flat_pressure[point_index] = val
+        flat_pressure = _evaluate_coupled_ib_points_pressure(
+            meridian,
+            q_a,
+            idx_a,
+            flat_obs,
+            k,
+            geom=geom,
+            n_psi=n_psi,
+        )
         field_pressure = flat_pressure.reshape(n_planes, n_angles)
 
         sphere_pressure = None
@@ -680,27 +672,15 @@ def run_sweep_coupled_ib(
                 config.observation.sphere_points,
                 dtype=np.float64,
             )
-            sphere_pressure = np.zeros(sphere_points.shape[0], dtype=np.complex128)
-            for point_index, point in enumerate(sphere_points):
-                target_z = float(point[2])
-                if target_z < 0.0:
-                    continue
-                target_rho = float(math.hypot(float(point[0]), float(point[1])))
-                val = 0.0 + 0.0j
-                for aperture_local, aperture_index in enumerate(idx_a):
-                    s_val, _ = _integrate_segment_kernel(
-                        target_rho=target_rho,
-                        target_z=target_z,
-                        meridian=meridian,
-                        geom=geom,
-                        source_index=int(aperture_index),
-                        k=k,
-                        baffle_z=None,
-                        n_psi=n_psi,
-                        target_index=None,
-                    )
-                    val += 2.0 * s_val * q_a[aperture_local]
-                sphere_pressure[point_index] = val
+            sphere_pressure = _evaluate_coupled_ib_points_pressure(
+                meridian,
+                q_a,
+                idx_a,
+                sphere_points,
+                k,
+                geom=geom,
+                n_psi=n_psi,
+            )
         field_s = time.time() - t_field
 
         directivity = _directivity_from_pressure(field_pressure, on_axis_idx)
@@ -1368,35 +1348,318 @@ def _evaluate_points_pressure(
     n_psi: int,
 ) -> NDArray[np.complex128]:
     pts = np.asarray(points, dtype=np.float64)
-    out = np.empty(pts.shape[0], dtype=np.complex128)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError(f"points must have shape (N, 3), got {pts.shape}")
+    if pts.shape[0] == 0:
+        return np.empty(0, dtype=np.complex128)
     geom = meridian.segment_geometry()
+    target_rho, target_z = _points_target_rho_z(pts)
+    source_indices = np.arange(meridian.segment_count, dtype=np.int64)
+    s_mat, h_mat = _integrate_field_segment_kernels_batched(
+        target_rho=target_rho,
+        target_z=target_z,
+        meridian=meridian,
+        geom=geom,
+        source_indices=source_indices,
+        k=k,
+        baffle_z=baffle_z,
+        n_psi=n_psi,
+    )
     rayleigh_sheet = _is_flat_baffled_sheet(meridian, baffle_z)
-    for i, point in enumerate(pts):
-        target_rho = float(math.hypot(float(point[0]), float(point[1])))
-        target_z = float(point[2])
-        s_row = np.empty(meridian.segment_count, dtype=np.complex128)
-        h_row = np.empty(meridian.segment_count, dtype=np.complex128)
-        for j in range(meridian.segment_count):
-            s_row[j], h_row[j] = _integrate_segment_kernel(
-                target_rho=target_rho,
-                target_z=target_z,
-                meridian=meridian,
-                geom=geom,
-                source_index=j,
-                k=k,
-                baffle_z=baffle_z,
-                n_psi=n_psi,
-                target_index=None,
-            )
-        if rayleigh_sheet:
-            # A coplanar baffled disk is an open Rayleigh radiator. The direct
-            # closed-surface representation's double-layer pressure term is not
-            # part of the textbook piston field, so use the half-space
-            # single-layer integral for this narrow geometry.
-            out[i] = -(s_row @ q_total)
-        else:
-            out[i] = h_row @ pressure - s_row @ q_total
+    if rayleigh_sheet:
+        # A coplanar baffled disk is an open Rayleigh radiator. The direct
+        # closed-surface representation's double-layer pressure term is not
+        # part of the textbook piston field, so use the half-space single-layer
+        # integral for this narrow geometry.
+        return np.asarray(-(s_mat @ q_total), dtype=np.complex128)
+    return np.asarray(h_mat @ pressure - s_mat @ q_total, dtype=np.complex128)
+
+
+def _evaluate_coupled_ib_points_pressure(
+    meridian: MeridianMesh,
+    aperture_neumann: NDArray[np.complex128],
+    aperture_indices: NDArray[np.int64] | NDArray[np.int32],
+    points: NDArray[np.float64],
+    k: complex,
+    *,
+    geom: SimpleNamespace | None = None,
+    n_psi: int,
+) -> NDArray[np.complex128]:
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError(f"points must have shape (N, 3), got {pts.shape}")
+    out = np.zeros(pts.shape[0], dtype=np.complex128)
+    if pts.shape[0] == 0:
+        return out
+    target_rho, target_z = _points_target_rho_z(pts)
+    active = target_z >= 0.0
+    if not np.any(active):
+        return out
+    if geom is None:
+        geom = meridian.segment_geometry()
+    indices = np.asarray(aperture_indices, dtype=np.int64)
+    if indices.size == 0:
+        return out
+    s_mat, _ = _integrate_field_segment_kernels_batched(
+        target_rho=target_rho[active],
+        target_z=target_z[active],
+        meridian=meridian,
+        geom=geom,
+        source_indices=indices,
+        k=k,
+        baffle_z=None,
+        n_psi=n_psi,
+    )
+    out[active] = 2.0 * (s_mat @ np.asarray(aperture_neumann, dtype=np.complex128))
     return out
+
+
+def _points_target_rho_z(
+    points: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    pts = np.asarray(points, dtype=np.float64)
+    return (
+        np.hypot(pts[:, 0], pts[:, 1]).astype(np.float64, copy=False),
+        pts[:, 2].astype(np.float64, copy=False),
+    )
+
+
+def _integrate_field_segment_kernels_batched(
+    *,
+    target_rho: NDArray[np.float64],
+    target_z: NDArray[np.float64],
+    meridian: MeridianMesh,
+    geom: SimpleNamespace,
+    source_indices: NDArray[np.int64] | NDArray[np.int32],
+    k: complex,
+    baffle_z: float | None,
+    n_psi: int,
+) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    target_rho_arr = np.asarray(target_rho, dtype=np.float64).reshape(-1)
+    target_z_arr = np.asarray(target_z, dtype=np.float64).reshape(-1)
+    if target_rho_arr.shape != target_z_arr.shape:
+        raise ValueError("target_rho and target_z must have the same shape")
+    indices = np.asarray(source_indices, dtype=np.int64).reshape(-1)
+    if target_rho_arr.size == 0 or indices.size == 0:
+        shape = (target_rho_arr.size, indices.size)
+        return (
+            np.empty(shape, dtype=np.complex128),
+            np.empty(shape, dtype=np.complex128),
+        )
+
+    s_mat = np.empty((target_rho_arr.size, indices.size), dtype=np.complex128)
+    h_mat = np.empty_like(s_mat)
+    workers = _field_kernel_worker_count(target_rho_arr.size, indices.size)
+    block_size = _field_kernel_target_block_size(indices.size, int(n_psi))
+    if workers > 1:
+        block_size = min(block_size, _FIELD_KERNEL_PARALLEL_TARGET_BLOCK)
+    ranges = [
+        (start, min(target_rho_arr.size, start + block_size))
+        for start in range(0, target_rho_arr.size, block_size)
+    ]
+
+    def compute_block(
+        span: tuple[int, int],
+    ) -> tuple[int, int, NDArray[np.complex128], NDArray[np.complex128]]:
+        start, stop = span
+        block_rho = target_rho_arr[start:stop]
+        block_z = target_z_arr[start:stop]
+        s_block, h_block = _integrate_ordinary_field_kernels_targets_batched(
+            target_rho=block_rho,
+            target_z=block_z,
+            meridian=meridian,
+            geom=geom,
+            source_indices=indices,
+            k=k,
+            baffle_z=baffle_z,
+            n_psi=n_psi,
+        )
+        near_mask = ~_ordinary_far_source_mask_targets(
+            block_rho,
+            block_z,
+            geom,
+            source_indices=indices,
+        )
+        if np.any(near_mask):
+            near_points, near_sources = np.nonzero(near_mask)
+            for point_local, source_local in zip(near_points, near_sources):
+                s_val, h_val = _integrate_segment_kernel(
+                    target_rho=float(block_rho[point_local]),
+                    target_z=float(block_z[point_local]),
+                    meridian=meridian,
+                    geom=geom,
+                    source_index=int(indices[source_local]),
+                    k=k,
+                    baffle_z=baffle_z,
+                    n_psi=n_psi,
+                    target_index=None,
+                )
+                s_block[point_local, source_local] = s_val
+                h_block[point_local, source_local] = h_val
+        return start, stop, s_block, h_block
+
+    if workers <= 1 or len(ranges) <= 1:
+        for span in ranges:
+            start, stop, s_block, h_block = compute_block(span)
+            s_mat[start:stop] = s_block
+            h_mat[start:stop] = h_block
+    else:
+        with ThreadPoolExecutor(max_workers=min(workers, len(ranges))) as executor:
+            for start, stop, s_block, h_block in executor.map(compute_block, ranges):
+                s_mat[start:stop] = s_block
+                h_mat[start:stop] = h_block
+    return s_mat, h_mat
+
+
+def _field_kernel_target_block_size(source_count: int, n_psi: int) -> int:
+    per_target = max(1, int(source_count) * _LINE_QUAD_ORDER * max(1, int(n_psi)))
+    by_elements = max(1, _FIELD_KERNEL_BLOCK_ELEMENTS // per_target)
+    return max(1, min(_FIELD_KERNEL_MAX_TARGET_BLOCK, int(by_elements)))
+
+
+def _field_kernel_worker_count(target_count: int, source_count: int) -> int:
+    if int(target_count) < 16 or int(source_count) < 16:
+        return 1
+    raw = os.environ.get("HORNLAB_CIRCSYM_FIELD_THREADS")
+    if raw is not None:
+        try:
+            return max(1, min(int(target_count), int(raw)))
+        except ValueError:
+            return 1
+    return max(1, min(int(target_count), _FIELD_KERNEL_MAX_WORKERS, os.cpu_count() or 1))
+
+
+def _ordinary_far_source_mask_targets(
+    target_rho: NDArray[np.float64],
+    target_z: NDArray[np.float64],
+    geom: SimpleNamespace,
+    *,
+    source_indices: NDArray[np.int64] | NDArray[np.int32],
+) -> NDArray[np.bool_]:
+    rho = np.asarray(target_rho, dtype=np.float64).reshape(-1)
+    z = np.asarray(target_z, dtype=np.float64).reshape(-1)
+    indices = np.asarray(source_indices, dtype=np.int64).reshape(-1)
+    target = np.stack([rho, z], axis=1)
+    p0 = geom.p0[indices]
+    delta = geom.delta[indices]
+    lengths = geom.lengths[indices]
+    denom = np.maximum(lengths * lengths, 1.0e-30)
+    u_star = np.einsum("pnd,nd->pn", target[:, None, :] - p0[None, :, :], delta) / denom
+    u_clamped = np.clip(u_star, 0.0, 1.0)
+    closest = p0[None, :, :] + u_clamped[:, :, None] * delta[None, :, :]
+    distance = np.linalg.norm(target[:, None, :] - closest, axis=2)
+    return distance > 1.25 * lengths[None, :]
+
+
+def _integrate_ordinary_field_kernels_targets_batched(
+    *,
+    target_rho: NDArray[np.float64],
+    target_z: NDArray[np.float64],
+    meridian: MeridianMesh,
+    geom: SimpleNamespace,
+    source_indices: NDArray[np.int64] | NDArray[np.int32],
+    k: complex,
+    baffle_z: float | None,
+    n_psi: int,
+) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    indices = np.asarray(source_indices, dtype=np.int64)
+    target_rho_arr = np.asarray(target_rho, dtype=np.float64).reshape(-1)
+    target_z_arr = np.asarray(target_z, dtype=np.float64).reshape(-1)
+    if indices.size == 0 or target_rho_arr.size == 0:
+        shape = (target_rho_arr.size, indices.size)
+        return (
+            np.empty(shape, dtype=np.complex128),
+            np.empty(shape, dtype=np.complex128),
+        )
+
+    u, w = _ordinary_interval(0.0, 1.0)
+    psi, psi_weights = _leggauss_psi(int(n_psi))
+    cos_psi = np.cos(psi)[None, None, :]
+    p0 = geom.p0[indices]
+    delta = geom.delta[indices]
+    lengths = geom.lengths[indices]
+    normal = meridian.normals[indices]
+    normal_rho = normal[:, 0][None, :, None]
+    normal_z = normal[:, 1][None, :, None]
+    rt = target_rho_arr[:, None, None]
+    zt = target_z_arr[:, None, None]
+
+    s_out = np.zeros((target_rho_arr.size, indices.size), dtype=np.complex128)
+    h_out = np.zeros_like(s_out)
+    for u_node, w_node in zip(u, w):
+        source = p0 + float(u_node) * delta
+        rho_s = source[:, 0]
+        z_s = source[:, 1]
+        measure = rho_s * lengths * float(w_node)
+        if not np.any(measure != 0.0):
+            continue
+        rs = rho_s[None, :, None]
+        zs = z_s[None, :, None]
+        g, h = _ring_dynamic_kernel_m0_targets_direct(
+            rt,
+            zt,
+            rs,
+            zs,
+            normal_rho,
+            normal_z,
+            cos_psi,
+            psi_weights,
+            k,
+        )
+
+        if baffle_z is not None:
+            z_img = 2.0 * float(baffle_z) - z_s
+            g_i, h_i = _ring_dynamic_kernel_m0_targets_direct(
+                rt,
+                zt,
+                rs,
+                z_img[None, :, None],
+                normal_rho,
+                -normal_z,
+                cos_psi,
+                psi_weights,
+                k,
+            )
+            g = g + g_i
+            h = h + h_i
+
+        s_out += g * measure[None, :]
+        h_out += h * measure[None, :]
+
+    return s_out, h_out
+
+
+def _ring_dynamic_kernel_m0_targets_direct(
+    target_rho: NDArray[np.float64],
+    target_z: NDArray[np.float64],
+    source_rho: NDArray[np.float64],
+    source_z: NDArray[np.float64],
+    normal_rho: NDArray[np.float64],
+    normal_z: NDArray[np.float64],
+    cos_psi: NDArray[np.float64],
+    psi_weights: NDArray[np.float64],
+    k: complex,
+) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    dz = source_z - target_z
+    R2 = (
+        target_rho * target_rho
+        + source_rho * source_rho
+        - 2.0 * target_rho * source_rho * cos_psi
+        + dz * dz
+    )
+    R = np.sqrt(np.maximum(R2, 0.0))
+    phase = np.exp(1j * complex(k) * R)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        g = phase / (4.0 * np.pi * R)
+        num = (source_rho - target_rho * cos_psi) * normal_rho + dz * normal_z
+        h = phase * (1j * complex(k) * R - 1.0) * num / (4.0 * np.pi * R ** 3)
+    g = np.where(R > 1e-13, g, 0.0 + 0.0j)
+    h = np.where(R > 1e-13, h, 0.0 + 0.0j)
+    weights = psi_weights[None, None, :]
+    return (
+        np.asarray(2.0 * np.sum(g * weights, axis=2), dtype=np.complex128),
+        np.asarray(2.0 * np.sum(h * weights, axis=2), dtype=np.complex128),
+    )
 
 
 def _is_flat_baffled_sheet(meridian: MeridianMesh, baffle_z: float | None) -> bool:
