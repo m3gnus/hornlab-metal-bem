@@ -3721,6 +3721,124 @@ def test_native_executable_coupled_ib_uses_rayleigh_aperture_field(
     assert np.linalg.norm(field[:2]) > 0.0
 
 
+def test_native_executable_coupled_ib_gpu_schur_matches_cpu_augmented(
+    monkeypatch,
+    tmp_path,
+):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    buffers = _ib_box_geometry_buffers()
+    neumann = np.zeros((1, buffers.n_triangles), dtype=np.complex64)
+    neumann[0, buffers.physical_tags_i32 == 1] = 1.0 + 0.0j
+    frequency_hz = np.array([220.0], dtype=np.float64)
+    k_real = np.array([np.float32(2.0 * np.pi * 220.0 / 343.0)], dtype=np.float32)
+    observation_points = np.array(
+        [
+            [0.0, 0.0, 0.7],
+            [0.3, 0.0, 0.8],
+            [0.0, 0.2, 0.8],
+        ],
+        dtype=np.float32,
+    )
+
+    def run_case(label: str, aperture_assembly: str | None, solve_mode: str | None):
+        monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+        monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
+        monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_REGULAR_ASSEMBLY_IMPL", "entrywise")
+        monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", raising=False)
+        monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE", raising=False)
+        monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_IMPL", raising=False)
+        monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_REFINE", raising=False)
+        if aperture_assembly is None:
+            monkeypatch.delenv(
+                "HORNLAB_METAL_BEM_NATIVE_COUPLED_IB_APERTURE_ASSEMBLY",
+                raising=False,
+            )
+        else:
+            monkeypatch.setenv(
+                "HORNLAB_METAL_BEM_NATIVE_COUPLED_IB_APERTURE_ASSEMBLY",
+                aperture_assembly,
+            )
+        if solve_mode is None:
+            monkeypatch.delenv("HORNLAB_METAL_BEM_NATIVE_COUPLED_IB_SOLVE", raising=False)
+        else:
+            monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_COUPLED_IB_SOLVE", solve_mode)
+
+        with MetalNativeStandardSession.create_session(
+            geometry_buffers=buffers,
+            work_dir=tmp_path / f"native-coupled-ib-{label}-session",
+            session_id=f"native-coupled-ib-{label}-test",
+            aperture_tag=7,
+            velocity_source_tags=[1],
+        ) as session:
+            solved = session.assemble_solve_evaluate_standard_neumann_batch(
+                frequency_hz,
+                k_real,
+                neumann,
+                observation_points,
+                operation_id=f"resident-coupled-ib-{label}",
+                source_tags=[1],
+            )[0]
+
+        pressure = np.fromfile(
+            solved.pressure_real_f32,
+            dtype="<f4",
+        ) + 1j * np.fromfile(solved.pressure_imag_f32, dtype="<f4")
+        field = np.fromfile(
+            solved.field_real_f32,
+            dtype="<f4",
+        ) + 1j * np.fromfile(solved.field_imag_f32, dtype="<f4")
+        return solved, pressure, field
+
+    gpu_schur, gpu_pressure, gpu_field = run_case(
+        "gpu-schur",
+        aperture_assembly=None,
+        solve_mode=None,
+    )
+    cpu_augmented, cpu_pressure, cpu_field = run_case(
+        "cpu-augmented",
+        aperture_assembly="cpu",
+        solve_mode="augmented",
+    )
+
+    assert gpu_schur.lapack_info == 0
+    assert cpu_augmented.lapack_info == 0
+    assert gpu_schur.diagnostics["ib_aperture_assembly_implementation"] == (
+        "swift_native_metal_aperture_slp_blocks"
+    )
+    assert gpu_schur.diagnostics["ib_coupled_solve"] == "schur"
+    assert (
+        gpu_schur.diagnostics["solve_implementation"]
+        == "accelerate_lapack_cgesv_coupled_ib_schur"
+    )
+    assert "ib_aperture_metal_dispatch" in gpu_schur.diagnostics
+    assert cpu_augmented.diagnostics["ib_aperture_assembly_implementation"] == (
+        "swift_native_cpu_aperture_slp_blocks"
+    )
+    assert cpu_augmented.diagnostics["ib_coupled_solve"] == "augmented"
+    assert (
+        cpu_augmented.diagnostics["solve_implementation"]
+        == "accelerate_lapack_cgesv_coupled_ib_augmented"
+    )
+    assert "ib_aperture_metal_dispatch" not in cpu_augmented.diagnostics
+    assert np.all(np.isfinite(gpu_pressure))
+    assert np.all(np.isfinite(gpu_field))
+    assert np.all(np.isfinite(cpu_pressure))
+    assert np.all(np.isfinite(cpu_field))
+
+    pressure_rel = np.linalg.norm(gpu_pressure - cpu_pressure) / np.linalg.norm(
+        cpu_pressure
+    )
+    field_rel = np.linalg.norm(gpu_field - cpu_field) / np.linalg.norm(cpu_field)
+    assert pressure_rel < 5.0e-4
+    assert field_rel < 5.0e-4
+
+
 def test_native_executable_coupled_ib_yz_xz_quadrant_matches_full(
     monkeypatch,
     tmp_path,

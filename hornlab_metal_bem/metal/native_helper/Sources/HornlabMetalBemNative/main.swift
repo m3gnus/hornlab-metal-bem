@@ -393,6 +393,12 @@ struct MetalDuffyBlockOutput {
     let dispatch: [String: Any]
 }
 
+struct MetalSlpProjectionOutput {
+    let projection: SlpProjection
+    let dispatch: [String: Any]
+    let seconds: Double
+}
+
 struct DenseSolveRun {
     let pressure: [Complex32]
     let implementation: String
@@ -891,6 +897,8 @@ struct ApertureCoupling {
     let rayleighSlp: SlpProjection
     let transformSeconds: Double
     let usedDuffy: Bool
+    let assemblyImplementation: String
+    let metalDispatch: [String: Any]?
 }
 
 func caseApertureTag(geom: Geometry, casePayload: [String: Any]) throws -> Int? {
@@ -955,25 +963,132 @@ func buildApertureGeometry(geom: Geometry, tag: Int) throws -> ApertureGeometry 
     )
 }
 
+func apertureTriangleLocalByGlobal(_ aperture: ApertureGeometry) -> [Int: Int] {
+    var out: [Int: Int] = [:]
+    out.reserveCapacity(aperture.triangles.count)
+    for (local, tri) in aperture.triangles.enumerated() {
+        out[tri] = local
+    }
+    return out
+}
+
+func coupledIBDuffyRules() throws -> [Int: DuffyRule] {
+    [
+        1: try duffyRule(kind: 1),
+        2: try duffyRule(kind: 2),
+        3: try duffyRule(kind: 3),
+    ]
+}
+
+func applyApertureSlpProjectionDuffyCorrections(
+    re: inout [Float],
+    im: inout [Float],
+    geom: Geometry,
+    aperture: ApertureGeometry,
+    pairList: DuffyPairList,
+    rules: [Int: DuffyRule],
+    k: Float,
+    kImag: Float,
+    testTriangles: [Int]? = nil
+) throws {
+    let d = aperture.triangles.count
+    let testSet = testTriangles.map { Set($0) }
+    let apertureTriangleLocalByGlobal = apertureTriangleLocalByGlobal(aperture)
+    for pair in pairList.pairs {
+        if let testSet, !testSet.contains(pair.test) {
+            continue
+        }
+        guard let apertureTriIndex = apertureTriangleLocalByGlobal[pair.trial] else {
+            continue
+        }
+        let regular = regularPairBlocks(
+            geom: geom,
+            test: pair.test,
+            trial: pair.trial,
+            testImageMask: pair.testImageMask,
+            trialImageMask: pair.trialImageMask,
+            k: k,
+            kImag: kImag
+        )
+        let singular = try singularPairBlocks(
+            geom: geom,
+            pair: pair,
+            rules: rules,
+            k: k,
+            kImag: kImag
+        )
+        for i in 0..<3 {
+            let row = geom.p1Dof(pair.test, i)
+            let delta = singular.slp[i] - regular.slp[i]
+            let base = row * d
+            re[base + apertureTriIndex] += delta.re
+            im[base + apertureTriIndex] += delta.im
+        }
+    }
+}
+
+func applyApertureAverageSlpProjectionDuffyCorrections(
+    re: inout [Float],
+    im: inout [Float],
+    geom: Geometry,
+    aperture: ApertureGeometry,
+    pairList: DuffyPairList,
+    rules: [Int: DuffyRule],
+    k: Float,
+    kImag: Float
+) throws {
+    let m = aperture.triangles.count
+    let apertureTriangleLocalByGlobal = apertureTriangleLocalByGlobal(aperture)
+    for pair in pairList.pairs {
+        guard pair.testImageMask == 0,
+              let rowLocal = apertureTriangleLocalByGlobal[pair.test],
+              let colLocal = apertureTriangleLocalByGlobal[pair.trial] else {
+            continue
+        }
+        let regular = regularPairBlocks(
+            geom: geom,
+            test: pair.test,
+            trial: pair.trial,
+            testImageMask: pair.testImageMask,
+            trialImageMask: pair.trialImageMask,
+            k: k,
+            kImag: kImag
+        )
+        let singular = try singularPairBlocks(
+            geom: geom,
+            pair: pair,
+            rules: rules,
+            k: k,
+            kImag: kImag
+        )
+        var delta = Complex32.zero
+        for i in 0..<3 {
+            delta = delta + (singular.slp[i] - regular.slp[i])
+        }
+        let invArea = Float(1.0) / max(geom.areas[pair.test], Float.leastNonzeroMagnitude)
+        let value = delta * invArea
+        let idx = rowLocal * m + colLocal
+        re[idx] += value.re
+        im[idx] += value.im
+    }
+}
+
 func assembleApertureSlpProjection(
     geom: Geometry,
     aperture: ApertureGeometry,
     k: Float,
     kImag: Float,
     includeDuffy: Bool,
-    testTriangles: [Int]? = nil
+    testTriangles: [Int]? = nil,
+    pairList: DuffyPairList? = nil,
+    rules: [Int: DuffyRule]? = nil
 ) throws -> SlpProjection {
     let n = geom.p1DofCount
     let d = aperture.triangles.count
     let imageMasks = [0] + symmetryImageMasks(geom.symmetryPlane)
     let tests = testTriangles ?? Array(0..<geom.nTriangles)
-    let testSet = testTriangles.map { Set($0) }
     var re = Array(repeating: Float(0.0), count: n * d)
     var im = Array(repeating: Float(0.0), count: n * d)
-    var apertureTriangleLocalByGlobal: [Int: Int] = [:]
-    for (local, tri) in aperture.triangles.enumerated() {
-        apertureTriangleLocalByGlobal[tri] = local
-    }
 
     for (apertureTriIndex, trial) in aperture.triangles.enumerated() {
         for test in tests {
@@ -1004,43 +1119,17 @@ func assembleApertureSlpProjection(
     }
 
     if includeDuffy {
-        let pairList = try buildDuffyPairList(geom)
-        let rules = [
-            1: try duffyRule(kind: 1),
-            2: try duffyRule(kind: 2),
-            3: try duffyRule(kind: 3),
-        ]
-        for pair in pairList.pairs {
-            if let testSet, !testSet.contains(pair.test) {
-                continue
-            }
-            guard let apertureTriIndex = apertureTriangleLocalByGlobal[pair.trial] else {
-                continue
-            }
-            let regular = regularPairBlocks(
-                geom: geom,
-                test: pair.test,
-                trial: pair.trial,
-                testImageMask: pair.testImageMask,
-                trialImageMask: pair.trialImageMask,
-                k: k,
-                kImag: kImag
-            )
-            let singular = try singularPairBlocks(
-                geom: geom,
-                pair: pair,
-                rules: rules,
-                k: k,
-                kImag: kImag
-            )
-            for i in 0..<3 {
-                let row = geom.p1Dof(pair.test, i)
-                let delta = singular.slp[i] - regular.slp[i]
-                let base = row * d
-                re[base + apertureTriIndex] += delta.re
-                im[base + apertureTriIndex] += delta.im
-            }
-        }
+        try applyApertureSlpProjectionDuffyCorrections(
+            re: &re,
+            im: &im,
+            geom: geom,
+            aperture: aperture,
+            pairList: pairList ?? buildDuffyPairList(geom),
+            rules: rules ?? coupledIBDuffyRules(),
+            k: k,
+            kImag: kImag,
+            testTriangles: testTriangles
+        )
     }
 
     return SlpProjection(re: re, im: im, rows: n, cols: d)
@@ -1051,16 +1140,14 @@ func assembleApertureAverageSlpProjection(
     aperture: ApertureGeometry,
     k: Float,
     kImag: Float,
-    includeDuffy: Bool
+    includeDuffy: Bool,
+    pairList: DuffyPairList? = nil,
+    rules: [Int: DuffyRule]? = nil
 ) throws -> SlpProjection {
     let m = aperture.triangles.count
     let imageMasks = [0] + symmetryImageMasks(geom.symmetryPlane)
     var re = Array(repeating: Float(0.0), count: m * m)
     var im = Array(repeating: Float(0.0), count: m * m)
-    var apertureTriangleLocalByGlobal: [Int: Int] = [:]
-    for (local, tri) in aperture.triangles.enumerated() {
-        apertureTriangleLocalByGlobal[tri] = local
-    }
 
     for (rowLocal, test) in aperture.triangles.enumerated() {
         let invArea = Float(1.0) / max(geom.areas[test], Float.leastNonzeroMagnitude)
@@ -1088,44 +1175,16 @@ func assembleApertureAverageSlpProjection(
     }
 
     if includeDuffy {
-        let pairList = try buildDuffyPairList(geom)
-        let rules = [
-            1: try duffyRule(kind: 1),
-            2: try duffyRule(kind: 2),
-            3: try duffyRule(kind: 3),
-        ]
-        for pair in pairList.pairs {
-            guard pair.testImageMask == 0,
-                  let rowLocal = apertureTriangleLocalByGlobal[pair.test],
-                  let colLocal = apertureTriangleLocalByGlobal[pair.trial] else {
-                continue
-            }
-            let regular = regularPairBlocks(
-                geom: geom,
-                test: pair.test,
-                trial: pair.trial,
-                testImageMask: pair.testImageMask,
-                trialImageMask: pair.trialImageMask,
-                k: k,
-                kImag: kImag
-            )
-            let singular = try singularPairBlocks(
-                geom: geom,
-                pair: pair,
-                rules: rules,
-                k: k,
-                kImag: kImag
-            )
-            var delta = Complex32.zero
-            for i in 0..<3 {
-                delta = delta + (singular.slp[i] - regular.slp[i])
-            }
-            let invArea = Float(1.0) / max(geom.areas[pair.test], Float.leastNonzeroMagnitude)
-            let value = delta * invArea
-            let idx = rowLocal * m + colLocal
-            re[idx] += value.re
-            im[idx] += value.im
-        }
+        try applyApertureAverageSlpProjectionDuffyCorrections(
+            re: &re,
+            im: &im,
+            geom: geom,
+            aperture: aperture,
+            pairList: pairList ?? buildDuffyPairList(geom),
+            rules: rules ?? coupledIBDuffyRules(),
+            k: k,
+            kImag: kImag
+        )
     }
 
     return SlpProjection(re: re, im: im, rows: m, cols: m)
@@ -1137,30 +1196,83 @@ func buildCoupledIBCoupling(
     k: Float,
     kImag: Float,
     fieldK: Float,
-    includeDuffy: Bool
+    includeDuffy: Bool,
+    residentContext: ResidentMetalContext? = nil
 ) throws -> ApertureCoupling {
     let start = CFAbsoluteTimeGetCurrent()
     let aperture = try buildApertureGeometry(geom: geom, tag: apertureTag)
-    let interiorSlp = try assembleApertureSlpProjection(
-        geom: geom,
-        aperture: aperture,
-        k: k,
-        kImag: kImag,
-        includeDuffy: includeDuffy
+    let assemblyMode = try requestedCoupledIBApertureAssembly(
+        hasResidentContext: residentContext != nil
     )
-    let rayleighSlp = try assembleApertureAverageSlpProjection(
-        geom: geom,
-        aperture: aperture,
-        k: fieldK,
-        kImag: 0.0,
-        includeDuffy: includeDuffy
-    )
+    let pairList: DuffyPairList?
+    let rules: [Int: DuffyRule]?
+    if includeDuffy {
+        if let residentContext {
+            pairList = residentContext.pairList
+            rules = residentContext.rules
+        } else {
+            pairList = try buildDuffyPairList(geom)
+            rules = try coupledIBDuffyRules()
+        }
+    } else {
+        pairList = nil
+        rules = nil
+    }
+    let interiorSlp: SlpProjection
+    let rayleighSlp: SlpProjection
+    var metalDispatch: [String: Any]? = nil
+    if assemblyMode == "gpu" {
+        guard let residentContext else {
+            try fail("\(coupledIBApertureAssemblyEnv)=gpu requires a resident Metal context")
+        }
+        let interior = try residentContext.assembleApertureSlpProjectionMetal(
+            aperture: aperture,
+            k: k,
+            kImag: kImag,
+            includeDuffy: includeDuffy
+        )
+        let rayleigh = try residentContext.assembleApertureAverageSlpProjectionMetal(
+            aperture: aperture,
+            k: fieldK,
+            kImag: 0.0,
+            includeDuffy: includeDuffy
+        )
+        interiorSlp = interior.projection
+        rayleighSlp = rayleigh.projection
+        metalDispatch = [
+            "interior_slp": interior.dispatch,
+            "rayleigh_slp": rayleigh.dispatch,
+        ]
+    } else {
+        interiorSlp = try assembleApertureSlpProjection(
+            geom: geom,
+            aperture: aperture,
+            k: k,
+            kImag: kImag,
+            includeDuffy: includeDuffy,
+            pairList: pairList,
+            rules: rules
+        )
+        rayleighSlp = try assembleApertureAverageSlpProjection(
+            geom: geom,
+            aperture: aperture,
+            k: fieldK,
+            kImag: 0.0,
+            includeDuffy: includeDuffy,
+            pairList: pairList,
+            rules: rules
+        )
+    }
     return ApertureCoupling(
         aperture: aperture,
         interiorSlp: interiorSlp,
         rayleighSlp: rayleighSlp,
         transformSeconds: CFAbsoluteTimeGetCurrent() - start,
-        usedDuffy: includeDuffy
+        usedDuffy: includeDuffy,
+        assemblyImplementation: assemblyMode == "gpu"
+            ? "swift_native_metal_aperture_slp_blocks"
+            : "swift_native_cpu_aperture_slp_blocks",
+        metalDispatch: metalDispatch
     )
 }
 
@@ -3505,6 +3617,77 @@ kernel void assemble_rhs_source_regular(
     outIm[row] = acc.y * rowWeight;
 }
 
+kernel void assemble_aperture_slp_projection(
+    device float *outRe [[buffer(0)]],
+    device float *outIm [[buffer(1)]],
+    device const float *px [[buffer(2)]],
+    device const float *py [[buffer(3)]],
+    device const float *pz [[buffer(4)]],
+    device const int *triangles [[buffer(5)]],
+    device const float *areas [[buffer(6)]],
+    device const int *incTri [[buffer(7)]],
+    device const int *incLoc [[buffer(8)]],
+    device const int *counts [[buffer(9)]],
+    device const int *apertureTris [[buffer(10)]],
+    constant Params &params [[buffer(11)]],
+    constant int &apertureCount [[buffer(12)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    int total = params.nDof * apertureCount;
+    if (gid >= uint(total)) {
+        return;
+    }
+    int idx = int(gid);
+    int row = idx / apertureCount;
+    int col = idx - row * apertureCount;
+    int trialTri = apertureTris[col];
+    float2 acc = float2(0.0f, 0.0f);
+    float rowWeight = p1_row_weight(
+        row, px, py, triangles, incTri, incLoc, params);
+    for (int rs = 0; rs < counts[row]; ++rs) {
+        int testTri = incTri[row * params.maxInc + rs];
+        int testLocal = incLoc[row * params.maxInc + rs];
+        acc += regular_slp_entry(
+            px, py, pz, triangles, areas, params.nTriangles,
+            testTri, trialTri, testLocal, SYMMETRY_PLANE, params.k, params.kImag);
+    }
+    outRe[idx] = acc.x * rowWeight;
+    outIm[idx] = acc.y * rowWeight;
+}
+
+kernel void assemble_aperture_average_slp_projection(
+    device float *outRe [[buffer(0)]],
+    device float *outIm [[buffer(1)]],
+    device const float *px [[buffer(2)]],
+    device const float *py [[buffer(3)]],
+    device const float *pz [[buffer(4)]],
+    device const int *triangles [[buffer(5)]],
+    device const float *areas [[buffer(6)]],
+    device const int *apertureTris [[buffer(7)]],
+    constant Params &params [[buffer(8)]],
+    constant int &apertureCount [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    int total = apertureCount * apertureCount;
+    if (gid >= uint(total)) {
+        return;
+    }
+    int idx = int(gid);
+    int rowLocal = idx / apertureCount;
+    int colLocal = idx - rowLocal * apertureCount;
+    int testTri = apertureTris[rowLocal];
+    int trialTri = apertureTris[colLocal];
+    float2 acc = float2(0.0f, 0.0f);
+    for (int testLocal = 0; testLocal < 3; ++testLocal) {
+        acc += regular_slp_entry(
+            px, py, pz, triangles, areas, params.nTriangles,
+            testTri, trialTri, testLocal, SYMMETRY_PLANE, params.k, params.kImag);
+    }
+    float invArea = 1.0f / max(areas[testTri], FLT_MIN);
+    outRe[idx] = acc.x * invArea;
+    outIm[idx] = acc.y * invArea;
+}
+
 kernel void assemble_pair_blocks_regular(
     device float *dlpRe [[buffer(0)]],
     device float *dlpIm [[buffer(1)]],
@@ -4558,6 +4741,8 @@ let metalSolveConcurrencyEnv = "HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY"
 // Dense factor/solve precision: "float32" (default, Complex32 LU) or "float64"
 // (complex128 zgesv, result narrowed back to f32). Mixed precision.
 let metalDenseSolveDtypeEnv = "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE"
+let coupledIBApertureAssemblyEnv = "HORNLAB_METAL_BEM_NATIVE_COUPLED_IB_APERTURE_ASSEMBLY"
+let coupledIBSolveEnv = "HORNLAB_METAL_BEM_NATIVE_COUPLED_IB_SOLVE"
 let nearQuadratureEnv = "HORNLAB_METAL_BEM_NATIVE_NEAR_QUADRATURE"
 let defaultMetalThreadsPerThreadgroup = 64
 
@@ -4701,6 +4886,23 @@ func requestedDenseSolveRefineIterations() throws -> Int {
     return value
 }
 
+func requestedCoupledIBApertureAssembly(hasResidentContext: Bool) throws -> String {
+    let raw = ProcessInfo.processInfo.environment[coupledIBApertureAssemblyEnv]
+        ?? (hasResidentContext ? "gpu" : "cpu")
+    if raw == "gpu" || raw == "cpu" {
+        return raw
+    }
+    try fail("\(coupledIBApertureAssemblyEnv) must be 'gpu' or 'cpu'")
+}
+
+func requestedCoupledIBSolveMode() throws -> String {
+    let raw = ProcessInfo.processInfo.environment[coupledIBSolveEnv] ?? "schur"
+    if raw == "schur" || raw == "augmented" {
+        return raw
+    }
+    try fail("\(coupledIBSolveEnv) must be 'schur' or 'augmented'")
+}
+
 func requestedNearQuadratureConfig() throws -> NearQuadratureConfig? {
     guard let raw = ProcessInfo.processInfo.environment[nearQuadratureEnv],
           !raw.isEmpty,
@@ -4819,6 +5021,8 @@ struct ResidentMetalPipelines {
     let matrixPipeline: MTLComputePipelineState
     let pairAtomicPipeline: MTLComputePipelineState
     let rhsPipeline: MTLComputePipelineState
+    let apertureSlpPipeline: MTLComputePipelineState
+    let apertureAverageSlpPipeline: MTLComputePipelineState
     let pairBlockPipeline: MTLComputePipelineState
     let fieldPipeline: MTLComputePipelineState
     let duffyPipeline: MTLComputePipelineState
@@ -4905,6 +5109,16 @@ final class ResidentMetalPipelineCache: @unchecked Sendable {
             name: "assemble_rhs_source_regular",
             symmetryPlaneCode: symmetryPlaneCode
         )
+        let apertureSlpFunction = try residentKernelFunction(
+            library: libraryLoad.library,
+            name: "assemble_aperture_slp_projection",
+            symmetryPlaneCode: symmetryPlaneCode
+        )
+        let apertureAverageSlpFunction = try residentKernelFunction(
+            library: libraryLoad.library,
+            name: "assemble_aperture_average_slp_projection",
+            symmetryPlaneCode: symmetryPlaneCode
+        )
         let pairBlockFunction = try residentKernelFunction(
             library: libraryLoad.library,
             name: "assemble_pair_blocks_regular",
@@ -4925,6 +5139,8 @@ final class ResidentMetalPipelineCache: @unchecked Sendable {
             matrixPipeline: try device.makeComputePipelineState(function: matrixFunction),
             pairAtomicPipeline: try device.makeComputePipelineState(function: pairAtomicFunction),
             rhsPipeline: try device.makeComputePipelineState(function: rhsFunction),
+            apertureSlpPipeline: try device.makeComputePipelineState(function: apertureSlpFunction),
+            apertureAverageSlpPipeline: try device.makeComputePipelineState(function: apertureAverageSlpFunction),
             pairBlockPipeline: try device.makeComputePipelineState(function: pairBlockFunction),
             fieldPipeline: try device.makeComputePipelineState(function: fieldFunction),
             duffyPipeline: try device.makeComputePipelineState(function: duffyFunction)
@@ -4973,6 +5189,8 @@ final class ResidentMetalContext {
     let matrixPipeline: MTLComputePipelineState
     let pairAtomicPipeline: MTLComputePipelineState
     let rhsPipeline: MTLComputePipelineState
+    let apertureSlpPipeline: MTLComputePipelineState
+    let apertureAverageSlpPipeline: MTLComputePipelineState
     let pairBlockPipeline: MTLComputePipelineState
     let fieldPipeline: MTLComputePipelineState
     let duffyPipeline: MTLComputePipelineState
@@ -5156,6 +5374,8 @@ final class ResidentMetalContext {
         self.matrixPipeline = pipelines.matrixPipeline
         self.pairAtomicPipeline = pipelines.pairAtomicPipeline
         self.rhsPipeline = pipelines.rhsPipeline
+        self.apertureSlpPipeline = pipelines.apertureSlpPipeline
+        self.apertureAverageSlpPipeline = pipelines.apertureAverageSlpPipeline
         self.pairBlockPipeline = pipelines.pairBlockPipeline
         self.fieldPipeline = pipelines.fieldPipeline
         self.duffyPipeline = pipelines.duffyPipeline
@@ -5439,6 +5659,170 @@ final class ResidentMetalContext {
         )
         rhsEncoder.endEncoding()
         return rhsDispatch
+    }
+
+    func assembleApertureSlpProjectionMetal(
+        aperture: ApertureGeometry,
+        k: Float,
+        kImag: Float,
+        includeDuffy: Bool
+    ) throws -> MetalSlpProjectionOutput {
+        let start = CFAbsoluteTimeGetCurrent()
+        let n = geom.p1DofCount
+        let m = aperture.triangles.count
+        var params = MetalKernelParams(
+            nDof: Int32(n),
+            nTriangles: Int32(geom.nTriangles),
+            maxInc: Int32(incidence.maxInc),
+            symmetryPlane: geom.symmetryPlaneCode,
+            k: k,
+            kImag: kImag,
+            hasRobin: 0
+        )
+        var apertureCount = Int32(m)
+        let apertureTris = try makeBuffer(
+            device,
+            aperture.triangles.map { Int32($0) },
+            label: "resident_aperture_slp_tris"
+        )
+        let outRe = try makeOutputBuffer(device, count: n * m, label: "resident_aperture_slp_re")
+        let outIm = try makeOutputBuffer(device, count: n * m, label: "resident_aperture_slp_im")
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            try fail("failed to create Metal aperture SLP command buffer")
+        }
+        commandBuffer.label = "hornlab resident aperture SLP projection"
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            try fail("failed to create Metal aperture SLP encoder")
+        }
+        encoder.label = "resident aperture P1/DP0 SLP projection"
+        encoder.setBuffer(outRe, offset: 0, index: 0)
+        encoder.setBuffer(outIm, offset: 0, index: 1)
+        encoder.setBuffer(px, offset: 0, index: 2)
+        encoder.setBuffer(py, offset: 0, index: 3)
+        encoder.setBuffer(pz, offset: 0, index: 4)
+        encoder.setBuffer(triangles, offset: 0, index: 5)
+        encoder.setBuffer(areas, offset: 0, index: 6)
+        encoder.setBuffer(incTri, offset: 0, index: 7)
+        encoder.setBuffer(incLoc, offset: 0, index: 8)
+        encoder.setBuffer(counts, offset: 0, index: 9)
+        encoder.setBuffer(apertureTris, offset: 0, index: 10)
+        encoder.setBytes(&params, length: MemoryLayout<MetalKernelParams>.stride, index: 11)
+        encoder.setBytes(&apertureCount, length: MemoryLayout<Int32>.stride, index: 12)
+        var dispatch = try dispatch1D(
+            encoder: encoder,
+            pipeline: apertureSlpPipeline,
+            count: n * m,
+            kernel: "aperture_slp"
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error {
+            try fail("resident Metal aperture SLP projection failed: \(error)")
+        }
+        var re = readFloatBuffer(outRe, count: n * m)
+        var im = readFloatBuffer(outIm, count: n * m)
+        if includeDuffy {
+            try applyApertureSlpProjectionDuffyCorrections(
+                re: &re,
+                im: &im,
+                geom: geom,
+                aperture: aperture,
+                pairList: pairList,
+                rules: rules,
+                k: k,
+                kImag: kImag
+            )
+        }
+        dispatch["kernel"] = "assemble_aperture_slp_projection"
+        dispatch["rows"] = n
+        dispatch["cols"] = m
+        dispatch["entries"] = n * m
+        return MetalSlpProjectionOutput(
+            projection: SlpProjection(re: re, im: im, rows: n, cols: m),
+            dispatch: dispatch,
+            seconds: CFAbsoluteTimeGetCurrent() - start
+        )
+    }
+
+    func assembleApertureAverageSlpProjectionMetal(
+        aperture: ApertureGeometry,
+        k: Float,
+        kImag: Float,
+        includeDuffy: Bool
+    ) throws -> MetalSlpProjectionOutput {
+        let start = CFAbsoluteTimeGetCurrent()
+        let m = aperture.triangles.count
+        var params = MetalKernelParams(
+            nDof: Int32(geom.p1DofCount),
+            nTriangles: Int32(geom.nTriangles),
+            maxInc: Int32(incidence.maxInc),
+            symmetryPlane: geom.symmetryPlaneCode,
+            k: k,
+            kImag: kImag,
+            hasRobin: 0
+        )
+        var apertureCount = Int32(m)
+        let apertureTris = try makeBuffer(
+            device,
+            aperture.triangles.map { Int32($0) },
+            label: "resident_aperture_average_slp_tris"
+        )
+        let outRe = try makeOutputBuffer(device, count: m * m, label: "resident_aperture_average_slp_re")
+        let outIm = try makeOutputBuffer(device, count: m * m, label: "resident_aperture_average_slp_im")
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            try fail("failed to create Metal aperture average SLP command buffer")
+        }
+        commandBuffer.label = "hornlab resident aperture average SLP projection"
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            try fail("failed to create Metal aperture average SLP encoder")
+        }
+        encoder.label = "resident aperture average DP0/DP0 SLP projection"
+        encoder.setBuffer(outRe, offset: 0, index: 0)
+        encoder.setBuffer(outIm, offset: 0, index: 1)
+        encoder.setBuffer(px, offset: 0, index: 2)
+        encoder.setBuffer(py, offset: 0, index: 3)
+        encoder.setBuffer(pz, offset: 0, index: 4)
+        encoder.setBuffer(triangles, offset: 0, index: 5)
+        encoder.setBuffer(areas, offset: 0, index: 6)
+        encoder.setBuffer(apertureTris, offset: 0, index: 7)
+        encoder.setBytes(&params, length: MemoryLayout<MetalKernelParams>.stride, index: 8)
+        encoder.setBytes(&apertureCount, length: MemoryLayout<Int32>.stride, index: 9)
+        var dispatch = try dispatch1D(
+            encoder: encoder,
+            pipeline: apertureAverageSlpPipeline,
+            count: m * m,
+            kernel: "aperture_average_slp"
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error {
+            try fail("resident Metal aperture average SLP projection failed: \(error)")
+        }
+        var re = readFloatBuffer(outRe, count: m * m)
+        var im = readFloatBuffer(outIm, count: m * m)
+        if includeDuffy {
+            try applyApertureAverageSlpProjectionDuffyCorrections(
+                re: &re,
+                im: &im,
+                geom: geom,
+                aperture: aperture,
+                pairList: pairList,
+                rules: rules,
+                k: k,
+                kImag: kImag
+            )
+        }
+        dispatch["kernel"] = "assemble_aperture_average_slp_projection"
+        dispatch["rows"] = m
+        dispatch["cols"] = m
+        dispatch["entries"] = m * m
+        return MetalSlpProjectionOutput(
+            projection: SlpProjection(re: re, im: im, rows: m, cols: m),
+            dispatch: dispatch,
+            seconds: CFAbsoluteTimeGetCurrent() - start
+        )
     }
 
     func assembleRegularMetal(
@@ -6949,7 +7333,7 @@ func solveCaseDenseMulti(
     )
 }
 
-func solveCoupledIBDenseMulti(
+func solveCoupledIBDenseMultiAugmented(
     arrays: AssemblyArrays,
     extraRhs: [(re: [Float], im: [Float])],
     geom: Geometry,
@@ -7039,6 +7423,223 @@ func solveCoupledIBDenseMulti(
         dtype: solved.dtype,
         chiefResidualRels: solved.chiefResidualRels,
         apertureNeumanns: apertureNeumanns
+    )
+}
+
+func solveCoupledIBDenseMultiSchur(
+    arrays: AssemblyArrays,
+    extraRhs: [(re: [Float], im: [Float])],
+    geom: Geometry,
+    coupling: ApertureCoupling
+) throws -> MultiDenseSolveRun {
+    let n = geom.p1DofCount
+    let m = coupling.aperture.triangles.count
+    if arrays.aRe.count != n * n || arrays.aIm.count != n * n
+        || arrays.rhsRe.count != n || arrays.rhsIm.count != n {
+        try fail("coupled IB base assembly size mismatch")
+    }
+    if coupling.interiorSlp.rows != n || coupling.interiorSlp.cols != m
+        || coupling.rayleighSlp.rows != m || coupling.rayleighSlp.cols != m {
+        try fail("coupled IB aperture block size mismatch")
+    }
+    var rhsRe = [arrays.rhsRe]
+    var rhsIm = [arrays.rhsIm]
+    for extra in extraRhs {
+        if extra.re.count != n || extra.im.count != n {
+            try fail("coupled IB extra RHS size mismatch")
+        }
+        rhsRe.append(extra.re)
+        rhsIm.append(extra.im)
+    }
+    let sourceCount = rhsRe.count
+    let start = CFAbsoluteTimeGetCurrent()
+
+    // T = (2*Saa)^-1 * Pavg, stored first as the column-major RHS block
+    // required by cgesv: rows=M aperture velocities, columns=N pressure DOFs.
+    var apertureMatrix = Array(
+        repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        count: m * m
+    )
+    for row in 0..<m {
+        for col in 0..<m {
+            let value = coupling.rayleighSlp.value(row: row, col: col) * 2.0
+            apertureMatrix[col * m + row] = __CLPK_complex(r: value.re, i: value.im)
+        }
+    }
+    var apertureRhs = Array(
+        repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        count: m * n
+    )
+    for (rowLocal, tri) in coupling.aperture.triangles.enumerated() {
+        for local in 0..<3 {
+            let pressureDof = geom.p1Dof(tri, local)
+            let idx = pressureDof * m + rowLocal
+            apertureRhs[idx].r += Float(1.0 / 3.0)
+        }
+    }
+    var mClpk = __CLPK_integer(m)
+    var nrhs = __CLPK_integer(n)
+    var lda = __CLPK_integer(m)
+    var ldb = __CLPK_integer(m)
+    var info = __CLPK_integer(0)
+    var aperturePivots = Array(repeating: __CLPK_integer(0), count: m)
+    cgesv_(&mClpk, &nrhs, &apertureMatrix, &lda, &aperturePivots, &apertureRhs, &ldb, &info)
+    if info != 0 {
+        return MultiDenseSolveRun(
+            pressures: [],
+            implementation: "accelerate_lapack_cgesv_coupled_ib_schur_aperture",
+            seconds: CFAbsoluteTimeGetCurrent() - start,
+            lapackInfo: Int32(info),
+            rcond: nil
+        )
+    }
+
+    // Row-major T (M x N), Sia (N x M), and Schur matrix (N x N) for cblas_cgemm:
+    // Schur = A - Sia*T.
+    var tRowMajor = Array(
+        repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        count: m * n
+    )
+    for row in 0..<m {
+        for col in 0..<n {
+            tRowMajor[row * n + col] = apertureRhs[col * m + row]
+        }
+    }
+    var sia = Array(
+        repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        count: n * m
+    )
+    for idx in 0..<(n * m) {
+        sia[idx] = __CLPK_complex(
+            r: coupling.interiorSlp.re[idx],
+            i: coupling.interiorSlp.im[idx]
+        )
+    }
+    var schur = Array(
+        repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        count: n * n
+    )
+    for idx in 0..<(n * n) {
+        schur[idx] = __CLPK_complex(r: arrays.aRe[idx], i: arrays.aIm[idx])
+    }
+    var alpha = __CLPK_complex(r: -1.0, i: 0.0)
+    var beta = __CLPK_complex(r: 1.0, i: 0.0)
+    cblas_cgemm(
+        CblasRowMajor,
+        CblasNoTrans,
+        CblasNoTrans,
+        Int32(n),
+        Int32(n),
+        Int32(m),
+        &alpha,
+        &sia,
+        Int32(m),
+        &tRowMajor,
+        Int32(n),
+        &beta,
+        &schur,
+        Int32(n)
+    )
+    var schurRe = Array(repeating: Float(0.0), count: n * n)
+    var schurIm = Array(repeating: Float(0.0), count: n * n)
+    for idx in 0..<(n * n) {
+        schurRe[idx] = schur[idx].r
+        schurIm[idx] = schur[idx].i
+    }
+
+    let solved = try solveDenseAccelerateMulti(
+        aReRowMajor: schurRe,
+        aImRowMajor: schurIm,
+        rhsRe: rhsRe,
+        rhsIm: rhsIm,
+        n: n
+    )
+    if solved.lapackInfo != 0 || solved.pressures.isEmpty {
+        return MultiDenseSolveRun(
+            pressures: solved.pressures,
+            implementation: solved.implementation + "_coupled_ib_schur",
+            seconds: CFAbsoluteTimeGetCurrent() - start,
+            lapackInfo: solved.lapackInfo,
+            rcond: solved.rcond,
+            refineIterations: solved.refineIterations,
+            refineResidualRels: solved.refineResidualRels,
+            dtype: solved.dtype,
+            chiefResidualRels: solved.chiefResidualRels
+        )
+    }
+
+    var pressureMatrix = Array(
+        repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        count: n * sourceCount
+    )
+    for s in 0..<sourceCount {
+        for row in 0..<n {
+            let value = solved.pressures[s][row]
+            pressureMatrix[row * sourceCount + s] = __CLPK_complex(r: value.re, i: value.im)
+        }
+    }
+    var apertureMatrixOut = Array(
+        repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        count: m * sourceCount
+    )
+    var recoverAlpha = __CLPK_complex(r: 1.0, i: 0.0)
+    var recoverBeta = __CLPK_complex(r: 0.0, i: 0.0)
+    cblas_cgemm(
+        CblasRowMajor,
+        CblasNoTrans,
+        CblasNoTrans,
+        Int32(m),
+        Int32(sourceCount),
+        Int32(n),
+        &recoverAlpha,
+        &tRowMajor,
+        Int32(n),
+        &pressureMatrix,
+        Int32(sourceCount),
+        &recoverBeta,
+        &apertureMatrixOut,
+        Int32(sourceCount)
+    )
+    let apertureNeumanns = (0..<sourceCount).map { s in
+        (0..<m).map { row in
+            let value = apertureMatrixOut[row * sourceCount + s]
+            return Complex32(re: value.r, im: value.i)
+        }
+    }
+    return MultiDenseSolveRun(
+        pressures: solved.pressures,
+        implementation: solved.implementation + "_coupled_ib_schur",
+        seconds: CFAbsoluteTimeGetCurrent() - start,
+        lapackInfo: solved.lapackInfo,
+        rcond: solved.rcond,
+        refineIterations: solved.refineIterations,
+        refineResidualRels: solved.refineResidualRels,
+        dtype: solved.dtype,
+        chiefResidualRels: solved.chiefResidualRels,
+        apertureNeumanns: apertureNeumanns
+    )
+}
+
+func solveCoupledIBDenseMulti(
+    arrays: AssemblyArrays,
+    extraRhs: [(re: [Float], im: [Float])],
+    geom: Geometry,
+    coupling: ApertureCoupling
+) throws -> MultiDenseSolveRun {
+    let mode = try requestedCoupledIBSolveMode()
+    if mode == "augmented" {
+        return try solveCoupledIBDenseMultiAugmented(
+            arrays: arrays,
+            extraRhs: extraRhs,
+            geom: geom,
+            coupling: coupling
+        )
+    }
+    return try solveCoupledIBDenseMultiSchur(
+        arrays: arrays,
+        extraRhs: extraRhs,
+        geom: geom,
+        coupling: coupling
     )
 }
 
@@ -8439,7 +9040,8 @@ func assembleSolveEvaluateStandardNeumannBatch(
             k: caseKs[caseIndex],
             kImag: caseKImag[caseIndex],
             fieldK: caseFieldKs[caseIndex],
-            includeDuffy: includeDuffy
+            includeDuffy: includeDuffy,
+            residentContext: context
         )
         return (
             AssemblyRun(
@@ -8940,6 +9542,13 @@ func assembleSolveEvaluateStandardNeumannBatch(
             caseResult["ib_field"] = "rayleigh_aperture_only"
             caseResult["ib_aperture_transform_seconds"] = apertureCoupling.transformSeconds
             caseResult["ib_aperture_slp_duffy"] = apertureCoupling.usedDuffy
+            caseResult["ib_aperture_assembly_implementation"] = apertureCoupling.assemblyImplementation
+            caseResult["ib_coupled_solve"] = solve.implementation.contains("_coupled_ib_schur")
+                ? "schur"
+                : "augmented"
+            if let apertureDispatch = apertureCoupling.metalDispatch {
+                caseResult["ib_aperture_metal_dispatch"] = apertureDispatch
+            }
         }
         if let chiefPoints {
             caseResult["chief_points"] = true
