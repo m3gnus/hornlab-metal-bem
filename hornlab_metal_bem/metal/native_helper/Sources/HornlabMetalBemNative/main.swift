@@ -1430,7 +1430,15 @@ func evaluateCoupledIBRayleighReference(
                 }
             }
         }
-        out[obsIdx] = acc * 2.0
+        // Half-space Rayleigh single-layer of the aperture velocity. The aperture
+        // Neumann is stored in the interior-domain mesh sense (normals point -Z
+        // into the cavity), opposite the +Z radiation direction into the z>0
+        // half-space, so the single-layer field carries a negative sign (matching
+        // the interior coupling block, which assembles -2*rayleighSlp). Using
+        // +2*acc here inverted the radiated pressure by 180 deg; normalized
+        // directivity is sign-invariant so the native-vs-CircSym parity test (which
+        // shared the same sign) did not catch it.
+        out[obsIdx] = acc * -2.0
     }
     return out
 }

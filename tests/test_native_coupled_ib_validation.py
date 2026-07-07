@@ -404,3 +404,145 @@ def test_native_coupled_ib_deep_circular_channel_matches_circsym(
 
     assert all(entry.get("coupled_ib") is True for entry in native_result.native_diagnostics)
     assert max_error_db < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Absolute-pressure (sign/phase) gate.
+#
+# All the parity checks above compare NORMALIZED directivity, which is invariant
+# to a global sign/phase on the radiated field. A 180 deg inversion of the
+# coupled-IB Rayleigh field therefore slips through them silently (and native and
+# CircSym shared the same convention, so native-vs-CircSym could not catch it).
+# These tests pin the ABSOLUTE outward-radiation sign of the coupled solve
+# against the analytic baffled piston, so a resurrected +/- error fails loudly.
+
+_SPEED_OF_SOUND = 343.0
+_AIR_DENSITY = SolveConfig().air_density
+
+
+def _analytic_baffled_piston(radius: float, points: np.ndarray, k: float) -> np.ndarray:
+    """Absolute complex pressure of a uniform unit-velocity baffled piston.
+
+    p = i*omega*rho * (half-space single-layer of the aperture velocity), where
+    the single-layer helper ``_rayleigh_pressure_uniform_disc`` is the analytic
+    reference already validated to 8e-4 in
+    ``test_uniform_full3d_rayleigh_disc_matches_baffled_piston_analytic``.
+    """
+    omega = k * _SPEED_OF_SOUND
+    verts, tris = _triangulated_disc(radius, rings=20, sectors=128)
+    return (1j * omega * _AIR_DENSITY) * _rayleigh_pressure_uniform_disc(
+        verts, tris, points, k
+    )
+
+
+def _coupled_ib_absolute_sign_scale(
+    pressure_by_freq: np.ndarray,
+    frequencies_hz: np.ndarray,
+    radius: float,
+    distance: float,
+    angles_deg: np.ndarray,
+) -> list[tuple[complex, float]]:
+    """Best-fit complex scale and shape residual vs the analytic baffled piston.
+
+    For a shallow channel the aperture velocity is ~uniform, so the coupled solve
+    should equal ``scale * analytic`` with ``scale ~= +1`` (small |scale| drift is
+    the real finite-depth-vs-ideal-piston difference). A 180 deg field inversion
+    shows up as ``scale.real < 0``; a corrupted system (wrong interior coupling)
+    shows up as a large shape residual.
+    """
+    front = angles_deg <= 90.0
+    pts = np.column_stack(
+        [
+            distance * np.sin(np.deg2rad(angles_deg)),
+            np.zeros_like(angles_deg),
+            distance * np.cos(np.deg2rad(angles_deg)),
+        ]
+    )
+    out: list[tuple[complex, float]] = []
+    for i, f in enumerate(frequencies_hz):
+        k = 2.0 * np.pi * float(f) / _SPEED_OF_SOUND
+        analytic = _analytic_baffled_piston(radius, pts, k)[front]
+        measured = pressure_by_freq[i, 0, :][front]
+        scale = complex(np.vdot(analytic, measured) / np.vdot(analytic, analytic))
+        resid = float(
+            np.linalg.norm(measured - scale * analytic) / np.linalg.norm(measured)
+        )
+        out.append((scale, resid))
+    return out
+
+
+def _assert_outward_baffled_piston(scales: list[tuple[complex, float]]) -> None:
+    for scale, resid in scales:
+        # Outward radiation: in-phase with the analytic piston, not inverted.
+        assert scale.real > 0.5, f"radiated field inverted (scale={scale:+.3f})"
+        assert abs(scale.imag) < 0.30, f"unexpected radiation phase (scale={scale:+.3f})"
+        assert 0.8 < abs(scale) < 1.3, f"radiated magnitude off (scale={scale:+.3f})"
+        # Directivity shape must track the analytic piston (guards the interior
+        # coupling / system, which a naive sign "fix" on the coupling would break).
+        assert resid < 0.03, f"directivity shape off analytic piston (resid={resid:.3%})"
+
+
+def test_circsym_coupled_ib_radiates_outward_absolute_sign():
+    radius, depth, distance = 0.04, 0.003, 1.5
+    frequencies_hz = np.array([800.0, 2000.0], dtype=np.float64)
+    angles = np.linspace(0.0, 90.0, 10)
+    config = SolveConfig(
+        velocity_sources={TAG_THROAT: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        circsym_aperture_tag=TAG_APERTURE,
+        observation=ObservationConfig(
+            distance_m=distance,
+            angle_min_deg=0.0,
+            angle_max_deg=90.0,
+            angle_count=angles.size,
+            planes=["horizontal"],
+            origin="mouth",
+        ),
+    )
+    result = metal_bem.solve_circsym_frequencies(
+        _straight_channel_meridian(radius, depth, target_edge=radius / 5.0),
+        frequencies_hz,
+        config,
+    )
+    _assert_outward_baffled_piston(
+        _coupled_ib_absolute_sign_scale(
+            result.pressure_complex, frequencies_hz, radius, distance, angles
+        )
+    )
+
+
+def test_native_coupled_ib_radiates_outward_absolute_sign():
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+    radius, depth, distance = 0.04, 0.003, 1.5
+    frequencies_hz = np.array([800.0, 2000.0], dtype=np.float64)
+    angles = np.linspace(0.0, 90.0, 10)
+    config = SolveConfig(
+        velocity_sources={TAG_THROAT: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        aperture_tag=TAG_APERTURE,
+        observation=ObservationConfig(
+            distance_m=distance,
+            angle_min_deg=0.0,
+            angle_max_deg=90.0,
+            angle_count=angles.size,
+            planes=["horizontal"],
+            origin="mouth",
+        ),
+        metal_native_assembly_mode="corrected",
+        dense_solve_dtype="float64",
+    )
+    result = metal_bem.solve_frequencies(
+        _straight_channel_mesh(radius, depth, rings=5, sectors=32),
+        frequencies_hz,
+        config,
+    )
+    _assert_outward_baffled_piston(
+        _coupled_ib_absolute_sign_scale(
+            result.pressure_complex, frequencies_hz, radius, distance, angles
+        )
+    )

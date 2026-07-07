@@ -103,7 +103,7 @@ def test_vectorized_coupled_ib_field_matches_scalar_aperture_sum():
                 n_psi=96,
                 target_index=None,
             )
-            val += 2.0 * s_val * q_a[aperture_local]
+            val += -2.0 * s_val * q_a[aperture_local]
         scalar[point_index] = val
 
     np.testing.assert_allclose(vectorized, scalar, rtol=1e-10, atol=1e-12)
@@ -161,3 +161,22 @@ def test_coupled_ib_cone_horn_is_a_forward_beam_with_no_rear_radiation():
         assert np.max(front) - front[0] < 1.0
         # zero radiation behind the baffle
         assert np.all(db[degs > 91.0] < -40.0)
+
+
+def test_circsym_missing_aperture_tag_raises_instead_of_free_space():
+    """A requested-but-absent circsym_aperture_tag must fail loudly, not silently
+    fall back to a free-space (free-standing) sweep with wrong physics."""
+    meridian = _channel_meridian(0.025, 0.05, 0.04)
+    config = SolveConfig(
+        velocity_sources={TAG_THROAT: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        circsym_aperture_tag=99,  # not present in the meridian (tags are 2/3/4)
+        observation=ObservationConfig(
+            distance_m=1.0, angle_min_deg=0.0, angle_max_deg=90.0,
+            angle_count=5, planes=["horizontal"], origin="mouth",
+        ),
+    )
+    with pytest.raises(ValueError, match="circsym_aperture_tag 99 is not present"):
+        metal_bem.solve_circsym_frequencies(
+            meridian, np.array([1000.0]), config
+        )

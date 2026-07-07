@@ -219,9 +219,12 @@ def run_sweep_circsym(
     """
     if not isinstance(meridian, MeridianMesh):
         raise TypeError("meridian must be a MeridianMesh")
-    if config.circsym_aperture_tag is not None and int(
-        config.circsym_aperture_tag
-    ) in {int(tag) for tag in np.unique(meridian.physical_tags)}:
+    if config.circsym_aperture_tag is not None:
+        # Dispatch to the coupled infinite-baffle solve whenever an aperture tag
+        # is requested. run_sweep_coupled_ib validates that the tag is present and
+        # raises a clear error if not; falling through to the free-space sweep
+        # here would silently return free-standing physics for a mis-tagged IB
+        # request instead of failing loudly.
         return run_sweep_coupled_ib(meridian, frequencies, config)
     frequencies_arr = np.asarray(frequencies, dtype=np.float64).reshape(-1)
     if frequencies_arr.size == 0:
@@ -2900,7 +2903,13 @@ def _evaluate_coupled_ib_points_pressure(
         baffle_z=None,
         n_psi=n_psi,
     )
-    out[active] = 2.0 * (s_mat @ np.asarray(aperture_neumann, dtype=np.complex128))
+    # Half-space Rayleigh single-layer: 2x the free-space single-layer of the
+    # aperture velocity. The single-layer field kernel carries a -s_mat sign
+    # convention (see _evaluate_points_pressure: the general exterior field and
+    # the flat baffled-sheet Rayleigh disk both return -s_mat @ q). Using +2*s_mat
+    # here inverted the radiated pressure by 180 deg (directivity, which is
+    # sign-normalized, was unaffected, so consistency tests missed it).
+    out[active] = -2.0 * (s_mat @ np.asarray(aperture_neumann, dtype=np.complex128))
     return out
 
 

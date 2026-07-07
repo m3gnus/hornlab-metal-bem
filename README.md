@@ -118,8 +118,13 @@ features.
 `m=0` DP0 meridian solver for circular bodies of revolution. Use it only for
 circular/axisymmetric geometries; non-round cross sections, morphing, and
 enclosures are outside the current validity envelope. Infinite-baffle CircSym
-is not supported yet because the image-plane meridian needs aperture coupling;
-use the full 3D solver for infinite-baffle jobs.
+is supported for circular waveguides via `SolveConfig.circsym_aperture_tag`,
+which names the flush `z=0` aperture segments and switches the solve to the
+exact coupled path (interior meridian BEM + analytic Rayleigh half-space
+aperture coupling). Prefer the full 3D coupled solve (`aperture_tag`) for
+production directivity; the CircSym IB path is for fast axisymmetric
+impedance/validation sweeps and requires a flush aperture at the global
+`z=0` baffle plane.
 
 With the wavelength-scaled meridian budget, CircSym is intended for waveguide
 sweeps up to roughly 30-40 kHz when the meridian resolves the requested band.
