@@ -8,6 +8,7 @@ import hornlab_metal_bem as metal_bem
 from hornlab_metal_bem._constants import SPEED_OF_SOUND
 from hornlab_metal_bem.circsym import (
     MeridianMesh,
+    _BoundaryAssemblyGeometryCache,
     _assemble_boundary_matrices,
     _evaluate_points_pressure,
     _is_flat_baffled_sheet,
@@ -221,6 +222,69 @@ def test_vectorized_boundary_assembly_matches_scalar_segment_integrals(
 
     np.testing.assert_allclose(S, S_ref, rtol=4e-13, atol=4e-14)
     np.testing.assert_allclose(H, H_ref, rtol=4e-13, atol=4e-14)
+
+
+@pytest.mark.parametrize("baffled_sheet", [False, True])
+def test_cached_boundary_assembly_matches_uncached(baffled_sheet: bool):
+    k = 41.0 + 0.07j
+    baffle_z = 0.0 if baffled_sheet else None
+    meridian = (
+        _piston_meridian(radius=0.1, segments=11)
+        if baffled_sheet
+        else _sphere_meridian(radius=0.1, segments=13)
+    )
+    cache = _BoundaryAssemblyGeometryCache(meridian, baffle_z)
+
+    S_cached, H_cached = _assemble_boundary_matrices(
+        meridian,
+        k,
+        baffle_z=baffle_z,
+        n_psi=96,
+        geometry_cache=cache,
+    )
+    S_uncached, H_uncached = _assemble_boundary_matrices(
+        meridian,
+        k,
+        baffle_z=baffle_z,
+        n_psi=96,
+    )
+
+    np.testing.assert_allclose(S_cached, S_uncached, rtol=6e-13, atol=6e-14)
+    np.testing.assert_allclose(H_cached, H_uncached, rtol=6e-13, atol=6e-14)
+
+
+def test_boundary_assembly_cache_release_and_budget_fallback(monkeypatch):
+    k = 37.0 + 0.02j
+    meridian = _sphere_meridian(radius=0.1, segments=9)
+    cache = _BoundaryAssemblyGeometryCache(
+        meridian,
+        None,
+        reusable_n_psi={96},
+        n_psi_use_counts={96: 1},
+    )
+
+    S_cached, H_cached = _assemble_boundary_matrices(
+        meridian,
+        k,
+        None,
+        n_psi=96,
+        geometry_cache=cache,
+    )
+    assert 96 not in cache._quadrature
+    assert cache.assemble(k, n_psi=96, meridian=meridian, baffle_z=None) is None
+
+    S_uncached, H_uncached = _assemble_boundary_matrices(
+        meridian,
+        k,
+        None,
+        n_psi=96,
+    )
+    np.testing.assert_allclose(S_cached, S_uncached, rtol=6e-13, atol=6e-14)
+    np.testing.assert_allclose(H_cached, H_uncached, rtol=6e-13, atol=6e-14)
+
+    monkeypatch.setenv("HORNLAB_CIRCSYM_ASSEMBLY_CACHE_MAX_BYTES", "1")
+    budget_cache = _BoundaryAssemblyGeometryCache(meridian, None)
+    assert budget_cache.assemble(k, n_psi=96, meridian=meridian, baffle_z=None) is None
 
 
 def test_vectorized_field_evaluation_matches_scalar_closed_meridian():

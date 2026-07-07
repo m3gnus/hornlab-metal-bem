@@ -15,6 +15,8 @@ import hornlab_metal_bem as metal_bem
 from hornlab_metal_bem._constants import SPEED_OF_SOUND
 from hornlab_metal_bem.circsym import (
     MeridianMesh,
+    _BoundaryAssemblyGeometryCache,
+    _assemble_boundary_matrices,
     _evaluate_coupled_ib_points_pressure,
     _integrate_segment_kernel,
 )
@@ -106,6 +108,29 @@ def test_vectorized_coupled_ib_field_matches_scalar_aperture_sum():
 
     np.testing.assert_allclose(vectorized, scalar, rtol=1e-10, atol=1e-12)
     assert vectorized[-1] == 0.0
+
+
+def test_coupled_ib_boundary_assembly_cache_matches_uncached():
+    k = 67.0 + 0.0j
+    meridian = _channel_meridian(0.025, 0.05, 0.04, h=0.004)
+    cache = _BoundaryAssemblyGeometryCache(meridian, None)
+
+    S_cached, H_cached = _assemble_boundary_matrices(
+        meridian,
+        k,
+        None,
+        n_psi=96,
+        geometry_cache=cache,
+    )
+    S_uncached, H_uncached = _assemble_boundary_matrices(
+        meridian,
+        k,
+        None,
+        n_psi=96,
+    )
+
+    np.testing.assert_allclose(S_cached, S_uncached, rtol=6e-13, atol=6e-14)
+    np.testing.assert_allclose(H_cached, H_uncached, rtol=6e-13, atol=6e-14)
 
 
 @pytest.mark.parametrize("ka", [1.0, 2.0, 3.0])
