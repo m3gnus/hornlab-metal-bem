@@ -1403,12 +1403,14 @@ func evaluateCoupledIBRayleighReference(
 ) -> [Complex32] {
     let (qx, qy, qw) = triangleRule6()
     let imageMasks = symmetryImageMasks(geom.symmetryPlane)
+    let bafflePlaneTolerance: Float = 1.0e-5
     var out = Array(repeating: Complex32.zero, count: observationPoints.count)
     for obsIdx in observationPoints.indices {
         let (ox, oy, oz) = observationPoints[obsIdx]
-        if oz < 0.0 {
+        if oz < -bafflePlaneTolerance {
             continue
         }
+        let evalZ = oz < 0.0 ? 0.0 : oz
         var acc = Complex32.zero
         for (apertureIndex, tri) in coupling.aperture.triangles.enumerated() {
             let qTri = apertureNeumann[apertureIndex]
@@ -1419,11 +1421,11 @@ func evaluateCoupledIBRayleighReference(
             for qa in 0..<qw.count {
                 let (sx, sy, sz) = pointOnTriangle(geom, tri, qx[qa], qy[qa])
                 let weight = qw[qa] * jac
-                let g = helmholtzG(sx - ox, sy - oy, sz - oz, k)
+                let g = helmholtzG(sx - ox, sy - oy, sz - evalZ, k)
                 acc = acc + (g * qTri) * weight
                 for mask in imageMasks {
                     let image = mirrorPoint((sx, sy, sz), mask: mask)
-                    let ig = helmholtzG(image.0 - ox, image.1 - oy, image.2 - oz, k)
+                    let ig = helmholtzG(image.0 - ox, image.1 - oy, image.2 - evalZ, k)
                     acc = acc + (ig * qTri) * weight
                 }
             }

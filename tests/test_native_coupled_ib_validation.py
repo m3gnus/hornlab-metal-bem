@@ -297,8 +297,8 @@ def test_native_coupled_ib_straight_circular_channel_matches_circsym(
     observation = ObservationConfig(
         distance_m=1.5,
         angle_min_deg=0.0,
-        angle_max_deg=70.0,
-        angle_count=9,
+        angle_max_deg=90.0,
+        angle_count=10,
         planes=["horizontal"],
         origin="mouth",
     )
@@ -307,7 +307,6 @@ def test_native_coupled_ib_straight_circular_channel_matches_circsym(
         velocity_mode=VelocityMode.VELOCITY,
         aperture_tag=TAG_APERTURE,
         observation=observation,
-        frame_override=_z_axis_frame(depth),
         metal_native_assembly_mode="corrected",
         dense_solve_dtype="float64",
     )
@@ -331,11 +330,14 @@ def test_native_coupled_ib_straight_circular_channel_matches_circsym(
 
     native_directivity = native_result.directivity_db[:, 0, :]
     circsym_directivity = circsym_result.directivity_db[:, 0, :]
-    max_error_db = float(np.max(np.abs(native_directivity - circsym_directivity)))
+    max_error_db = float(
+        np.max(np.abs(native_directivity[:, :-1] - circsym_directivity[:, :-1]))
+    )
 
     assert all(entry.get("coupled_ib") is True for entry in native_result.native_diagnostics)
     assert all(
         entry.get("aperture_velocity_basis") == "DP0"
         for entry in native_result.native_diagnostics
     )
+    assert native_directivity[:, -1].min() > -20.0
     assert max_error_db < 1.0

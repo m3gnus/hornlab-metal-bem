@@ -78,17 +78,69 @@ def _resolve_mesh(mesh, config: SolveConfig) -> LoadedMesh:
     )
 
 
+def _project_to_native_symmetry_plane(point: np.ndarray, plane: str | None) -> np.ndarray:
+    projected = np.array(point, dtype=np.float64, copy=True)
+    if plane == "yz":
+        projected[0] = 0.0
+    elif plane == "xz":
+        projected[1] = 0.0
+    elif plane == "yz+xz":
+        projected[0] = 0.0
+        projected[1] = 0.0
+    elif plane == "xy":
+        projected[2] = 0.0
+    return projected
+
+
+def _coupled_ib_aperture_origin(loaded: LoadedMesh, aperture_tag: int) -> np.ndarray | None:
+    tags = np.asarray(loaded.physical_tags, dtype=np.int32)
+    aperture_mask = tags == int(aperture_tag)
+    if not np.any(aperture_mask):
+        return None
+
+    vertices = np.asarray(loaded.grid.vertices.T, dtype=np.float64)
+    elements = np.asarray(loaded.grid.elements.T, dtype=np.int64)
+    aperture_elements = elements[aperture_mask]
+    if aperture_elements.size == 0:
+        return None
+
+    p0 = vertices[aperture_elements[:, 0]]
+    p1 = vertices[aperture_elements[:, 1]]
+    p2 = vertices[aperture_elements[:, 2]]
+    raw_normals = np.cross(p1 - p0, p2 - p0)
+    areas = 0.5 * np.linalg.norm(raw_normals, axis=1)
+    valid = areas > 1.0e-15
+    if not np.any(valid):
+        return None
+
+    centroids = (p0[valid] + p1[valid] + p2[valid]) / 3.0
+    return np.average(centroids, weights=areas[valid], axis=0)
+
+
 def _resolve_frame(loaded: LoadedMesh, config: SolveConfig) -> ObservationFrame:
     if config.frame_override is not None:
         return config.frame_override
 
-    return infer_frame(
+    frame = infer_frame(
         loaded.grid,
         loaded.physical_tags,
         source_tag=min(config.velocity_sources.keys(), default=2),
         origin_at=config.observation.origin,
         symmetry_plane=config.native_symmetry_plane,
     )
+    if config.aperture_tag is not None and config.observation.origin == "mouth":
+        aperture_origin = _coupled_ib_aperture_origin(loaded, config.aperture_tag)
+        if aperture_origin is not None:
+            aperture_origin = _project_to_native_symmetry_plane(
+                aperture_origin,
+                config.native_symmetry_plane,
+            )
+            frame = _replace(
+                frame,
+                origin=aperture_origin,
+                mouth_center=aperture_origin,
+            )
+    return frame
 
 
 def solve(mesh, config: SolveConfig | None = None) -> SolveResult:
