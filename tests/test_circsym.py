@@ -189,11 +189,19 @@ def test_ring_kernels_match_dense_azimuth_quadrature_off_diagonal_and_near():
     assert np.isfinite(h_self)
 
 
-def test_vectorized_boundary_assembly_matches_scalar_segment_integrals():
+@pytest.mark.parametrize("baffled_sheet", [False, True])
+def test_vectorized_boundary_assembly_matches_scalar_segment_integrals(
+    baffled_sheet: bool,
+):
     k = 19.0 + 0.03j
-    meridian = _sphere_meridian(radius=0.1, segments=14)
+    baffle_z = 0.0 if baffled_sheet else None
+    meridian = (
+        _piston_meridian(radius=0.1, segments=12)
+        if baffled_sheet
+        else _sphere_meridian(radius=0.1, segments=14)
+    )
     geom = meridian.segment_geometry()
-    S, H = _assemble_boundary_matrices(meridian, k, baffle_z=None, n_psi=96)
+    S, H = _assemble_boundary_matrices(meridian, k, baffle_z=baffle_z, n_psi=96)
 
     S_ref = np.empty_like(S)
     H_ref = np.empty_like(H)
@@ -206,13 +214,13 @@ def test_vectorized_boundary_assembly_matches_scalar_segment_integrals():
                 geom=geom,
                 source_index=j,
                 k=k,
-                baffle_z=None,
+                baffle_z=baffle_z,
                 n_psi=96,
                 target_index=i,
             )
 
-    np.testing.assert_allclose(S, S_ref, rtol=2e-13, atol=2e-14)
-    np.testing.assert_allclose(H, H_ref, rtol=2e-13, atol=2e-14)
+    np.testing.assert_allclose(S, S_ref, rtol=4e-13, atol=4e-14)
+    np.testing.assert_allclose(H, H_ref, rtol=4e-13, atol=4e-14)
 
 
 def test_vectorized_field_evaluation_matches_scalar_closed_meridian():

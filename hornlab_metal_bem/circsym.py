@@ -56,6 +56,9 @@ _FIELD_KERNEL_BLOCK_ELEMENTS = 8_000_000
 _FIELD_KERNEL_MAX_TARGET_BLOCK = 64
 _FIELD_KERNEL_PARALLEL_TARGET_BLOCK = 8
 _FIELD_KERNEL_MAX_WORKERS = 8
+_ASSEMBLY_KERNEL_BLOCK_ELEMENTS = 3_000_000
+_ASSEMBLY_KERNEL_MAX_TARGET_BLOCK = 16
+_ASSEMBLY_KERNEL_PARALLEL_TARGET_BLOCK = 5
 
 
 @dataclass
@@ -1078,33 +1081,50 @@ def _assemble_boundary_matrices(
     S = np.empty((n, n), dtype=np.complex128)
     H = np.empty((n, n), dtype=np.complex128)
     workers = _assembly_worker_count(n)
-    if workers <= 1:
-        for i in range(n):
-            _, S[i], H[i] = _assemble_boundary_row(
-                i,
+    block_size = _assembly_target_block_size(n, int(n_psi))
+    if workers > 1:
+        block_size = min(block_size, _ASSEMBLY_KERNEL_PARALLEL_TARGET_BLOCK)
+    ranges = [
+        (start, min(n, start + block_size))
+        for start in range(0, n, block_size)
+    ]
+    if workers <= 1 or len(ranges) <= 1:
+        for span in ranges:
+            start, stop, s_block, h_block = _assemble_boundary_block(
+                span[0],
+                span[1],
                 meridian=meridian,
                 geom=geom,
                 k=k,
                 baffle_z=baffle_z,
                 n_psi=n_psi,
             )
+            S[start:stop] = s_block
+            H[start:stop] = h_block
     else:
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            rows = executor.map(
-                lambda i: _assemble_boundary_row(
-                    i,
+            blocks = executor.map(
+                lambda span: _assemble_boundary_block(
+                    span[0],
+                    span[1],
                     meridian=meridian,
                     geom=geom,
                     k=k,
                     baffle_z=baffle_z,
                     n_psi=n_psi,
                 ),
-                range(n),
+                ranges,
             )
-            for i, s_row, h_row in rows:
-                S[i] = s_row
-                H[i] = h_row
+            for start, stop, s_block, h_block in blocks:
+                S[start:stop] = s_block
+                H[start:stop] = h_block
     return S, H
+
+
+def _assembly_target_block_size(segment_count: int, n_psi: int) -> int:
+    per_target = max(1, int(segment_count) * _LINE_QUAD_ORDER * max(1, int(n_psi)))
+    by_elements = max(1, _ASSEMBLY_KERNEL_BLOCK_ELEMENTS // per_target)
+    return max(1, min(_ASSEMBLY_KERNEL_MAX_TARGET_BLOCK, int(by_elements)))
 
 
 def _assembly_worker_count(segment_count: int) -> int:
@@ -1117,6 +1137,55 @@ def _assembly_worker_count(segment_count: int) -> int:
         except ValueError:
             return 1
     return max(1, min(int(segment_count), 8, os.cpu_count() or 1))
+
+
+def _assemble_boundary_block(
+    start: int,
+    stop: int,
+    *,
+    meridian: MeridianMesh,
+    geom: SimpleNamespace,
+    k: complex,
+    baffle_z: float | None,
+    n_psi: int,
+) -> tuple[int, int, NDArray[np.complex128], NDArray[np.complex128]]:
+    row_indices = np.arange(int(start), int(stop), dtype=np.int64)
+    targets = geom.midpoints[row_indices]
+    source_indices = np.arange(meridian.segment_count, dtype=np.int64)
+    s_block, h_block = _integrate_ordinary_segment_kernels_targets_batched(
+        target_rho=targets[:, 0],
+        target_z=targets[:, 1],
+        meridian=meridian,
+        geom=geom,
+        source_indices=source_indices,
+        k=k,
+        baffle_z=baffle_z,
+        n_psi=n_psi,
+    )
+    far_mask = _ordinary_far_source_mask_targets(
+        targets[:, 0],
+        targets[:, 1],
+        geom,
+        source_indices=source_indices,
+    )
+    near_rows, near_cols = np.nonzero(~far_mask)
+    for row_local, source_local in zip(near_rows, near_cols):
+        row_index = int(row_indices[row_local])
+        source_index = int(source_indices[source_local])
+        s_block[row_local, source_local], h_block[row_local, source_local] = (
+            _integrate_segment_kernel(
+                target_rho=float(targets[row_local, 0]),
+                target_z=float(targets[row_local, 1]),
+                meridian=meridian,
+                geom=geom,
+                source_index=source_index,
+                k=k,
+                baffle_z=baffle_z,
+                n_psi=n_psi,
+                target_index=row_index,
+            )
+        )
+    return int(start), int(stop), s_block, h_block
 
 
 def _assemble_boundary_row(
@@ -1256,6 +1325,92 @@ def _integrate_ordinary_segment_kernels_batched(
     return (
         np.asarray(np.sum(g * measure, axis=1), dtype=np.complex128),
         np.asarray(np.sum(h * measure, axis=1), dtype=np.complex128),
+    )
+
+
+def _integrate_ordinary_segment_kernels_targets_batched(
+    *,
+    target_rho: NDArray[np.float64],
+    target_z: NDArray[np.float64],
+    meridian: MeridianMesh,
+    geom: SimpleNamespace,
+    source_indices: NDArray[np.int64] | NDArray[np.int32],
+    k: complex,
+    baffle_z: float | None,
+    n_psi: int,
+) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    """Ordinary-quadrature block kernel; callers must replace near/self pairs."""
+    indices = np.asarray(source_indices, dtype=np.int64)
+    target_rho_arr = np.asarray(target_rho, dtype=np.float64).reshape(-1)
+    target_z_arr = np.asarray(target_z, dtype=np.float64).reshape(-1)
+    if target_rho_arr.shape != target_z_arr.shape:
+        raise ValueError("target_rho and target_z must have the same shape")
+    if indices.size == 0 or target_rho_arr.size == 0:
+        shape = (target_rho_arr.size, indices.size)
+        return (
+            np.empty(shape, dtype=np.complex128),
+            np.empty(shape, dtype=np.complex128),
+        )
+
+    u, w = _ordinary_interval(0.0, 1.0)
+    p0 = geom.p0[indices]
+    delta = geom.delta[indices]
+    lengths = geom.lengths[indices]
+    source = p0[:, None, :] + u[None, :, None] * delta[:, None, :]
+    rho_s = source[:, :, 0]
+    z_s = source[:, :, 1]
+    measure = rho_s * lengths[:, None] * w[None, :]
+    normal = meridian.normals[indices]
+    normal_rho = normal[:, 0]
+    normal_z = normal[:, 1]
+
+    g_static, h_static = _ring_static_kernel_m0_targets_batched(
+        target_rho_arr,
+        target_z_arr,
+        rho_s,
+        z_s,
+        normal_rho,
+        normal_z,
+    )
+    g_rem, h_rem = _ring_remainder_kernel_m0_targets_batched(
+        target_rho_arr,
+        target_z_arr,
+        rho_s,
+        z_s,
+        normal_rho,
+        normal_z,
+        k,
+        n_psi=n_psi,
+    )
+    g = g_static + g_rem
+    h = h_static + h_rem
+
+    if baffle_z is not None:
+        z_img = 2.0 * float(baffle_z) - z_s
+        g_static_i, h_static_i = _ring_static_kernel_m0_targets_batched(
+            target_rho_arr,
+            target_z_arr,
+            rho_s,
+            z_img,
+            normal_rho,
+            -normal_z,
+        )
+        g_rem_i, h_rem_i = _ring_remainder_kernel_m0_targets_batched(
+            target_rho_arr,
+            target_z_arr,
+            rho_s,
+            z_img,
+            normal_rho,
+            -normal_z,
+            k,
+            n_psi=n_psi,
+        )
+        g = g + g_static_i + g_rem_i
+        h = h + h_static_i + h_rem_i
+
+    return (
+        np.asarray(np.sum(g * measure[None, :, :], axis=2), dtype=np.complex128),
+        np.asarray(np.sum(h * measure[None, :, :], axis=2), dtype=np.complex128),
     )
 
 
@@ -1938,6 +2093,45 @@ def _ring_static_kernel_m0_batched(
     return np.asarray(G, dtype=np.complex128), np.asarray(H, dtype=np.complex128)
 
 
+def _ring_static_kernel_m0_targets_batched(
+    target_rho: NDArray[np.float64],
+    target_z: NDArray[np.float64],
+    source_rho: NDArray[np.float64],
+    source_z: NDArray[np.float64],
+    normal_rho: NDArray[np.float64],
+    normal_z: NDArray[np.float64],
+) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    rt = np.asarray(target_rho, dtype=np.float64).reshape(-1, 1, 1)
+    zt = np.asarray(target_z, dtype=np.float64).reshape(-1, 1, 1)
+    rs = np.asarray(source_rho, dtype=np.float64)[None, :, :]
+    zs = np.asarray(source_z, dtype=np.float64)[None, :, :]
+    n_rho = np.asarray(normal_rho, dtype=np.float64).reshape(1, -1, 1)
+    n_z = np.asarray(normal_z, dtype=np.float64).reshape(1, -1, 1)
+    D = (rt + rs) ** 2 + (zt - zs) ** 2
+    sqrtD = np.sqrt(D)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        m = np.where(D > 0.0, 4.0 * rt * rs / D, 0.0)
+    m = np.clip(m, 0.0, 1.0 - 1e-15)
+    K = ellipk(m)
+    E = ellipe(m)
+    G = K / (np.pi * sqrtD)
+
+    dKdm = _ellipk_derivative(m, K, E)
+    dD_dr = 2.0 * (rt + rs)
+    dD_dz = 2.0 * (zs - zt)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dm_dr = 4.0 * rt / D - (4.0 * rt * rs / (D * D)) * dD_dr
+        dm_dz = -(4.0 * rt * rs / (D * D)) * dD_dz
+        dF_dr = (
+            dKdm * dm_dr / sqrtD - 0.5 * K * dD_dr / (D * sqrtD)
+        ) / np.pi
+        dF_dz = (
+            dKdm * dm_dz / sqrtD - 0.5 * K * dD_dz / (D * sqrtD)
+        ) / np.pi
+    H = n_rho * dF_dr + n_z * dF_dz
+    return np.asarray(G, dtype=np.complex128), np.asarray(H, dtype=np.complex128)
+
+
 def _ellipk_derivative(
     m: NDArray[np.float64],
     K: NDArray[np.float64],
@@ -2057,6 +2251,44 @@ def _ring_remainder_kernel_m0_batched(
 
     G = 2.0 * np.sum(rem_g * weights[None, None, :], axis=2)
     H = 2.0 * np.sum(rem_h * weights[None, None, :], axis=2)
+    return np.asarray(G, dtype=np.complex128), np.asarray(H, dtype=np.complex128)
+
+
+def _ring_remainder_kernel_m0_targets_batched(
+    target_rho: NDArray[np.float64],
+    target_z: NDArray[np.float64],
+    source_rho: NDArray[np.float64],
+    source_z: NDArray[np.float64],
+    normal_rho: NDArray[np.float64],
+    normal_z: NDArray[np.float64],
+    k: complex,
+    *,
+    n_psi: int,
+) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    rs = np.asarray(source_rho, dtype=np.float64)[None, :, :, None]
+    zs = np.asarray(source_z, dtype=np.float64)[None, :, :, None]
+    psi, weights = _leggauss_psi(int(n_psi))
+    cos_psi = np.cos(psi)[None, None, None, :]
+    rt = np.asarray(target_rho, dtype=np.float64).reshape(-1, 1, 1, 1)
+    zt = np.asarray(target_z, dtype=np.float64).reshape(-1, 1, 1, 1)
+    n_rho = np.asarray(normal_rho, dtype=np.float64).reshape(1, -1, 1, 1)
+    n_z = np.asarray(normal_z, dtype=np.float64).reshape(1, -1, 1, 1)
+
+    dz = zs - zt
+    R2 = rt * rt + rs * rs - 2.0 * rt * rs * cos_psi + dz * dz
+    R = np.sqrt(np.maximum(R2, 0.0))
+    q = complex(k) * R
+    phase = np.exp(1j * q)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rem_g = (phase - 1.0) / (4.0 * np.pi * R)
+
+    num = (rs - rt * cos_psi) * n_rho + dz * n_z
+    expr = phase * (1j * q - 1.0) + 1.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rem_h = expr * num / (4.0 * np.pi * R2 * R)
+
+    G = 2.0 * np.sum(rem_g * weights[None, None, None, :], axis=3)
+    H = 2.0 * np.sum(rem_h * weights[None, None, None, :], axis=3)
     return np.asarray(G, dtype=np.complex128), np.asarray(H, dtype=np.complex128)
 
 
