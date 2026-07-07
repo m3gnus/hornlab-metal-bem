@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+from numbers import Integral
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
@@ -63,6 +64,7 @@ class GeometryPayload:
     duffy_1d_order: int = 4
     precision: str = "complex64"
     symmetry_plane: str | None = None
+    aperture_tag: int | None = None
     schema: str = METAL_STANDARD_SCHEMA
     op: str = "create_session"
     index_base: int = INDEX_BASE
@@ -97,6 +99,7 @@ class GeometryPayload:
                 "basis_test": "P1",
                 "source_basis": "DP0",
                 "symmetry_plane": self.symmetry_plane,
+                "aperture_tag": self.aperture_tag,
             },
         }
 
@@ -654,6 +657,15 @@ def _validate_geometry_manifest(manifest: dict[str, Any]) -> None:
         raise ValueError("space.p1_dof_count must be positive")
     if dp0_dof_count != n_triangles:
         raise ValueError("space.dp0_dof_count must equal n_triangles")
+    scope = manifest.get("assembly_scope")
+    if isinstance(scope, dict):
+        aperture_tag = scope.get("aperture_tag")
+        if aperture_tag is not None and (
+            isinstance(aperture_tag, bool)
+            or not isinstance(aperture_tag, Integral)
+            or int(aperture_tag) <= 0
+        ):
+            raise ValueError("assembly_scope.aperture_tag must be positive or null")
 
 
 def _validate_assembly_manifest(manifest: dict[str, Any]) -> None:

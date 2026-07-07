@@ -234,6 +234,9 @@ class SolveConfig:
     frame_override: object | None = None  # ObservationFrame, kept as object to avoid circular import
 
     # Native Metal controls
+    # Full-3D native Metal coupled infinite-baffle solve. Names the physical tag
+    # for the flush z=0 aperture triangles. Independent of circsym_aperture_tag.
+    aperture_tag: int | None = None
     native_symmetry_plane: NativeSymmetryPlane | None = None
     # When True (default), a reduced-domain symmetry mesh must have every open
     # boundary edge on a requested symmetry plane: a closed surface reduced by
@@ -354,6 +357,13 @@ class SolveConfig:
                 raise ValueError(
                     "circsym_aperture_tag must be a positive int or None"
                 )
+        if self.aperture_tag is not None:
+            if (
+                isinstance(self.aperture_tag, bool)
+                or not isinstance(self.aperture_tag, Integral)
+                or self.aperture_tag <= 0
+            ):
+                raise ValueError("aperture_tag must be a positive int or None")
         if (
             self.native_symmetry_plane is not None
             and self.native_symmetry_plane not in NATIVE_SYMMETRY_PLANES

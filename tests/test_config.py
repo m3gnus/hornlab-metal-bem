@@ -327,6 +327,17 @@ def test_solve_config_mesh_loading_options_default_off():
     assert cfg.mesh_validate is True
     assert cfg.mesh_merge_tol == 1e-9
     assert cfg.mesh_repair_normals is False
+    assert cfg.aperture_tag is None
+
+
+def test_solve_config_accepts_native_infinite_baffle_aperture_tag():
+    assert SolveConfig(aperture_tag=11).aperture_tag == 11
+
+
+@pytest.mark.parametrize("bad_tag", [0, -1, True, 1.5, "11"])
+def test_solve_config_rejects_invalid_native_infinite_baffle_aperture_tag(bad_tag):
+    with pytest.raises(ValueError, match="aperture_tag"):
+        SolveConfig(aperture_tag=bad_tag)  # type: ignore[arg-type]
 
 
 def test_solve_config_rejects_unknown_metal_native_assembly_mode():

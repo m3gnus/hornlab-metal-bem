@@ -708,6 +708,8 @@ def run_sweep_native_metal(
     with MetalNativeStandardSession.create_session(
         geometry_buffers=geometry_buffers,
         symmetry_plane=config.native_symmetry_plane,
+        aperture_tag=config.aperture_tag,
+        velocity_source_tags=source_tags,
         check_open_edges=config.native_check_open_edges,
         runtime_status=runtime,
         extra_env=_native_env_overrides(config),
@@ -1180,6 +1182,8 @@ def run_sweep_native_metal_multi_source(
     with MetalNativeStandardSession.create_session(
         geometry_buffers=geometry_buffers,
         symmetry_plane=config.native_symmetry_plane,
+        aperture_tag=config.aperture_tag,
+        velocity_source_tags=source_tags,
         check_open_edges=config.native_check_open_edges,
         runtime_status=runtime,
         extra_env=_native_env_overrides(config),

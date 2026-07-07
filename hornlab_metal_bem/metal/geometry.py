@@ -10,6 +10,7 @@ code must not emit one-based triangle or DOF indices.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any
 
 import numpy as np
@@ -210,6 +211,99 @@ def validate_native_symmetry_plane(
     if check_open_edges:
         _validate_open_edges_on_symmetry_planes(coords, triangles, plane)
     return plane
+
+
+def validate_native_infinite_baffle_aperture(
+    buffers: MetalGeometryBuffers,
+    aperture_tag: int | None,
+    *,
+    velocity_source_tags: Any | None = None,
+    symmetry_plane: str | None = None,
+    tolerance: float = 1.0e-6,
+) -> int | None:
+    """Validate the native full-3D coupled infinite-baffle aperture contract."""
+    if aperture_tag is None:
+        return None
+    if (
+        isinstance(aperture_tag, bool)
+        or not isinstance(aperture_tag, Integral)
+        or int(aperture_tag) <= 0
+    ):
+        raise MetalGeometryError("aperture_tag must be a positive int or None")
+    tag = int(aperture_tag)
+
+    plane = None if symmetry_plane is None else str(symmetry_plane).strip().lower()
+    if plane == "xy":
+        raise MetalGeometryError(
+            "aperture_tag coupled infinite-baffle mode does not compose with "
+            "native_symmetry_plane='xy'; use None, 'yz', 'xz', or 'yz+xz'"
+        )
+    if plane is not None and plane not in {"yz", "xz", "yz+xz"}:
+        raise MetalGeometryError(
+            "aperture_tag coupled infinite-baffle mode requires "
+            "native_symmetry_plane to be None, 'yz', 'xz', or 'yz+xz'"
+        )
+
+    if velocity_source_tags is None:
+        source_tags: set[int] = set()
+    else:
+        source_tags = set()
+        for source_tag in velocity_source_tags:
+            if (
+                isinstance(source_tag, bool)
+                or not isinstance(source_tag, Integral)
+                or int(source_tag) <= 0
+            ):
+                raise MetalGeometryError("velocity_source_tags must be positive ints")
+            source_tags.add(int(source_tag))
+    if tag in source_tags:
+        raise MetalGeometryError(
+            "aperture_tag must not also be listed in velocity_sources"
+        )
+
+    tags = np.asarray(buffers.physical_tags_i32, dtype=np.int32)
+    aperture_mask = tags == tag
+    if not np.any(aperture_mask):
+        available = sorted(int(value) for value in np.unique(tags))
+        raise MetalGeometryError(
+            f"aperture_tag {tag} is not present in the mesh; "
+            f"available physical tags: {available}"
+        )
+
+    triangles = buffers.triangles_nx3_i32[aperture_mask]
+    if triangles.shape[0] == 0:
+        raise MetalGeometryError("aperture_tag must select at least one triangle")
+
+    coords = np.asarray(buffers.vertices_3xn_f32, dtype=np.float64)
+    z_values = coords[2, triangles]
+    max_abs_z = float(np.max(np.abs(z_values)))
+    if max_abs_z > tolerance:
+        raise MetalGeometryError(
+            "aperture_tag triangles must be coplanar at Z=0; "
+            f"max |Z| is {max_abs_z:.6g}"
+        )
+
+    normals = np.asarray(buffers.triangle_normals_3xm_f32, dtype=np.float64)[
+        :,
+        aperture_mask,
+    ]
+    normal_tol = max(float(tolerance), 1.0e-5)
+    off_axis = np.hypot(normals[0], normals[1])
+    bad = (
+        (off_axis > normal_tol)
+        | (normals[2] < 1.0 - normal_tol)
+        | (normals[2] <= 0.0)
+    )
+    if np.any(bad):
+        first = int(np.flatnonzero(aperture_mask)[int(np.flatnonzero(bad)[0])])
+        normal = normals[:, int(np.flatnonzero(bad)[0])]
+        raise MetalGeometryError(
+            "aperture_tag triangles must have normals pointing +Z; "
+            f"triangle {first} normal is "
+            f"({normal[0]:.6g}, {normal[1]:.6g}, {normal[2]:.6g})"
+        )
+
+    return tag
 
 
 def _validate_open_edges_on_symmetry_planes(

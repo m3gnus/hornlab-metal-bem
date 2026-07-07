@@ -99,6 +99,13 @@ func optionalDouble(_ object: [String: Any], _ key: String, default defaultValue
     return try requireDouble(object, key)
 }
 
+func optionalInt(_ object: [String: Any], _ key: String) throws -> Int? {
+    guard object[key] != nil, !(object[key] is NSNull) else {
+        return nil
+    }
+    return try requireInt(object, key)
+}
+
 func requireString(_ object: [String: Any], _ key: String) throws -> String {
     guard let value = object[key] as? String else {
         try fail("\(key) must be a string")
@@ -251,6 +258,7 @@ func validateSession(_ manifest: [String: Any]) throws -> [String: Any] {
         try fail("space.dp0_dof_count must equal n_triangles")
     }
     let symmetryPlane = try parseSymmetryPlane(manifest)
+    let apertureTag = try parseApertureTag(manifest)
 
     return [
         "schema": schema,
@@ -262,6 +270,7 @@ func validateSession(_ manifest: [String: Any]) throws -> [String: Any] {
         "p1_dof_count": p1DofCount,
         "dp0_dof_count": dp0DofCount,
         "symmetry_plane": symmetryPlane.map { $0 as Any } ?? NSNull(),
+        "aperture_tag": apertureTag.map { $0 as Any } ?? NSNull(),
         "status": "ok",
     ]
 }
@@ -278,6 +287,34 @@ func parseSymmetryPlane(_ manifest: [String: Any]) throws -> String? {
         try fail("native symmetry currently supports yz, xz, xy, and yz+xz")
     }
     return plane
+}
+
+func parseApertureTag(_ manifest: [String: Any]) throws -> Int? {
+    let scope = manifest["assembly_scope"] as? [String: Any]
+    guard let rawTag = scope?["aperture_tag"], !(rawTag is NSNull) else {
+        return nil
+    }
+    let tag: Int
+    if rawTag is Bool {
+        try fail("assembly_scope.aperture_tag must be null or an integer")
+    } else if let intValue = rawTag as? Int {
+        tag = intValue
+    } else if let numberValue = rawTag as? NSNumber {
+        if CFGetTypeID(numberValue) == CFBooleanGetTypeID() {
+            try fail("assembly_scope.aperture_tag must be null or an integer")
+        }
+        let doubleValue = numberValue.doubleValue
+        if !doubleValue.isFinite || Double(numberValue.intValue) != doubleValue {
+            try fail("assembly_scope.aperture_tag must be null or an integer")
+        }
+        tag = numberValue.intValue
+    } else {
+        try fail("assembly_scope.aperture_tag must be null or an integer")
+    }
+    if tag <= 0 {
+        try fail("assembly_scope.aperture_tag must be positive when set")
+    }
+    return tag
 }
 
 struct Complex32 {
@@ -399,6 +436,7 @@ struct MultiDenseSolveRun {
     var refineResidualRels: [Double]? = nil
     var dtype: String = "float32"
     var chiefResidualRels: [Double]? = nil
+    var apertureNeumanns: [[Complex32]]? = nil
 
     /// Single-source view for the existing per-case result plumbing.
     func single(_ index: Int) -> DenseSolveRun {
@@ -642,6 +680,7 @@ struct Geometry {
     let p1DofCount: Int
     let dp0DofCount: Int
     let symmetryPlane: String?
+    let apertureTag: Int?
 
     func triangleVertex(_ triangle: Int, _ local: Int) -> Int {
         Int(triangles[local * nTriangles + triangle])
@@ -737,6 +776,7 @@ func readGeometry(_ sessionManifestPath: String) throws -> Geometry {
         expectedCount: 3 * nTriangles
     )
     let symmetryPlane = try parseSymmetryPlane(manifest)
+    let apertureTag = try parseApertureTag(manifest)
 
     return Geometry(
         root: root,
@@ -753,7 +793,8 @@ func readGeometry(_ sessionManifestPath: String) throws -> Geometry {
         nTriangles: nTriangles,
         p1DofCount: try requireInt(space, "p1_dof_count"),
         dp0DofCount: try requireInt(space, "dp0_dof_count"),
-        symmetryPlane: symmetryPlane
+        symmetryPlane: symmetryPlane,
+        apertureTag: apertureTag
     )
 }
 
@@ -821,6 +862,381 @@ func nativePressureReductionPayload(
         payload["surface_pressure_avg"] = pavg
     }
     return payload
+}
+
+struct ApertureGeometry {
+    let tag: Int
+    let triangles: [Int]
+    let dofs: [Int]
+    let dofLocalByGlobal: [Int: Int]
+    let projectionLocalsByTriangle: [[Int]]
+    let projectionLocalsByGlobalTriangle: [Int: [Int]]
+}
+
+struct SlpProjection {
+    let re: [Float]
+    let im: [Float]
+    let rows: Int
+    let cols: Int
+
+    func value(row: Int, col: Int) -> Complex32 {
+        let idx = row * cols + col
+        return Complex32(re: re[idx], im: im[idx])
+    }
+}
+
+struct ApertureCoupling {
+    let aperture: ApertureGeometry
+    let interiorSlp: SlpProjection
+    let rayleighSlp: SlpProjection
+    let transformSeconds: Double
+    let usedDuffy: Bool
+}
+
+func caseApertureTag(geom: Geometry, casePayload: [String: Any]) throws -> Int? {
+    let caseTag = try optionalInt(casePayload, "aperture_tag")
+    if let caseTag, caseTag <= 0 {
+        try fail("aperture_tag must be positive when set")
+    }
+    if let sessionTag = geom.apertureTag, let caseTag, sessionTag != caseTag {
+        try fail("case aperture_tag \(caseTag) does not match session aperture_tag \(sessionTag)")
+    }
+    return caseTag ?? geom.apertureTag
+}
+
+func buildApertureGeometry(geom: Geometry, tag: Int) throws -> ApertureGeometry {
+    if geom.symmetryPlane == "xy" {
+        try fail("aperture_tag coupled infinite-baffle mode does not support native_symmetry_plane='xy'")
+    }
+    var triangles: [Int] = []
+    for tri in 0..<geom.nTriangles where Int(geom.physicalTags[tri]) == tag {
+        triangles.append(tri)
+    }
+    if triangles.isEmpty {
+        try fail("aperture_tag \(tag) selects no triangles")
+    }
+
+    var dofSet = Set<Int>()
+    for tri in triangles {
+        for local in 0..<3 {
+            dofSet.insert(geom.p1Dof(tri, local))
+        }
+    }
+    let dofs = dofSet.sorted()
+    var dofLocalByGlobal: [Int: Int] = [:]
+    for (index, dof) in dofs.enumerated() {
+        dofLocalByGlobal[dof] = index
+    }
+
+    var projectionLocalsByTriangle: [[Int]] = []
+    var projectionLocalsByGlobalTriangle: [Int: [Int]] = [:]
+    projectionLocalsByTriangle.reserveCapacity(triangles.count)
+    for tri in triangles {
+        var locals: [Int] = []
+        locals.reserveCapacity(3)
+        for local in 0..<3 {
+            let dof = geom.p1Dof(tri, local)
+            guard let apertureLocal = dofLocalByGlobal[dof] else {
+                try fail("internal aperture projection map missing P1 dof \(dof)")
+            }
+            locals.append(apertureLocal)
+        }
+        projectionLocalsByTriangle.append(locals)
+        projectionLocalsByGlobalTriangle[tri] = locals
+    }
+
+    return ApertureGeometry(
+        tag: tag,
+        triangles: triangles,
+        dofs: dofs,
+        dofLocalByGlobal: dofLocalByGlobal,
+        projectionLocalsByTriangle: projectionLocalsByTriangle,
+        projectionLocalsByGlobalTriangle: projectionLocalsByGlobalTriangle
+    )
+}
+
+func assembleApertureSlpProjection(
+    geom: Geometry,
+    aperture: ApertureGeometry,
+    k: Float,
+    kImag: Float,
+    includeDuffy: Bool,
+    testTriangles: [Int]? = nil
+) throws -> SlpProjection {
+    let n = geom.p1DofCount
+    let d = aperture.triangles.count
+    let imageMasks = [0] + symmetryImageMasks(geom.symmetryPlane)
+    let tests = testTriangles ?? Array(0..<geom.nTriangles)
+    let testSet = testTriangles.map { Set($0) }
+    var re = Array(repeating: Float(0.0), count: n * d)
+    var im = Array(repeating: Float(0.0), count: n * d)
+    var apertureTriangleLocalByGlobal: [Int: Int] = [:]
+    for (local, tri) in aperture.triangles.enumerated() {
+        apertureTriangleLocalByGlobal[tri] = local
+    }
+
+    for (apertureTriIndex, trial) in aperture.triangles.enumerated() {
+        for test in tests {
+            var slp = Array(repeating: Complex32.zero, count: 3)
+            for trialMask in imageMasks {
+                let blocks = regularPairBlocks(
+                    geom: geom,
+                    test: test,
+                    trial: trial,
+                    testImageMask: 0,
+                    trialImageMask: trialMask,
+                    k: k,
+                    kImag: kImag
+                )
+                for i in 0..<3 {
+                    slp[i] = slp[i] + blocks.slp[i]
+                }
+            }
+            for i in 0..<3 {
+                let row = geom.p1Dof(test, i)
+                let rowWeight = geom.symmetryRowWeight(row)
+                let value = slp[i] * rowWeight
+                let base = row * d
+                re[base + apertureTriIndex] += value.re
+                im[base + apertureTriIndex] += value.im
+            }
+        }
+    }
+
+    if includeDuffy {
+        let pairList = try buildDuffyPairList(geom)
+        let rules = [
+            1: try duffyRule(kind: 1),
+            2: try duffyRule(kind: 2),
+            3: try duffyRule(kind: 3),
+        ]
+        for pair in pairList.pairs {
+            if let testSet, !testSet.contains(pair.test) {
+                continue
+            }
+            guard let apertureTriIndex = apertureTriangleLocalByGlobal[pair.trial] else {
+                continue
+            }
+            let regular = regularPairBlocks(
+                geom: geom,
+                test: pair.test,
+                trial: pair.trial,
+                testImageMask: pair.testImageMask,
+                trialImageMask: pair.trialImageMask,
+                k: k,
+                kImag: kImag
+            )
+            let singular = try singularPairBlocks(
+                geom: geom,
+                pair: pair,
+                rules: rules,
+                k: k,
+                kImag: kImag
+            )
+            for i in 0..<3 {
+                let row = geom.p1Dof(pair.test, i)
+                let delta = singular.slp[i] - regular.slp[i]
+                let base = row * d
+                re[base + apertureTriIndex] += delta.re
+                im[base + apertureTriIndex] += delta.im
+            }
+        }
+    }
+
+    return SlpProjection(re: re, im: im, rows: n, cols: d)
+}
+
+func assembleApertureAverageSlpProjection(
+    geom: Geometry,
+    aperture: ApertureGeometry,
+    k: Float,
+    kImag: Float,
+    includeDuffy: Bool
+) throws -> SlpProjection {
+    let m = aperture.triangles.count
+    let imageMasks = [0] + symmetryImageMasks(geom.symmetryPlane)
+    var re = Array(repeating: Float(0.0), count: m * m)
+    var im = Array(repeating: Float(0.0), count: m * m)
+    var apertureTriangleLocalByGlobal: [Int: Int] = [:]
+    for (local, tri) in aperture.triangles.enumerated() {
+        apertureTriangleLocalByGlobal[tri] = local
+    }
+
+    for (rowLocal, test) in aperture.triangles.enumerated() {
+        let invArea = Float(1.0) / max(geom.areas[test], Float.leastNonzeroMagnitude)
+        for (colLocal, trial) in aperture.triangles.enumerated() {
+            var acc = Complex32.zero
+            for trialMask in imageMasks {
+                let blocks = regularPairBlocks(
+                    geom: geom,
+                    test: test,
+                    trial: trial,
+                    testImageMask: 0,
+                    trialImageMask: trialMask,
+                    k: k,
+                    kImag: kImag
+                )
+                for i in 0..<3 {
+                    acc = acc + blocks.slp[i]
+                }
+            }
+            let value = acc * invArea
+            let idx = rowLocal * m + colLocal
+            re[idx] += value.re
+            im[idx] += value.im
+        }
+    }
+
+    if includeDuffy {
+        let pairList = try buildDuffyPairList(geom)
+        let rules = [
+            1: try duffyRule(kind: 1),
+            2: try duffyRule(kind: 2),
+            3: try duffyRule(kind: 3),
+        ]
+        for pair in pairList.pairs {
+            guard pair.testImageMask == 0,
+                  let rowLocal = apertureTriangleLocalByGlobal[pair.test],
+                  let colLocal = apertureTriangleLocalByGlobal[pair.trial] else {
+                continue
+            }
+            let regular = regularPairBlocks(
+                geom: geom,
+                test: pair.test,
+                trial: pair.trial,
+                testImageMask: pair.testImageMask,
+                trialImageMask: pair.trialImageMask,
+                k: k,
+                kImag: kImag
+            )
+            let singular = try singularPairBlocks(
+                geom: geom,
+                pair: pair,
+                rules: rules,
+                k: k,
+                kImag: kImag
+            )
+            var delta = Complex32.zero
+            for i in 0..<3 {
+                delta = delta + (singular.slp[i] - regular.slp[i])
+            }
+            let invArea = Float(1.0) / max(geom.areas[pair.test], Float.leastNonzeroMagnitude)
+            let value = delta * invArea
+            let idx = rowLocal * m + colLocal
+            re[idx] += value.re
+            im[idx] += value.im
+        }
+    }
+
+    return SlpProjection(re: re, im: im, rows: m, cols: m)
+}
+
+func buildCoupledIBCoupling(
+    geom: Geometry,
+    apertureTag: Int,
+    k: Float,
+    kImag: Float,
+    fieldK: Float,
+    includeDuffy: Bool
+) throws -> ApertureCoupling {
+    let start = CFAbsoluteTimeGetCurrent()
+    let aperture = try buildApertureGeometry(geom: geom, tag: apertureTag)
+    let interiorSlp = try assembleApertureSlpProjection(
+        geom: geom,
+        aperture: aperture,
+        k: k,
+        kImag: kImag,
+        includeDuffy: includeDuffy
+    )
+    let rayleighSlp = try assembleApertureAverageSlpProjection(
+        geom: geom,
+        aperture: aperture,
+        k: fieldK,
+        kImag: 0.0,
+        includeDuffy: includeDuffy
+    )
+    return ApertureCoupling(
+        aperture: aperture,
+        interiorSlp: interiorSlp,
+        rayleighSlp: rayleighSlp,
+        transformSeconds: CFAbsoluteTimeGetCurrent() - start,
+        usedDuffy: includeDuffy
+    )
+}
+
+func coupledIBApertureNeumann(
+    apertureUnknown: [Complex32],
+    coupling: ApertureCoupling
+) -> [Complex32] {
+    if apertureUnknown.count != coupling.aperture.triangles.count {
+        return []
+    }
+    return apertureUnknown
+}
+
+func evaluateCoupledIBRayleighReference(
+    geom: Geometry,
+    coupling: ApertureCoupling,
+    apertureNeumann: [Complex32],
+    observationPoints: [(Float, Float, Float)],
+    k: Float
+) -> [Complex32] {
+    let (qx, qy, qw) = triangleRule6()
+    let imageMasks = symmetryImageMasks(geom.symmetryPlane)
+    var out = Array(repeating: Complex32.zero, count: observationPoints.count)
+    for obsIdx in observationPoints.indices {
+        let (ox, oy, oz) = observationPoints[obsIdx]
+        if oz < 0.0 {
+            continue
+        }
+        var acc = Complex32.zero
+        for (apertureIndex, tri) in coupling.aperture.triangles.enumerated() {
+            let qTri = apertureNeumann[apertureIndex]
+            if qTri.re == 0.0 && qTri.im == 0.0 {
+                continue
+            }
+            let jac = 2.0 * geom.areas[tri]
+            for qa in 0..<qw.count {
+                let (sx, sy, sz) = pointOnTriangle(geom, tri, qx[qa], qy[qa])
+                let weight = qw[qa] * jac
+                let g = helmholtzG(sx - ox, sy - oy, sz - oz, k)
+                acc = acc + (g * qTri) * weight
+                for mask in imageMasks {
+                    let image = mirrorPoint((sx, sy, sz), mask: mask)
+                    let ig = helmholtzG(image.0 - ox, image.1 - oy, image.2 - oz, k)
+                    acc = acc + (ig * qTri) * weight
+                }
+            }
+        }
+        out[obsIdx] = acc * 2.0
+    }
+    return out
+}
+
+func evaluateCoupledIBRayleigh(
+    geom: Geometry,
+    coupling: ApertureCoupling,
+    apertureNeumann: [Complex32],
+    observationPoints: [(Float, Float, Float)],
+    k: Float
+) -> FieldRun {
+    let (values, seconds) = timedRun {
+        evaluateCoupledIBRayleighReference(
+            geom: geom,
+            coupling: coupling,
+            apertureNeumann: apertureNeumann,
+            observationPoints: observationPoints,
+            k: k
+        )
+    }
+    return FieldRun(
+        values: values,
+        implementation: "swift_native_reference_coupled_ib_rayleigh_field",
+        mode: "rayleigh",
+        seconds: seconds,
+        parity: nil,
+        metalDispatch: nil
+    )
 }
 
 func triangleRule6() -> ([Float], [Float], [Float]) {
@@ -6533,6 +6949,99 @@ func solveCaseDenseMulti(
     )
 }
 
+func solveCoupledIBDenseMulti(
+    arrays: AssemblyArrays,
+    extraRhs: [(re: [Float], im: [Float])],
+    geom: Geometry,
+    coupling: ApertureCoupling
+) throws -> MultiDenseSolveRun {
+    let n = geom.p1DofCount
+    let m = coupling.aperture.triangles.count
+    let total = n + m
+    if arrays.aRe.count != n * n || arrays.aIm.count != n * n
+        || arrays.rhsRe.count != n || arrays.rhsIm.count != n {
+        try fail("coupled IB base assembly size mismatch")
+    }
+    if coupling.interiorSlp.rows != n || coupling.interiorSlp.cols != m
+        || coupling.rayleighSlp.rows != m || coupling.rayleighSlp.cols != m {
+        try fail("coupled IB aperture block size mismatch")
+    }
+
+    var aRe = Array(repeating: Float(0.0), count: total * total)
+    var aIm = Array(repeating: Float(0.0), count: total * total)
+    for row in 0..<n {
+        for col in 0..<n {
+            let src = row * n + col
+            let dst = row * total + col
+            aRe[dst] = arrays.aRe[src]
+            aIm[dst] = arrays.aIm[src]
+        }
+    }
+
+    for colLocal in 0..<m {
+        let outCol = n + colLocal
+        for row in 0..<n {
+            let slp = coupling.interiorSlp.value(row: row, col: colLocal)
+            let dst = row * total + outCol
+            aRe[dst] = -slp.re
+            aIm[dst] = -slp.im
+        }
+    }
+
+    for (rowLocal, tri) in coupling.aperture.triangles.enumerated() {
+        let outRow = n + rowLocal
+        for local in 0..<3 {
+            let pressureDof = geom.p1Dof(tri, local)
+            aRe[outRow * total + pressureDof] += Float(1.0 / 3.0)
+        }
+        for colLocal in 0..<m {
+            let rayleigh = coupling.rayleighSlp.value(row: rowLocal, col: colLocal) * 2.0
+            let qCol = n + colLocal
+            aRe[outRow * total + qCol] = -rayleigh.re
+            aIm[outRow * total + qCol] = -rayleigh.im
+        }
+    }
+
+    var rhsRe = [arrays.rhsRe + Array(repeating: Float(0.0), count: m)]
+    var rhsIm = [arrays.rhsIm + Array(repeating: Float(0.0), count: m)]
+    for extra in extraRhs {
+        if extra.re.count != n || extra.im.count != n {
+            try fail("coupled IB extra RHS size mismatch")
+        }
+        rhsRe.append(extra.re + Array(repeating: Float(0.0), count: m))
+        rhsIm.append(extra.im + Array(repeating: Float(0.0), count: m))
+    }
+
+    let solved = try solveDenseAccelerateMulti(
+        aReRowMajor: aRe,
+        aImRowMajor: aIm,
+        rhsRe: rhsRe,
+        rhsIm: rhsIm,
+        n: total
+    )
+    if solved.lapackInfo != 0 || solved.pressures.isEmpty {
+        return solved
+    }
+    let pressures = solved.pressures.map { solution in
+        Array(solution[0..<n])
+    }
+    let apertureNeumanns = solved.pressures.map { solution in
+        Array(solution[n..<total])
+    }
+    return MultiDenseSolveRun(
+        pressures: pressures,
+        implementation: solved.implementation + "_coupled_ib_augmented",
+        seconds: solved.seconds,
+        lapackInfo: solved.lapackInfo,
+        rcond: solved.rcond,
+        refineIterations: solved.refineIterations,
+        refineResidualRels: solved.refineResidualRels,
+        dtype: solved.dtype,
+        chiefResidualRels: solved.chiefResidualRels,
+        apertureNeumanns: apertureNeumanns
+    )
+}
+
 func solveDenseAccelerateCgesv(
     aReRowMajor: [Float],
     aImRowMajor: [Float],
@@ -7553,6 +8062,7 @@ func assembleSolveStandardNeumannBatch(
 
 struct SolvedCase {
     let assembly: AssemblyRun
+    let apertureCoupling: ApertureCoupling?
     // Fully corrected extra-source RHS vectors (empty for single-source
     // cases); retained for diagnostics parity with the primary arrays.
     let extraRhs: [(re: [Float], im: [Float])]
@@ -7695,12 +8205,14 @@ func assembleSolveEvaluateStandardNeumannBatch(
     var caseNeumanns: [[Complex32]] = []
     var caseExtraNeumanns: [[[Complex32]]] = []
     var caseRobinBetas: [[Complex32]?] = []
+    var caseApertureTags: [Int?] = []
     caseKs.reserveCapacity(cases.count)
     caseKImag.reserveCapacity(cases.count)
     caseFieldKs.reserveCapacity(cases.count)
     caseNeumanns.reserveCapacity(cases.count)
     caseExtraNeumanns.reserveCapacity(cases.count)
     caseRobinBetas.reserveCapacity(cases.count)
+    caseApertureTags.reserveCapacity(cases.count)
     for casePayload in cases {
         let kReal = Float(try requireDouble(casePayload, "k_real_f32"))
         let kImag = Float(try optionalDouble(casePayload, "k_imag_f32", default: 0.0))
@@ -7713,6 +8225,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
         caseKs.append(kReal)
         caseKImag.append(kImag)
         caseFieldKs.append(fieldK)
+        caseApertureTags.append(try caseApertureTag(geom: geom, casePayload: casePayload))
         caseNeumanns.append(
             try readComplexVector(
                 root: geom.root,
@@ -7747,6 +8260,10 @@ func assembleSolveEvaluateStandardNeumannBatch(
         try fail("extra_sources must have the same length in every case")
     }
     let sourcesPerCase = extraSourceCount + 1
+    let hasCoupledIB = caseApertureTags.contains { $0 != nil }
+    if hasCoupledIB && chiefPoints != nil {
+        try fail("coupled IB aperture_tag does not support chief_points yet")
+    }
 
     let assemblyMode = ProcessInfo.processInfo.environment[
         "HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE"
@@ -7794,7 +8311,11 @@ func assembleSolveEvaluateStandardNeumannBatch(
     func assemblyRun(
         from finished: ResidentMetalContext.FinishedAssembly,
         caseIndex: Int
-    ) throws -> (run: AssemblyRun, extraRhs: [(re: [Float], im: [Float])]) {
+    ) throws -> (
+        run: AssemblyRun,
+        extraRhs: [(re: [Float], im: [Float])],
+        apertureCoupling: ApertureCoupling?
+    ) {
         guard let blocks = finished.duffyBlocks else {
             let (nearCorrected, nearExtra, nearStats) = try applyNearFieldCorrectionsIfEnabled(
                 to: finished.regular.arrays,
@@ -7817,7 +8338,12 @@ func assembleSolveEvaluateStandardNeumannBatch(
                 nearStats: nearStats,
                 metalDispatch: finished.regular.dispatch
             )
-            return (run, nearExtra)
+            let (transformed, apertureCoupling) = try applyCoupledIBIfNeeded(
+                run: run,
+                caseIndex: caseIndex,
+                includeDuffy: false
+            )
+            return (transformed, nearExtra, apertureCoupling)
         }
         let (correctedArrays, reductionSeconds) = context.reduceDuffyDeltaBlocks(
             to: finished.regular.arrays,
@@ -7866,12 +8392,21 @@ func assembleSolveEvaluateStandardNeumannBatch(
             nearStats: nearStats,
             metalDispatch: finished.regular.dispatch
         )
-        return (run, nearExtra)
+        let (transformed, apertureCoupling) = try applyCoupledIBIfNeeded(
+            run: run,
+            caseIndex: caseIndex,
+            includeDuffy: true
+        )
+        return (transformed, nearExtra, apertureCoupling)
     }
 
     func pipelinedAssemblyRun(
         _ caseIndex: Int
-    ) throws -> (run: AssemblyRun, extraRhs: [(re: [Float], im: [Float])]) {
+    ) throws -> (
+        run: AssemblyRun,
+        extraRhs: [(re: [Float], im: [Float])],
+        apertureCoupling: ApertureCoupling?
+    ) {
         guard let pending = pendingAssembly, pending.caseIndex == caseIndex else {
             try fail("internal error: pipelined assembly is out of order")
         }
@@ -7890,6 +8425,65 @@ func assembleSolveEvaluateStandardNeumannBatch(
         return try assemblyRun(from: finished, caseIndex: caseIndex)
     }
 
+    func applyCoupledIBIfNeeded(
+        run: AssemblyRun,
+        caseIndex: Int,
+        includeDuffy: Bool
+    ) throws -> (AssemblyRun, ApertureCoupling?) {
+        guard let apertureTag = caseApertureTags[caseIndex] else {
+            return (run, nil)
+        }
+        let coupling = try buildCoupledIBCoupling(
+            geom: geom,
+            apertureTag: apertureTag,
+            k: caseKs[caseIndex],
+            kImag: caseKImag[caseIndex],
+            fieldK: caseFieldKs[caseIndex],
+            includeDuffy: includeDuffy
+        )
+        return (
+            AssemblyRun(
+                arrays: run.arrays,
+                implementation: run.implementation,
+                mode: run.mode,
+                seconds: run.seconds + coupling.transformSeconds,
+                parity: run.parity,
+                duffyStats: run.duffyStats,
+                nearStats: run.nearStats,
+                metalDispatch: run.metalDispatch
+            ),
+            coupling
+        )
+    }
+
+    func solveDenseForCase(
+        assembly: AssemblyRun,
+        extraRhs: [(re: [Float], im: [Float])],
+        apertureCoupling: ApertureCoupling?,
+        caseIndex: Int
+    ) throws -> MultiDenseSolveRun {
+        if let apertureCoupling {
+            return try solveCoupledIBDenseMulti(
+                arrays: assembly.arrays,
+                extraRhs: extraRhs,
+                geom: geom,
+                coupling: apertureCoupling
+            )
+        }
+        return try solveCaseDenseMulti(
+            arrays: assembly.arrays,
+            extraRhs: extraRhs,
+            geom: geom,
+            chiefPoints: chiefPoints,
+            chiefWeight: chiefWeight,
+            driverNeumanns: [caseNeumanns[caseIndex]]
+                + caseExtraNeumanns[caseIndex],
+            k: caseKs[caseIndex],
+            kImag: caseKImag[caseIndex],
+            robinBetas: caseRobinBetas[caseIndex]
+        )
+    }
+
     func submitSolveJob(
         caseIndex: Int,
         finished: ResidentMetalContext.FinishedAssembly
@@ -7903,26 +8497,21 @@ func assembleSolveEvaluateStandardNeumannBatch(
                 solveSemaphore.signal()
             }
             do {
-                let (assembly, extraRhs) = try assemblyRun(
+                let (assembly, extraRhs, apertureCoupling) = try assemblyRun(
                     from: finished,
                     caseIndex: caseIndex
                 )
-                let solve = try solveCaseDenseMulti(
-                    arrays: assembly.arrays,
+                let solve = try solveDenseForCase(
+                    assembly: assembly,
                     extraRhs: extraRhs,
-                    geom: geom,
-                    chiefPoints: chiefPoints,
-                    chiefWeight: chiefWeight,
-                    driverNeumanns: [caseNeumanns[caseIndex]]
-                        + caseExtraNeumanns[caseIndex],
-                    k: caseKs[caseIndex],
-                    kImag: caseKImag[caseIndex],
-                    robinBetas: caseRobinBetas[caseIndex]
+                    apertureCoupling: apertureCoupling,
+                    caseIndex: caseIndex
                 )
                 solveResults.store(
                     .success(
                         SolvedCase(
                             assembly: assembly,
+                            apertureCoupling: apertureCoupling,
                             extraRhs: extraRhs,
                             solve: solve
                         )
@@ -8012,31 +8601,28 @@ func assembleSolveEvaluateStandardNeumannBatch(
             impedanceSourceTag = try requireInt(casePayload, "impedance_source_tag")
         }
         let assembly: AssemblyRun
+        let apertureCoupling: ApertureCoupling?
         let extraRhs: [(re: [Float], im: [Float])]
         let solve: MultiDenseSolveRun
         if pipelineAssembly && solveConcurrency > 1 {
             try pumpSubmissions(upTo: caseIndex)
             let solved = try solveResults.wait(caseIndex)
             assembly = solved.assembly
+            apertureCoupling = solved.apertureCoupling
             extraRhs = solved.extraRhs
             solve = solved.solve
         } else if pipelineAssembly {
-            (assembly, extraRhs) = try pipelinedAssemblyRun(caseIndex)
-            solve = try solveCaseDenseMulti(
-                arrays: assembly.arrays,
+            (assembly, extraRhs, apertureCoupling) = try pipelinedAssemblyRun(caseIndex)
+            solve = try solveDenseForCase(
+                assembly: assembly,
                 extraRhs: extraRhs,
-                geom: geom,
-                chiefPoints: chiefPoints,
-                chiefWeight: chiefWeight,
-                driverNeumanns: [neumann] + caseExtraNeumanns[caseIndex],
-                k: k,
-                kImag: kImag,
-                robinBetas: robinBetas
+                apertureCoupling: apertureCoupling,
+                caseIndex: caseIndex
             )
         } else {
             // Single-source by construction: the extra_sources guard above
             // rejects multi-source cases outside the pipelined path.
-            assembly = try assembleRegular(
+            let rawAssembly = try assembleRegular(
                 geom: geom,
                 neumann: neumann,
                 k: k,
@@ -8044,17 +8630,17 @@ func assembleSolveEvaluateStandardNeumannBatch(
                 robinBetas: robinBetas,
                 residentContext: context
             )
+            (assembly, apertureCoupling) = try applyCoupledIBIfNeeded(
+                run: rawAssembly,
+                caseIndex: caseIndex,
+                includeDuffy: rawAssembly.duffyStats != nil
+            )
             extraRhs = []
-            solve = try solveCaseDenseMulti(
-                arrays: assembly.arrays,
+            solve = try solveDenseForCase(
+                assembly: assembly,
                 extraRhs: [],
-                geom: geom,
-                chiefPoints: chiefPoints,
-                chiefWeight: chiefWeight,
-                driverNeumanns: [neumann],
-                k: k,
-                kImag: kImag,
-                robinBetas: robinBetas
+                apertureCoupling: apertureCoupling,
+                caseIndex: caseIndex
             )
         }
         if solve.lapackInfo != 0 {
@@ -8066,32 +8652,56 @@ func assembleSolveEvaluateStandardNeumannBatch(
                     + "solutions for \(sourcesPerCase) sources"
             )
         }
-        let fieldNeumann = neumannWithRobin(
-            geom: geom,
-            driverNeumann: neumann,
-            pressure: solve.pressures[0],
-            kReal: k,
-            kImag: kImag,
-            robinBetas: robinBetas
-        )
-        let field = try evaluateExterior(
-            geom: geom,
-            pressure: solve.pressures[0],
-            neumann: fieldNeumann,
-            observationPoints: observationPoints,
-            k: fieldK,
-            residentContext: context,
-            cachedObservationBuffer: sharedObservationBuffer,
-            cachedObservationCount: sharedObservationCount
-        )
+        let primaryUnknown = solve.pressures[0]
+        let primaryPressure = primaryUnknown
+        let field: FieldRun
+        if let apertureCoupling {
+            guard let apertureUnknowns = solve.apertureNeumanns,
+                  apertureUnknowns.count == sourcesPerCase else {
+                try fail("coupled IB dense solve did not return aperture Neumann unknowns")
+            }
+            let apertureNeumann = coupledIBApertureNeumann(
+                apertureUnknown: apertureUnknowns[0],
+                coupling: apertureCoupling
+            )
+            if apertureNeumann.isEmpty {
+                try fail("coupled IB aperture Neumann projection failed")
+            }
+            field = evaluateCoupledIBRayleigh(
+                geom: geom,
+                coupling: apertureCoupling,
+                apertureNeumann: apertureNeumann,
+                observationPoints: observationPoints,
+                k: fieldK
+            )
+        } else {
+            let fieldNeumann = neumannWithRobin(
+                geom: geom,
+                driverNeumann: neumann,
+                pressure: primaryPressure,
+                kReal: k,
+                kImag: kImag,
+                robinBetas: robinBetas
+            )
+            field = try evaluateExterior(
+                geom: geom,
+                pressure: primaryPressure,
+                neumann: fieldNeumann,
+                observationPoints: observationPoints,
+                k: fieldK,
+                residentContext: context,
+                cachedObservationBuffer: sharedObservationBuffer,
+                cachedObservationCount: sharedObservationCount
+            )
+        }
         if let pressureReDesc, let pressureImDesc {
             try writeF32(
                 try descriptorPath(root: geom.root, descriptor: pressureReDesc),
-                solve.pressures[0].map { $0.re }
+                primaryPressure.map { $0.re }
             )
             try writeF32(
                 try descriptorPath(root: geom.root, descriptor: pressureImDesc),
-                solve.pressures[0].map { $0.im }
+                primaryPressure.map { $0.im }
             )
         }
         let fieldReValues = field.values.map { $0.re }
@@ -8120,7 +8730,8 @@ func assembleSolveEvaluateStandardNeumannBatch(
         for s in 1..<sourcesPerCase {
             let extraPayload = extraSourcePayloads[s - 1]
             let sourceNeumann = caseExtraNeumanns[caseIndex][s - 1]
-            let sourcePressure = solve.pressures[s]
+            let sourceUnknown = solve.pressures[s]
+            let sourcePressure = sourceUnknown
             let extraOutputs = try requireObject(extraPayload, "outputs")
             let extraPressureReDesc = extraOutputs["pressure_real_f32"] as? [String: Any]
             let extraPressureImDesc = extraOutputs["pressure_imag_f32"] as? [String: Any]
@@ -8152,24 +8763,46 @@ func assembleSolveEvaluateStandardNeumannBatch(
             } else {
                 extraImpedanceTag = try requireInt(extraPayload, "impedance_source_tag")
             }
-            let extraFieldNeumann = neumannWithRobin(
-                geom: geom,
-                driverNeumann: sourceNeumann,
-                pressure: sourcePressure,
-                kReal: k,
-                kImag: kImag,
-                robinBetas: robinBetas
-            )
-            let extraField = try evaluateExterior(
-                geom: geom,
-                pressure: sourcePressure,
-                neumann: extraFieldNeumann,
-                observationPoints: observationPoints,
-                k: fieldK,
-                residentContext: context,
-                cachedObservationBuffer: sharedObservationBuffer,
-                cachedObservationCount: sharedObservationCount
-            )
+            let extraField: FieldRun
+            if let apertureCoupling {
+                guard let apertureUnknowns = solve.apertureNeumanns,
+                      apertureUnknowns.count == sourcesPerCase else {
+                    try fail("coupled IB dense solve did not return aperture Neumann unknowns")
+                }
+                let apertureNeumann = coupledIBApertureNeumann(
+                    apertureUnknown: apertureUnknowns[s],
+                    coupling: apertureCoupling
+                )
+                if apertureNeumann.isEmpty {
+                    try fail("coupled IB aperture Neumann projection failed")
+                }
+                extraField = evaluateCoupledIBRayleigh(
+                    geom: geom,
+                    coupling: apertureCoupling,
+                    apertureNeumann: apertureNeumann,
+                    observationPoints: observationPoints,
+                    k: fieldK
+                )
+            } else {
+                let extraFieldNeumann = neumannWithRobin(
+                    geom: geom,
+                    driverNeumann: sourceNeumann,
+                    pressure: sourcePressure,
+                    kReal: k,
+                    kImag: kImag,
+                    robinBetas: robinBetas
+                )
+                extraField = try evaluateExterior(
+                    geom: geom,
+                    pressure: sourcePressure,
+                    neumann: extraFieldNeumann,
+                    observationPoints: observationPoints,
+                    k: fieldK,
+                    residentContext: context,
+                    cachedObservationBuffer: sharedObservationBuffer,
+                    cachedObservationCount: sharedObservationCount
+                )
+            }
             extraFieldSeconds += extraField.seconds
             if let extraPressureReDesc, let extraPressureImDesc {
                 try writeF32(
@@ -8254,6 +8887,11 @@ func assembleSolveEvaluateStandardNeumannBatch(
             if let refineResidualRels = solve.refineResidualRels {
                 sourceResult["dense_solve_refine_residual_rel"] = refineResidualRels[s]
             }
+            if let apertureCoupling {
+                sourceResult["coupled_ib"] = true
+                sourceResult["aperture_tag"] = apertureCoupling.aperture.tag
+                sourceResult["ib_field"] = "rayleigh_aperture_only"
+            }
             extraSourceResults.append(sourceResult)
         }
 
@@ -8292,6 +8930,17 @@ func assembleSolveEvaluateStandardNeumannBatch(
             caseResult["dense_solve_refine_residual_rel"] = refineResidualRels[0]
         }
         caseResult["dense_solve_dtype"] = solve.dtype
+        if let apertureCoupling {
+            caseResult["coupled_ib"] = true
+            caseResult["aperture_tag"] = apertureCoupling.aperture.tag
+            caseResult["aperture_triangles"] = apertureCoupling.aperture.triangles.count
+            caseResult["aperture_p1_dofs"] = apertureCoupling.aperture.dofs.count
+            caseResult["aperture_velocity_basis"] = "DP0"
+            caseResult["aperture_velocity_dofs"] = apertureCoupling.aperture.triangles.count
+            caseResult["ib_field"] = "rayleigh_aperture_only"
+            caseResult["ib_aperture_transform_seconds"] = apertureCoupling.transformSeconds
+            caseResult["ib_aperture_slp_duffy"] = apertureCoupling.usedDuffy
+        }
         if let chiefPoints {
             caseResult["chief_points"] = true
             caseResult["chief_points_count"] = chiefPoints.count
@@ -8315,7 +8964,9 @@ func assembleSolveEvaluateStandardNeumannBatch(
         }
         if robinBetas != nil {
             caseResult["robin_boundary"] = true
-            caseResult["field_uses_total_neumann"] = true
+            if apertureCoupling == nil {
+                caseResult["field_uses_total_neumann"] = true
+            }
         }
         if fieldK != k {
             caseResult["field_k_real_f32"] = fieldK
@@ -8352,7 +9003,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
         caseResult.merge(
             nativePressureReductionPayload(
                 geom: geom,
-                pressure: solve.pressures[0],
+                pressure: primaryPressure,
                 sourceTags: sourceTags,
                 impedanceSourceTag: impedanceSourceTag
             )

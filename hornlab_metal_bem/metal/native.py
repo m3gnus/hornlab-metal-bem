@@ -266,6 +266,8 @@ class MetalNativeStandardSession:
         duffy_1d_order: int = 4,
         precision: str = "complex64",
         symmetry_plane: str | None = None,
+        aperture_tag: int | None = None,
+        velocity_source_tags: Any | None = None,
         check_open_edges: bool = True,
         runtime_status: MetalNativeRuntimeStatus | None = None,
         extra_env: dict[str, str] | None = None,
@@ -282,6 +284,7 @@ class MetalNativeStandardSession:
         :func:`validate_native_symmetry_plane`.
         """
         from .geometry import build_metal_geometry_buffers
+        from .geometry import validate_native_infinite_baffle_aperture
         from .geometry import validate_native_symmetry_plane
         from .session import GeometryPayload, write_geometry_buffers, write_json_manifest
 
@@ -320,6 +323,12 @@ class MetalNativeStandardSession:
             symmetry_plane,
             check_open_edges=check_open_edges,
         )
+        aperture_tag = validate_native_infinite_baffle_aperture(
+            geometry_buffers,
+            aperture_tag,
+            velocity_source_tags=velocity_source_tags,
+            symmetry_plane=symmetry_plane,
+        )
 
         session_id = session_id or f"native-metal-{uuid4().hex[:12]}"
         owns_work_dir = work_dir is None and not keep_artifacts
@@ -345,6 +354,7 @@ class MetalNativeStandardSession:
                 duffy_1d_order=duffy_1d_order,
                 precision=precision,
                 symmetry_plane=symmetry_plane,
+                aperture_tag=aperture_tag,
             )
             manifest_path = write_json_manifest(payload, root / "session.json")
         except BaseException:
@@ -905,6 +915,8 @@ class MetalNativeStandardSession:
         # predates float64 support errors loudly instead of silently running f32.
         expect_float64 = dense_solve_dtype == "float64"
         expect_multi_source = n_extra_sources > 0
+        aperture_tag_value = self.geometry_payload.aperture_tag
+        expect_coupled_ib = aperture_tag_value is not None
 
         points_3xn = _require_observation_points_3xn(observation_points)
         n_obs = int(points_3xn.shape[1])
@@ -1116,6 +1128,11 @@ class MetalNativeStandardSession:
                         else {}
                     ),
                     **(
+                        {"aperture_tag": int(aperture_tag_value)}
+                        if aperture_tag_value is not None
+                        else {}
+                    ),
+                    **(
                         {
                             "chief_points": chief_desc.to_manifest(),
                             "chief_weight": float(chief_weight),
@@ -1156,6 +1173,7 @@ class MetalNativeStandardSession:
                 expect_float64=expect_float64,
                 expect_chief=expect_chief,
                 expect_multi_source=expect_multi_source,
+                expect_coupled_ib=expect_coupled_ib,
             )
 
         self._run_native_helper(
@@ -1179,6 +1197,7 @@ class MetalNativeStandardSession:
                 expect_float64=expect_float64,
                 expect_chief=expect_chief,
                 expect_multi_source=expect_multi_source,
+                expect_coupled_ib=expect_coupled_ib,
             )
             for idx, case_result in enumerate(case_results)
         ]
@@ -1192,6 +1211,7 @@ class MetalNativeStandardSession:
         expect_float64: bool = False,
         expect_chief: bool = False,
         expect_multi_source: bool = False,
+        expect_coupled_ib: bool = False,
     ) -> Any:
         from .session import DenseSolveFieldResult
 
@@ -1242,6 +1262,14 @@ class MetalNativeStandardSession:
                 "native helper acknowledged no multi-source support; the "
                 "helper binary predates extra_sources (multi-RHS). Rebuild "
                 "with `swift build -c release` in "
+                "hornlab_metal_bem/metal/native_helper or unset "
+                "HORNLAB_METAL_BEM_NATIVE."
+            )
+        if expect_coupled_ib and diagnostics.get("coupled_ib") is not True:
+            raise RuntimeError(
+                "native helper acknowledged no coupled infinite-baffle support; "
+                "the helper binary predates aperture_tag. Rebuild with "
+                "`swift build -c release` in "
                 "hornlab_metal_bem/metal/native_helper or unset "
                 "HORNLAB_METAL_BEM_NATIVE."
             )
@@ -1344,6 +1372,7 @@ class MetalNativeStandardSession:
         expect_float64: bool = False,
         expect_chief: bool = False,
         expect_multi_source: bool = False,
+        expect_coupled_ib: bool = False,
     ) -> list[Any]:
         """Run one batch helper invocation, firing callbacks per case.
 
@@ -1376,6 +1405,7 @@ class MetalNativeStandardSession:
                     expect_float64=expect_float64,
                     expect_chief=expect_chief,
                     expect_multi_source=expect_multi_source,
+                    expect_coupled_ib=expect_coupled_ib,
                 )
                 solved_fields.append(solved)
                 if on_case_result(len(solved_fields) - 1, solved) is False:
@@ -1409,6 +1439,7 @@ class MetalNativeStandardSession:
                 expect_float64=expect_float64,
                 expect_chief=expect_chief,
                 expect_multi_source=expect_multi_source,
+                expect_coupled_ib=expect_coupled_ib,
             )
             solved_fields.append(solved)
             if on_case_result(index, solved) is False:
@@ -2077,6 +2108,13 @@ def _native_case_diagnostics(
         "complex_k",
         "robin_boundary",
         "field_uses_total_neumann",
+        "coupled_ib",
+        "aperture_tag",
+        "aperture_triangles",
+        "aperture_p1_dofs",
+        "aperture_velocity_basis",
+        "aperture_velocity_dofs",
+        "ib_field",
         "symmetry_plane",
         "pressure_shape",
         "field_shape",

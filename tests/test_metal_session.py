@@ -99,6 +99,7 @@ def test_session_manifest_json_shape_and_relative_paths(tmp_path):
         "basis_test": "P1",
         "source_basis": "DP0",
         "symmetry_plane": None,
+        "aperture_tag": None,
     }
 
     mesh = manifest["mesh"]
@@ -118,6 +119,35 @@ def test_session_manifest_json_shape_and_relative_paths(tmp_path):
     manifest_text = (work_dir / "session.json").read_text(encoding="utf-8")
     assert "runs/scratch" not in manifest_text
     assert "metal-bem-probe" not in manifest_text
+
+
+def test_geometry_manifest_carries_aperture_tag(tmp_path):
+    work_dir = tmp_path / "session"
+    geometry_dir = work_dir / "geometry"
+    buffers = _buffers()
+    mesh = write_geometry_buffers(buffers, geometry_dir, relative_to=work_dir)
+    payload = GeometryPayload(
+        session_id="metal-test-ib",
+        mesh=mesh,
+        p1_dof_count=buffers.p1_dof_count,
+        dp0_dof_count=buffers.dp0_dof_count,
+        aperture_tag=2,
+    )
+
+    write_json_manifest(payload, work_dir / "session.json")
+    manifest = read_json_manifest(work_dir / "session.json")
+
+    assert manifest["assembly_scope"]["aperture_tag"] == 2
+
+
+@pytest.mark.parametrize("bad_tag", [0, -1, True, "7"])
+def test_geometry_manifest_rejects_invalid_aperture_tag(tmp_path, bad_tag):
+    work_dir, _ = _write_geometry_payload(tmp_path)
+    manifest = read_json_manifest(work_dir / "session.json")
+    manifest["assembly_scope"]["aperture_tag"] = bad_tag
+
+    with pytest.raises(ValueError, match="assembly_scope.aperture_tag"):
+        payload_to_manifest(manifest)
 
 
 def test_geometry_binary_buffers_are_little_endian_and_c_contiguous(tmp_path):

@@ -94,6 +94,139 @@ def _near_quadrature_geometry_buffers():
     )
 
 
+def _ib_box_geometry_buffers():
+    vertices = np.array(
+        [
+            [-1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0],
+            [-1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0, -1.0, -1.0, -1.0, -1.0],
+        ],
+        dtype=np.float64,
+    )
+    triangles_nx3 = np.array(
+        [
+            [0, 1, 2],
+            [0, 2, 3],
+            [4, 6, 5],
+            [4, 7, 6],
+            [0, 5, 4],
+            [0, 1, 5],
+            [1, 6, 5],
+            [1, 2, 6],
+            [2, 7, 6],
+            [2, 3, 7],
+            [3, 4, 7],
+            [3, 0, 4],
+        ],
+        dtype=np.int64,
+    )
+    grid = SimpleNamespace(
+        vertices=vertices,
+        elements=triangles_nx3.T,
+        number_of_elements=triangles_nx3.shape[0],
+    )
+    p1 = SimpleNamespace(
+        local2global=triangles_nx3.astype(np.int64),
+        global_dof_count=vertices.shape[1],
+    )
+    tags = np.array([7, 7, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2], dtype=np.int32)
+    return build_metal_geometry_buffers(
+        grid,
+        tags,
+        p1,
+        SimpleNamespace(global_dof_count=triangles_nx3.shape[0]),
+    )
+
+
+def _ib_quarter_box_mesh(scale: float = 0.1, depth: float = 0.05):
+    vertices = np.array(
+        [
+            [0.0, scale, scale, 0.0, 0.0, scale, scale, 0.0],
+            [0.0, 0.0, scale, scale, 0.0, 0.0, scale, scale],
+            [0.0, 0.0, 0.0, 0.0, -depth, -depth, -depth, -depth],
+        ],
+        dtype=np.float64,
+    )
+    triangles_nx3 = np.array(
+        [
+            [0, 1, 2],
+            [0, 2, 3],
+            [4, 6, 5],
+            [4, 7, 6],
+            [1, 5, 6],
+            [1, 6, 2],
+            [3, 2, 6],
+            [3, 6, 7],
+        ],
+        dtype=np.int64,
+    )
+    tags = np.array([7, 7, 1, 1, 2, 2, 2, 2], dtype=np.int32)
+    return vertices, triangles_nx3, tags
+
+
+def _mirror_xy_mesh(vertices_3xn, triangles_nx3, tags):
+    vertices_out: list[tuple[float, float, float]] = []
+    vertex_index: dict[tuple[float, float, float], int] = {}
+    triangles_out: list[list[int]] = []
+    tags_out: list[int] = []
+
+    def mirror(point, mask: int) -> tuple[float, float, float]:
+        x, y, z = (float(point[0]), float(point[1]), float(point[2]))
+        if mask & 1:
+            x = -x
+        if mask & 2:
+            y = -y
+        return (x, y, z)
+
+    def vertex_id(point: tuple[float, float, float]) -> int:
+        key = tuple(round(value, 10) for value in point)
+        if key not in vertex_index:
+            vertex_index[key] = len(vertices_out)
+            vertices_out.append(point)
+        return vertex_index[key]
+
+    for mask in (0, 1, 2, 3):
+        reverse_winding = bin(mask).count("1") % 2 == 1
+        for triangle, tag in zip(triangles_nx3, tags, strict=True):
+            ids = [vertex_id(mirror(vertices_3xn[:, idx], mask)) for idx in triangle]
+            if reverse_winding:
+                ids = [ids[0], ids[2], ids[1]]
+            triangles_out.append(ids)
+            tags_out.append(int(tag))
+
+    return (
+        np.asarray(vertices_out, dtype=np.float64).T,
+        np.asarray(triangles_out, dtype=np.int64),
+        np.asarray(tags_out, dtype=np.int32),
+    )
+
+
+def _geometry_buffers_from_mesh(vertices_3xn, triangles_nx3, tags):
+    grid = SimpleNamespace(
+        vertices=vertices_3xn,
+        elements=triangles_nx3.T,
+        number_of_elements=triangles_nx3.shape[0],
+    )
+    p1 = SimpleNamespace(
+        local2global=triangles_nx3.astype(np.int64),
+        global_dof_count=vertices_3xn.shape[1],
+    )
+    return build_metal_geometry_buffers(
+        grid,
+        tags,
+        p1,
+        SimpleNamespace(global_dof_count=triangles_nx3.shape[0]),
+    )
+
+
+def _ib_quarter_box_geometry_buffers():
+    return _geometry_buffers_from_mesh(*_ib_quarter_box_mesh())
+
+
+def _ib_quarter_box_mirrored_full_geometry_buffers():
+    return _geometry_buffers_from_mesh(*_mirror_xy_mesh(*_ib_quarter_box_mesh()))
+
+
 _TRIANGLE_QX = np.array(
     [
         0.4459484909159651,
@@ -3520,6 +3653,163 @@ def test_run_native_helper_streaming_spools_output_without_deadlock(tmp_path):
 
     assert completed is True
     assert result_path.is_file()
+
+
+def test_native_executable_coupled_ib_uses_rayleigh_aperture_field(
+    monkeypatch,
+    tmp_path,
+):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
+    buffers = _ib_box_geometry_buffers()
+    neumann = np.zeros((1, buffers.n_triangles), dtype=np.complex64)
+    neumann[0, buffers.physical_tags_i32 == 1] = 1.0 + 0.0j
+    frequency_hz = np.array([220.0], dtype=np.float64)
+    k_real = np.array([np.float32(2.0 * np.pi * 220.0 / 343.0)], dtype=np.float32)
+    observation_points = np.array(
+        [
+            [0.0, 0.0, 0.7],
+            [0.3, 0.0, 0.8],
+            [0.0, 0.0, -0.2],
+        ],
+        dtype=np.float32,
+    )
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=buffers,
+        work_dir=tmp_path / "native-coupled-ib-session",
+        session_id="native-coupled-ib-test",
+        aperture_tag=7,
+        velocity_source_tags=[1],
+    ) as session:
+        solved = session.assemble_solve_evaluate_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            neumann,
+            observation_points,
+            operation_id="resident-coupled-ib",
+            source_tags=[1],
+        )[0]
+
+    pressure = np.fromfile(solved.pressure_real_f32, dtype="<f4") + 1j * np.fromfile(
+        solved.pressure_imag_f32,
+        dtype="<f4",
+    )
+    field = np.fromfile(solved.field_real_f32, dtype="<f4") + 1j * np.fromfile(
+        solved.field_imag_f32,
+        dtype="<f4",
+    )
+
+    assert solved.lapack_info == 0
+    assert np.all(np.isfinite(pressure))
+    assert np.all(np.isfinite(field))
+    assert solved.diagnostics["coupled_ib"] is True
+    assert solved.diagnostics["aperture_tag"] == 7
+    assert solved.diagnostics["aperture_triangles"] == 2
+    assert solved.diagnostics["aperture_velocity_basis"] == "DP0"
+    assert solved.diagnostics["aperture_velocity_dofs"] == 2
+    assert solved.diagnostics["ib_field"] == "rayleigh_aperture_only"
+    assert "field_uses_total_neumann" not in solved.diagnostics
+    assert abs(field[2]) == pytest.approx(0.0, abs=0.0)
+    assert np.linalg.norm(field[:2]) > 0.0
+
+
+def test_native_executable_coupled_ib_yz_xz_quadrant_matches_full(
+    monkeypatch,
+    tmp_path,
+):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE", "float64")
+
+    full_buffers = _ib_quarter_box_mirrored_full_geometry_buffers()
+    quarter_buffers = _ib_quarter_box_geometry_buffers()
+    frequency_hz = np.array([100.0], dtype=np.float64)
+    k_real = np.array([np.float32(2.0 * np.pi * 100.0 / 343.0)], dtype=np.float32)
+    k_imag = np.array([np.float32(k_real[0] * 0.02)], dtype=np.float32)
+    observation_points = np.array(
+        [
+            [0.02, 0.01, 0.10],
+            [-0.02, 0.01, 0.10],
+            [0.02, -0.01, 0.10],
+            [0.0, 0.0, 0.12],
+        ],
+        dtype=np.float32,
+    )
+    full_neumann = np.zeros((1, full_buffers.n_triangles), dtype=np.complex64)
+    full_neumann[0, full_buffers.physical_tags_i32 == 1] = 1.0 + 0.0j
+    quarter_neumann = np.zeros((1, quarter_buffers.n_triangles), dtype=np.complex64)
+    quarter_neumann[0, quarter_buffers.physical_tags_i32 == 1] = 1.0 + 0.0j
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=full_buffers,
+        work_dir=tmp_path / "native-coupled-ib-full-session",
+        session_id="native-coupled-ib-full-test",
+        aperture_tag=7,
+        velocity_source_tags=[1],
+    ) as full_session:
+        full_solved = full_session.assemble_solve_evaluate_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            full_neumann,
+            observation_points,
+            k_imag_f32=k_imag,
+            operation_id="resident-coupled-ib-full",
+            source_tags=[1],
+            dense_solve_dtype="float64",
+        )[0]
+
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=quarter_buffers,
+        work_dir=tmp_path / "native-coupled-ib-quarter-session",
+        session_id="native-coupled-ib-quarter-test",
+        symmetry_plane="yz+xz",
+        aperture_tag=7,
+        velocity_source_tags=[1],
+        check_open_edges=False,
+    ) as quarter_session:
+        quarter_solved = quarter_session.assemble_solve_evaluate_standard_neumann_batch(
+            frequency_hz,
+            k_real,
+            quarter_neumann,
+            observation_points,
+            k_imag_f32=k_imag,
+            operation_id="resident-coupled-ib-quarter",
+            source_tags=[1],
+            dense_solve_dtype="float64",
+        )[0]
+
+    full_field = np.fromfile(
+        full_solved.field_real_f32,
+        dtype="<f4",
+    ) + 1j * np.fromfile(full_solved.field_imag_f32, dtype="<f4")
+    quarter_field = np.fromfile(
+        quarter_solved.field_real_f32,
+        dtype="<f4",
+    ) + 1j * np.fromfile(quarter_solved.field_imag_f32, dtype="<f4")
+    relative_error = np.max(np.abs(full_field - quarter_field)) / np.max(
+        np.abs(full_field)
+    )
+
+    assert full_solved.lapack_info == 0
+    assert quarter_solved.lapack_info == 0
+    assert quarter_solved.diagnostics["symmetry_plane"] == "yz+xz"
+    assert quarter_solved.diagnostics["coupled_ib"] is True
+    assert relative_error < 5.0e-4
 
 
 def test_native_executable_field_evaluation_on_tiny_mesh(tmp_path):

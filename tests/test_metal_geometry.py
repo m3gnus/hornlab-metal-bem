@@ -8,6 +8,7 @@ import pytest
 from hornlab_metal_bem.metal.geometry import (
     MetalGeometryError,
     build_metal_geometry_buffers,
+    validate_native_infinite_baffle_aperture,
 )
 
 
@@ -226,3 +227,80 @@ def test_build_metal_geometry_buffers_snaps_near_zero_coordinates():
     assert buffers.vertices_3xn_f32[2, 1] == np.float32(2.0e-6)
     # The caller's array is untouched.
     assert vertices[2, 0] == 5.0e-7
+
+
+def _aperture_buffers(
+    *,
+    tag: int = 7,
+    z_offset: float = 0.0,
+    reversed_normal: bool = False,
+):
+    vertices = np.array(
+        [
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [z_offset, z_offset, z_offset],
+        ],
+        dtype=np.float64,
+    )
+    if reversed_normal:
+        triangles = np.array([[0], [2], [1]], dtype=np.int32)
+        local2global = np.array([[0, 2, 1]], dtype=np.int32)
+    else:
+        triangles = np.array([[0], [1], [2]], dtype=np.int32)
+        local2global = np.array([[0, 1, 2]], dtype=np.int32)
+    return build_metal_geometry_buffers(
+        _mock_grid(vertices, triangles),
+        np.array([tag], dtype=np.int32),
+        SimpleNamespace(local2global=local2global, global_dof_count=3),
+        _mock_dp0(1),
+    )
+
+
+def test_validate_native_infinite_baffle_aperture_accepts_z0_plus_z_disc():
+    buffers = _aperture_buffers()
+
+    assert validate_native_infinite_baffle_aperture(buffers, 7) == 7
+    assert (
+        validate_native_infinite_baffle_aperture(
+            buffers,
+            7,
+            symmetry_plane="yz+xz",
+        )
+        == 7
+    )
+
+
+def test_validate_native_infinite_baffle_aperture_rejects_missing_or_source_tag():
+    buffers = _aperture_buffers()
+
+    with pytest.raises(MetalGeometryError, match="not present"):
+        validate_native_infinite_baffle_aperture(buffers, 8)
+    with pytest.raises(MetalGeometryError, match="velocity_sources"):
+        validate_native_infinite_baffle_aperture(
+            buffers,
+            7,
+            velocity_source_tags=[7],
+        )
+
+
+def test_validate_native_infinite_baffle_aperture_rejects_xy_image_mode():
+    with pytest.raises(MetalGeometryError, match="native_symmetry_plane='xy'"):
+        validate_native_infinite_baffle_aperture(
+            _aperture_buffers(),
+            7,
+            symmetry_plane="xy",
+        )
+
+
+def test_validate_native_infinite_baffle_aperture_rejects_nonplanar_or_flipped():
+    with pytest.raises(MetalGeometryError, match="coplanar at Z=0"):
+        validate_native_infinite_baffle_aperture(
+            _aperture_buffers(z_offset=1.0e-4),
+            7,
+        )
+    with pytest.raises(MetalGeometryError, match="normals pointing \\+Z"):
+        validate_native_infinite_baffle_aperture(
+            _aperture_buffers(reversed_normal=True),
+            7,
+        )
