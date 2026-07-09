@@ -38,6 +38,21 @@ def test_boundary_lab_config_defaults_to_strict_open_edge_check():
     assert config.native_check_open_edges is True
 
 
+@pytest.mark.parametrize("name", ["aperture_tag", "apertureTag"])
+def test_boundary_lab_config_forwards_infinite_baffle_aperture_tag(name):
+    config, _ = solve_config_from_boundary_lab({name: 12})
+
+    assert config.aperture_tag == 12
+
+
+def test_boundary_lab_config_rejects_conflicting_aperture_aliases():
+    with pytest.raises(BoundaryLabSolverError, match="Conflicting aperture metadata"):
+        solve_config_from_boundary_lab({"aperture_tag": 12, "apertureTag": 13})
+
+    with pytest.raises(BoundaryLabSolverError, match="Conflicting aperture_tag"):
+        solve_config_from_boundary_lab({}, aperture_tag=12, apertureTag=13)
+
+
 def test_boundary_lab_config_forwards_open_edge_opt_out_for_open_shells():
     config, _ = solve_config_from_boundary_lab(
         {"symmetry": "yz+xz", "native_check_open_edges": False}

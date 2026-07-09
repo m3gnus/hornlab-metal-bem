@@ -68,6 +68,13 @@ Mesh requirements:
 - source/radiator tags must match `config.velocity_sources`
 - the default source tag is `2`
 
+A Gmsh surface physical group named `mouth_aperture` is the canonical coupled
+infinite-baffle declaration. `load_mesh()` carries that declaration into the
+public solve APIs, which automatically resolve `SolveConfig.aperture_tag` and
+reject explicit conflicts. A bare numeric tag `12` is not sufficient by itself:
+external meshes may use that number for unrelated boundaries, so automatic
+coupled-IB routing requires the physical name (or an explicit `aperture_tag`).
+
 The solver infers the observation frame from the source-tag element normals and
 the mesh mouth. For enclosed or unusual geometry, pass `frame_override`.
 
@@ -123,8 +130,19 @@ which names the flush `z=0` aperture segments and switches the solve to the
 exact coupled path (interior meridian BEM + analytic Rayleigh half-space
 aperture coupling). Prefer the full 3D coupled solve (`aperture_tag`) for
 production directivity; the CircSym IB path is for fast axisymmetric
-impedance/validation sweeps and requires a flush aperture at the global
-`z=0` baffle plane.
+impedance/validation sweeps. It requires one closed interior-channel meridian
+entirely behind the baffle, with a contiguous mouth-to-axis aperture at global
+`z=0` whose normals point `-Z`. Complex-k regularization and Robin/admittance
+walls are supported; CHIEF points are rejected until their coupled augmented
+constraints are implemented. Generated observation arcs honor `origin="mouth"`
+or `origin="throat"`.
+
+The legacy `circsym_baffle_z` image kernel is intentionally limited to a
+coplanar flat Rayleigh sheet (such as a baffled piston). It is not a recessed
+horn model: use `circsym_aperture_tag` for a flush-mounted waveguide. Bare,
+zero-thickness open meridians are rejected because the current one-trace BIE is
+a closed-surface formulation; finite-thickness freestanding meridians that
+close on the symmetry axis remain supported.
 
 With the wavelength-scaled meridian budget, CircSym is intended for waveguide
 sweeps up to roughly 30-40 kHz when the meridian resolves the requested band.
@@ -196,6 +214,7 @@ Key result fields:
 - `observation_points`: `(P, N, 3)` observation coordinates in metres
 - `observation_planes`: plane names matching axis `P`
 - `surface_pressure_avg`: source-tag keyed average surface pressure arrays
+  (always populated, including CircSym coupled-IB solves)
 - `surface_pressure_complex`: optional `(F, n_p1_dofs)` solved surface pressure
   when `return_surface_pressure=True`
 - `native_diagnostics`: per-frequency native implementation, LAPACK, Duffy,

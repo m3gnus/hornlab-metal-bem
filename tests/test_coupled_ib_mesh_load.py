@@ -6,7 +6,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from hornlab_metal_bem.mesh import MeshError, load_mesh
+import hornlab_metal_bem
+from hornlab_metal_bem import sweep
+from hornlab_metal_bem.config import SolveConfig
+from hornlab_metal_bem.mesh import MeshError, load_mesh, make_pure_function_spaces
+from hornlab_metal_bem.metal.geometry import (
+    build_metal_geometry_buffers,
+    validate_native_infinite_baffle_aperture,
+)
 
 MESHER_REPO = Path(__file__).resolve().parents[2] / "hornlab-waveguide-mesher"
 if MESHER_REPO.exists() and str(MESHER_REPO) not in sys.path:
@@ -73,8 +80,91 @@ def test_load_mesh_accepts_mesher_coupled_ib_with_validation(
 
     assert 12 in {int(tag) for tag in inferred.physical_tags}
     assert 12 in {int(tag) for tag in explicit.physical_tags}
+    assert inferred.coupled_ib_aperture_tag == 12
+    assert explicit.coupled_ib_aperture_tag == 12
     assert inferred.info.n_triangles > 0
     assert explicit.info.n_triangles == inferred.info.n_triangles
+
+    p1, dp0 = make_pure_function_spaces(inferred.grid)
+    buffers = build_metal_geometry_buffers(
+        inferred.grid,
+        inferred.physical_tags,
+        p1,
+        dp0,
+    )
+    assert (
+        validate_native_infinite_baffle_aperture(
+            buffers,
+            inferred.coupled_ib_aperture_tag,
+            velocity_source_tags=[2],
+            symmetry_plane=result.native_symmetry_plane,
+        )
+        == 12
+    )
+
+
+def test_public_solve_propagates_mesher_mouth_aperture_into_native_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = build_from_config(_ib_config(1234), tmp_path / "coupled-ib.msh")
+    sentinel = object()
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr(hornlab_metal_bem, "_resolve_frame", lambda mesh, config: object())
+
+    def fake_run(mesh, frequencies, frame, config):
+        seen["loaded_tag"] = mesh.coupled_ib_aperture_tag
+        seen["config_tag"] = config.aperture_tag
+        return sentinel
+
+    monkeypatch.setattr(sweep, "run_sweep_native_metal", fake_run)
+
+    solved = hornlab_metal_bem.solve_frequencies(
+        result.mesh_path,
+        [1000.0],
+        SolveConfig(mesh_scale=1.0),
+    )
+
+    assert solved is sentinel
+    assert seen == {"loaded_tag": 12, "config_tag": 12}
+
+
+def test_load_mesh_rejects_explicit_tag_conflicting_with_mouth_aperture(
+    tmp_path: Path,
+) -> None:
+    result = build_from_config(_ib_config(1234), tmp_path / "coupled-ib.msh")
+
+    with pytest.raises(MeshError, match="conflicts with canonical mouth_aperture"):
+        load_mesh(result.mesh_path, scale=1.0, aperture_tag=2)
+
+
+def test_raw_tag_12_without_canonical_name_does_not_enable_coupled_ib(
+    tmp_path: Path,
+) -> None:
+    meshio = pytest.importorskip("meshio")
+    path = tmp_path / "ordinary-tag-12.msh"
+    meshio.write(
+        path,
+        meshio.Mesh(
+            points=np.array(
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                dtype=np.float64,
+            ),
+            cells=[("triangle", np.array([[0, 1, 2]], dtype=np.int32))],
+            cell_data={
+                "gmsh:physical": [np.array([12], dtype=np.int32)],
+                "gmsh:geometrical": [np.array([12], dtype=np.int32)],
+            },
+            field_data={"ordinary_boundary": np.array([12, 2], dtype=np.int32)},
+        ),
+        file_format="gmsh22",
+        binary=False,
+    )
+
+    loaded = load_mesh(path, validate=False)
+
+    assert loaded.coupled_ib_aperture_tag is None
 
 
 def test_load_mesh_rejects_inverse_coupled_ib_winding(tmp_path: Path) -> None:

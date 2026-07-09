@@ -78,6 +78,54 @@ def _resolve_mesh(mesh, config: SolveConfig) -> LoadedMesh:
     )
 
 
+def _declared_loaded_mesh_aperture_tag(loaded: LoadedMesh) -> int | None:
+    """Return coupled-IB metadata carried by a loaded or legacy mesh object."""
+    carried = getattr(loaded, "coupled_ib_aperture_tag", None)
+    info = getattr(loaded, "info", None)
+    physical_groups = getattr(info, "physical_groups", {})
+    named = [
+        int(tag)
+        for tag, name in physical_groups.items()
+        if str(name).strip().lower() == "mouth_aperture"
+    ]
+    if len(named) > 1:
+        raise MeshError(
+            "LoadedMesh declares more than one mouth_aperture physical group: "
+            f"{sorted(named)}"
+        )
+    named_tag = named[0] if named else None
+    if carried is not None and named_tag is not None and int(carried) != named_tag:
+        raise MeshError(
+            "LoadedMesh coupled-IB metadata conflicts with its mouth_aperture "
+            f"physical group ({int(carried)} != {named_tag})"
+        )
+    detected = int(carried) if carried is not None else named_tag
+    if detected is None:
+        return None
+    present = {int(tag) for tag in np.unique(loaded.physical_tags)}
+    if detected not in present:
+        raise MeshError(
+            f"LoadedMesh declares aperture tag {detected}, but no triangle uses it"
+        )
+    return detected
+
+
+def _config_for_loaded_mesh(loaded: LoadedMesh, config: SolveConfig) -> SolveConfig:
+    """Resolve mesh-declared coupled-IB semantics into the solve config."""
+    detected = _declared_loaded_mesh_aperture_tag(loaded)
+    explicit = config.aperture_tag
+    if detected is None:
+        return config
+    if explicit is not None and int(explicit) != detected:
+        raise MeshError(
+            f"SolveConfig.aperture_tag {int(explicit)} conflicts with the "
+            f"LoadedMesh mouth_aperture tag {detected}"
+        )
+    if explicit is not None:
+        return config
+    return _replace(config, aperture_tag=detected)
+
+
 def _project_to_native_symmetry_plane(point: np.ndarray, plane: str | None) -> np.ndarray:
     projected = np.array(point, dtype=np.float64, copy=True)
     if plane == "yz":
@@ -155,6 +203,7 @@ def solve(mesh, config: SolveConfig | None = None) -> SolveResult:
     )
 
     loaded = _resolve_mesh(mesh, config)
+    config = _config_for_loaded_mesh(loaded, config)
     frame = _resolve_frame(loaded, config)
     frequencies = _build_frequency_grid(config)
 
@@ -174,6 +223,7 @@ def solve_frequencies(
     from .sweep import run_sweep_native_metal, should_route_native_metal
 
     loaded = _resolve_mesh(mesh, config)
+    config = _config_for_loaded_mesh(loaded, config)
     frame = _resolve_frame(loaded, config)
     freqs = np.asarray(frequencies_hz, dtype=np.float64)
 
@@ -239,8 +289,9 @@ def solve_multi_source(
         should_route_native_metal,
     )
 
-    frame_config = _replace(config, velocity_sources=dict(sources[0]))
     loaded = _resolve_mesh(mesh, config)
+    config = _config_for_loaded_mesh(loaded, config)
+    frame_config = _replace(config, velocity_sources=dict(sources[0]))
     frame = _resolve_frame(loaded, frame_config)
     freqs = (
         _build_frequency_grid(config)

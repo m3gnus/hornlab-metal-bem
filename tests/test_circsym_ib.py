@@ -65,6 +65,10 @@ def test_coupled_ib_dispatch_is_taken_when_aperture_tag_present():
     res = _solve(_channel_meridian(0.05, 0.05, 0.002, h=0.0025), [4000.0])
     assert res.native_diagnostics[0].get("coupled_ib") is True
     assert res.native_diagnostics[0].get("aperture_tag") == TAG_DISC
+    assert res.native_diagnostics[0]["aperture_pressure_continuity_rel"] < 1.0e-11
+    assert res.surface_pressure_avg is not None
+    assert TAG_THROAT in res.surface_pressure_avg
+    assert res.surface_pressure_complex is None
 
 
 def test_vectorized_coupled_ib_field_matches_scalar_aperture_sum():
@@ -103,7 +107,7 @@ def test_vectorized_coupled_ib_field_matches_scalar_aperture_sum():
                 n_psi=96,
                 target_index=None,
             )
-            val += -2.0 * s_val * q_a[aperture_local]
+            val += 2.0 * s_val * q_a[aperture_local]
         scalar[point_index] = val
 
     np.testing.assert_allclose(vectorized, scalar, rtol=1e-10, atol=1e-12)
@@ -180,3 +184,137 @@ def test_circsym_missing_aperture_tag_raises_instead_of_free_space():
         metal_bem.solve_circsym_frequencies(
             meridian, np.array([1000.0]), config
         )
+
+
+def test_coupled_ib_observation_origin_moves_generated_arc():
+    depth = 0.04
+    meridian = _channel_meridian(0.025, 0.05, depth, h=0.005)
+
+    def solve(origin: str):
+        return metal_bem.solve_circsym_frequencies(
+            meridian,
+            [1000.0],
+            SolveConfig(
+                velocity_sources={TAG_THROAT: 1.0},
+                velocity_mode=VelocityMode.VELOCITY,
+                circsym_aperture_tag=TAG_DISC,
+                observation=ObservationConfig(
+                    distance_m=1.0,
+                    angle_min_deg=0.0,
+                    angle_max_deg=60.0,
+                    angle_count=3,
+                    planes=["horizontal"],
+                    origin=origin,
+                ),
+            ),
+        )
+
+    mouth = solve("mouth")
+    throat = solve("throat")
+    np.testing.assert_allclose(
+        throat.observation_points,
+        mouth.observation_points + np.array([0.0, 0.0, -depth]),
+        atol=1.0e-12,
+    )
+    assert not np.allclose(throat.pressure_complex, mouth.pressure_complex)
+
+
+def test_coupled_ib_complex_k_and_robin_are_applied():
+    meridian = _channel_meridian(0.025, 0.05, 0.04, h=0.005)
+    base = dict(
+        velocity_sources={TAG_THROAT: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        circsym_aperture_tag=TAG_DISC,
+        observation=ObservationConfig(
+            distance_m=1.0,
+            angle_count=3,
+            planes=["horizontal"],
+            origin="mouth",
+        ),
+    )
+    standard = metal_bem.solve_circsym_frequencies(
+        meridian, [1500.0], SolveConfig(**base)
+    )
+    regularized = metal_bem.solve_circsym_frequencies(
+        meridian,
+        [1500.0],
+        SolveConfig(
+            **base,
+            formulation="complex_k",
+            complex_k_shift=0.01,
+            impedance_sources={TAG_WALL: 0.08 + 0.02j},
+        ),
+    )
+    diagnostics = regularized.native_diagnostics[0]
+    assert diagnostics["complex_k"] is True
+    assert diagnostics["robin"] is True
+    assert not np.allclose(
+        regularized.surface_pressure_avg[TAG_THROAT],
+        standard.surface_pressure_avg[TAG_THROAT],
+    )
+
+
+@pytest.mark.parametrize(
+    "override, match",
+    [
+        ({"circsym_baffle_z": 0.0}, "does not compose"),
+        ({"chief_points": np.array([[0.0, 0.0, -0.02]])}, "does not support chief_points"),
+        ({"impedance_sources": {TAG_DISC: 0.1}}, "must not also carry"),
+    ],
+)
+def test_coupled_ib_unsupported_or_conflicting_options_fail_loudly(override, match):
+    config = SolveConfig(
+        velocity_sources={TAG_THROAT: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        circsym_aperture_tag=TAG_DISC,
+        observation=ObservationConfig(angle_count=3, planes=["horizontal"]),
+        **override,
+    )
+    with pytest.raises(ValueError, match=match):
+        metal_bem.solve_circsym_frequencies(
+            _channel_meridian(0.025, 0.05, 0.04, h=0.005),
+            [1000.0],
+            config,
+        )
+
+
+def test_coupled_ib_rejects_aperture_off_plane_or_wrong_normal():
+    original = _channel_meridian(0.025, 0.05, 0.04, h=0.005)
+    aperture = original.physical_tags == TAG_DISC
+
+    shifted_nodes = original.nodes.copy()
+    shifted_nodes[np.unique(original.segments[aperture]), 1] += 0.001
+    shifted = MeridianMesh(
+        shifted_nodes,
+        original.segments,
+        original.physical_tags,
+        original.normals,
+    )
+    with pytest.raises(ValueError, match="global z=0"):
+        _solve(shifted, [1000.0])
+
+    wrong_normals = original.normals.copy()
+    wrong_normals[aperture] *= -1.0
+    wrong = MeridianMesh(
+        original.nodes,
+        original.segments,
+        original.physical_tags,
+        wrong_normals,
+    )
+    with pytest.raises(ValueError, match="normals must point -Z"):
+        _solve(wrong, [1000.0])
+
+
+def test_coupled_ib_rejects_incomplete_or_disconnected_aperture():
+    original = _channel_meridian(0.025, 0.05, 0.04, h=0.005)
+    aperture_indices = np.where(original.physical_tags == TAG_DISC)[0]
+    tags = original.physical_tags.copy()
+    tags[aperture_indices[len(aperture_indices) // 2]] = TAG_WALL
+    broken = MeridianMesh(
+        original.nodes,
+        original.segments,
+        tags,
+        original.normals,
+    )
+    with pytest.raises(ValueError, match="contiguous mouth-to-axis disc"):
+        _solve(broken, [1000.0])

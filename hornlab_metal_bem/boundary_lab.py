@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from numbers import Integral
 import queue
 import platform
 import threading
@@ -412,9 +413,21 @@ def solve_config_from_boundary_lab(
                 default=True,
             )
         ),
+        # Boundary Lab and mesher metadata use both snake_case and camelCase.
+        # Preserve the coupled infinite-baffle contract through translation so
+        # a declared aperture cannot silently become an ordinary free-space
+        # solve.
+        "aperture_tag": _coerce_boundary_aperture_tag(simulation_config),
         "observation": observation,
         "metal_native_assembly_mode": "corrected",
     }
+    if "apertureTag" in overrides:
+        camel_value = overrides.pop("apertureTag")
+        if "aperture_tag" in overrides and overrides["aperture_tag"] != camel_value:
+            raise BoundaryLabSolverError(
+                "Conflicting aperture_tag and apertureTag overrides"
+            )
+        overrides["aperture_tag"] = camel_value
     config_values.update(overrides)
     return SolveConfig(**config_values), frequencies_hz
 
@@ -440,6 +453,32 @@ def _coerce_frequencies(value: Any) -> np.ndarray | None:
     if isinstance(value, Iterable) and not isinstance(value, (str, bytes, dict)):
         return np.asarray(list(value), dtype=np.float64)
     raise BoundaryLabSolverError("frequencies_hz must be a number or sequence")
+
+
+def _coerce_boundary_aperture_tag(source: Any | None) -> int | None:
+    values: list[tuple[str, Any]] = []
+    for name in ("aperture_tag", "apertureTag"):
+        if isinstance(source, dict):
+            if name in source and source[name] is not None:
+                values.append((name, source[name]))
+        elif source is not None and hasattr(source, name):
+            value = getattr(source, name)
+            if value is not None:
+                values.append((name, value))
+    if not values:
+        return None
+
+    normalized: list[tuple[str, int]] = []
+    for name, value in values:
+        if isinstance(value, bool) or not isinstance(value, Integral) or int(value) <= 0:
+            raise BoundaryLabSolverError(f"{name} must be a positive integer or null")
+        normalized.append((name, int(value)))
+
+    unique = {tag for _, tag in normalized}
+    if len(unique) != 1:
+        detail = ", ".join(f"{name}={tag}" for name, tag in normalized)
+        raise BoundaryLabSolverError(f"Conflicting aperture metadata: {detail}")
+    return normalized[0][1]
 
 
 def _coerce_velocity_sources(source: Any | None) -> dict[int, float]:

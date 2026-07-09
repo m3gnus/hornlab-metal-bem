@@ -5,9 +5,11 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 import hornlab_metal_bem
 from hornlab_metal_bem import sweep
+from hornlab_metal_bem.mesh import LoadedMesh, MeshError
 from hornlab_metal_bem.result import MeshInfo, SolveResult
 
 
@@ -74,6 +76,38 @@ def test_hornlab_metal_bem_solve_defaults_to_pure_native_dispatch(monkeypatch):
         "native_symmetry_plane": None,
         "aperture_tag": None,
     }
+
+
+def test_public_solve_preserves_legacy_loaded_mesh_mouth_aperture(monkeypatch):
+    loaded = LoadedMesh(
+        grid="pure",
+        physical_tags=np.asarray([2, 12], dtype=np.int32),
+        info=MeshInfo(
+            n_vertices=3,
+            n_triangles=2,
+            physical_groups={2: "source", 12: "mouth_aperture"},
+            bounding_box_m=(np.zeros(3), np.ones(3)),
+        ),
+    )
+    seen = {}
+    sentinel = object()
+    monkeypatch.setattr(hornlab_metal_bem, "_resolve_frame", lambda mesh, config: object())
+
+    def fake_run(mesh, frequencies, frame, config):
+        seen["aperture_tag"] = config.aperture_tag
+        return sentinel
+
+    monkeypatch.setattr(sweep, "run_sweep_native_metal", fake_run)
+
+    assert hornlab_metal_bem.solve_frequencies(loaded, [1000.0]) is sentinel
+    assert seen["aperture_tag"] == 12
+
+    with pytest.raises(MeshError, match="conflicts with the LoadedMesh"):
+        hornlab_metal_bem.solve_frequencies(
+            loaded,
+            [1000.0],
+            hornlab_metal_bem.native_config(aperture_tag=11),
+        )
 
 
 def test_importing_public_metal_namespace_does_not_import_bempp():

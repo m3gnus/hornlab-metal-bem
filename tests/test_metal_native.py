@@ -105,10 +105,12 @@ def _ib_box_geometry_buffers():
     )
     triangles_nx3 = np.array(
         [
-            [0, 1, 2],
-            [0, 2, 3],
-            [4, 6, 5],
-            [4, 7, 6],
+            # Interior-domain orientation: aperture -Z, rear cap +Z, and
+            # side-wall normals pointing into the box cavity.
+            [0, 2, 1],
+            [0, 3, 2],
+            [4, 5, 6],
+            [4, 6, 7],
             [0, 5, 4],
             [0, 1, 5],
             [1, 6, 5],
@@ -119,7 +121,7 @@ def _ib_box_geometry_buffers():
             [3, 0, 4],
         ],
         dtype=np.int64,
-    )[:, [0, 2, 1]]
+    )
     grid = SimpleNamespace(
         vertices=vertices,
         elements=triangles_nx3.T,

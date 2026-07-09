@@ -239,12 +239,7 @@ def run_sweep_circsym(
             f"velocity_sources tags {missing_tags} are not present in the meridian; "
             f"available physical tags: {sorted(mesh_tags)}"
         )
-    # NOTE: an OPEN meridian (endpoints not both on the axis) is valid -- a bare
-    # (zero-wall-thickness) free-standing horn is a genuine open shell (throat cap
-    # + inner wall radiating from an open mouth), which matches the full-3D open
-    # shell it is compared against. The earlier "endpoints must close on the axis"
-    # guard wrongly rejected that common case. The degenerate sealed-aperture case
-    # is the infinite-baffle image, which is blocked upstream in build_meridian.
+    _validate_closed_or_baffled_meridian(meridian, config.circsym_baffle_z)
 
     t_total = time.time()
     geom = meridian.segment_geometry()
@@ -519,6 +514,16 @@ def run_sweep_coupled_ib(
         raise TypeError("meridian must be a MeridianMesh")
     if config.circsym_aperture_tag is None:
         raise ValueError("circsym_aperture_tag must be set for coupled IB solves")
+    if config.circsym_baffle_z is not None:
+        raise ValueError(
+            "circsym_aperture_tag coupled infinite-baffle mode does not compose "
+            "with the legacy circsym_baffle_z image kernel"
+        )
+    if config.chief_points is not None:
+        raise ValueError(
+            "circsym_aperture_tag coupled infinite-baffle mode does not support "
+            "chief_points yet"
+        )
 
     frequencies_arr = np.asarray(frequencies, dtype=np.float64).reshape(-1)
     if frequencies_arr.size == 0:
@@ -549,6 +554,7 @@ def run_sweep_coupled_ib(
 
     t_total = time.time()
     geom = meridian.segment_geometry()
+    _validate_coupled_ib_meridian(meridian, aperture_tag, geom=geom)
     frame = _infer_circsym_frame(meridian, config)
     source_scale = _build_source_segment_scale(meridian, config, frame)
 
@@ -566,76 +572,14 @@ def run_sweep_coupled_ib(
     if throat_area <= 1e-30:
         raise ValueError("velocity_sources throat area must be positive")
 
-    if config.observation.custom_points is not None:
-        angles_deg = np.linspace(
-            config.observation.angle_min_deg,
-            config.observation.angle_max_deg,
-            config.observation.angle_count,
-        )
-        plane_points = []
-        for plane in config.observation.planes:
-            if plane not in config.observation.custom_points:
-                raise ValueError(
-                    f"custom_points missing plane {plane!r}; "
-                    f"available: {list(config.observation.custom_points.keys())}"
-                )
-            pts = np.asarray(
-                config.observation.custom_points[plane],
-                dtype=np.float64,
-            )
-            if pts.ndim != 2 or pts.shape[1] != 3:
-                raise ValueError(
-                    f"custom_points[{plane!r}] must be (N, 3), got {pts.shape}"
-                )
-            plane_points.append(pts)
-        counts = [points.shape[0] for points in plane_points]
-        if len(set(counts)) > 1:
-            raise ValueError(
-                "All custom_points planes must have the same number of "
-                f"points, got {dict(zip(config.observation.planes, counts))}"
-            )
-        if counts[0] != config.observation.angle_count:
-            angles_deg = np.linspace(
-                config.observation.angle_min_deg,
-                config.observation.angle_max_deg,
-                counts[0],
-            )
-        obs_points = np.stack(plane_points, axis=0)
-    else:
-        angles_deg = np.linspace(
-            config.observation.angle_min_deg,
-            config.observation.angle_max_deg,
-            config.observation.angle_count,
-        )
-        angles_rad = np.deg2rad(angles_deg)
-        radius = float(config.observation.distance_m)
-        transverse = radius * np.sin(angles_rad)
-        axial = radius * np.cos(angles_rad)
-        zeros = np.zeros_like(transverse)
-
-        plane_points = []
-        for plane in config.observation.planes:
-            if plane == "horizontal":
-                pts = np.column_stack([transverse, zeros, axial])
-            elif plane == "vertical":
-                pts = np.column_stack([zeros, transverse, axial])
-            elif plane == "diagonal":
-                diagonal = transverse / np.sqrt(2.0)
-                pts = np.column_stack([diagonal, diagonal, axial])
-            else:
-                raise ValueError(f"Unknown plane: {plane!r}")
-            plane_points.append(pts)
-        obs_points = np.stack(plane_points, axis=0)
+    obs_points, angles_deg = build_observation_points(frame, config.observation)
 
     n_planes, n_angles, _ = obs_points.shape
     on_axis_idx = int(np.argmin(np.abs(angles_deg)))
     rho_max = float(np.max(meridian.nodes[:, 0]))
     n_psi_by_frequency = np.asarray(
         [
-            _azimuth_order(
-                complex(2.0 * np.pi * float(frequency_hz) / SPEED_OF_SOUND, 0.0),
-                rho_max,
-            )
+            _azimuth_order(_complex_wavenumber(float(frequency_hz), config), rho_max)
             for frequency_hz in frequencies_arr
         ],
         dtype=np.int32,
@@ -661,18 +605,32 @@ def run_sweep_coupled_ib(
     surface_pressure_rows: list[NDArray[np.complex128]] | None = (
         [] if config.return_surface_pressure else None
     )
-    surface_pavg: dict[int, list[complex]] | None = (
-        {int(tag): [] for tag in source_tags}
-        if config.return_surface_pressure
-        else None
+    surface_pavg: dict[int, list[complex]] = {
+        int(tag): [] for tag in source_tags
+    }
+    impedance_sources_arg = _impedance_sources_for_frequencies(
+        meridian.physical_tags, frequencies_arr, config
     )
+    per_case_impedance = isinstance(impedance_sources_arg, list)
 
     for freq_index, frequency_hz in enumerate(frequencies_arr):
         frequency = float(frequency_hz)
         t_case = time.time()
         omega = 2.0 * np.pi * frequency
-        k = complex(omega / SPEED_OF_SOUND, 0.0)
+        k = _complex_wavenumber(frequency, config)
+        k_field = complex(float(k.real), 0.0)
         n_psi = int(n_psi_by_frequency[freq_index])
+        case_impedance = (
+            impedance_sources_arg[freq_index]
+            if per_case_impedance
+            else impedance_sources_arg
+        )
+        if aperture_tag in {int(tag) for tag in case_impedance}:
+            raise ValueError(
+                "circsym_aperture_tag must not also carry a Robin/admittance "
+                "boundary condition"
+            )
+        impedance_tags = {int(tag) for tag in case_impedance}
 
         t_assembly = time.time()
         S, H = _assemble_boundary_matrices(
@@ -682,12 +640,21 @@ def run_sweep_coupled_ib(
             n_psi=n_psi,
             geometry_cache=assembly_cache,
         )
+        if k.imag == 0.0:
+            S_rayleigh = S
+        else:
+            S_rayleigh, _ = _assemble_boundary_matrices(
+                meridian,
+                k_field,
+                None,
+                n_psi=n_psi,
+            )
         q_driver = _build_driver_neumann_segments(
             meridian,
             omega,
             frequency,
             config,
-            impedance_tags=set(),
+            impedance_tags=impedance_tags,
             source_scale=source_scale,
         )
         if np.any(q_driver[idx_a] != 0.0):
@@ -695,15 +662,18 @@ def run_sweep_coupled_ib(
                 "circsym_aperture_tag must not be driven by velocity_sources"
             )
         free = _boundary_free_terms(meridian, None)
+        beta = _segment_beta(meridian, case_impedance)
 
         A = np.zeros((n + m, n + m), dtype=np.complex128)
         b = np.zeros(n + m, dtype=np.complex128)
         A[:n, :n] = H
         A[np.arange(n), np.arange(n)] -= free
+        if np.any(beta != 0.0):
+            A[:n, :n] -= S * (1j * k * beta)[None, :]
         A[:n, n:] = -S[:, idx_a]
         b[:n] = S @ q_driver
         A[n + np.arange(m), idx_a] = 1.0
-        A[n:, n:] = -2.0 * S[np.ix_(idx_a, idx_a)]
+        A[n:, n:] = -2.0 * S_rayleigh[np.ix_(idx_a, idx_a)]
         assembly_s = time.time() - t_assembly
 
         t_solve = time.time()
@@ -715,6 +685,11 @@ def run_sweep_coupled_ib(
 
         p_srf = np.asarray(x[:n], dtype=np.complex128)
         q_a = np.asarray(x[n:], dtype=np.complex128)
+        aperture_trace = 2.0 * (S_rayleigh[np.ix_(idx_a, idx_a)] @ q_a)
+        aperture_trace_denom = max(float(np.linalg.norm(p_srf[idx_a])), 1.0e-30)
+        aperture_pressure_continuity_rel = float(
+            np.linalg.norm(aperture_trace - p_srf[idx_a]) / aperture_trace_denom
+        )
 
         t_field = time.time()
         flat_obs = obs_points.reshape(-1, 3)
@@ -723,7 +698,7 @@ def run_sweep_coupled_ib(
             q_a,
             idx_a,
             flat_obs,
-            k,
+            k_field,
             geom=geom,
             n_psi=n_psi,
         )
@@ -740,7 +715,7 @@ def run_sweep_coupled_ib(
                 q_a,
                 idx_a,
                 sphere_points,
-                k,
+                k_field,
                 geom=geom,
                 n_psi=n_psi,
             )
@@ -755,10 +730,9 @@ def run_sweep_coupled_ib(
         completed_freqs.append(frequency)
         if surface_pressure_rows is not None:
             surface_pressure_rows.append(p_srf)
-        if surface_pavg is not None:
-            pavg = _surface_pressure_average(meridian, p_srf, source_tags)
-            for tag in source_tags:
-                surface_pavg[int(tag)].append(pavg[int(tag)])
+        pavg = _surface_pressure_average(meridian, p_srf, source_tags)
+        for tag in source_tags:
+            surface_pavg[int(tag)].append(pavg[int(tag)])
 
         diagnostics = {
             "circsym": True,
@@ -767,6 +741,10 @@ def run_sweep_coupled_ib(
             "aperture_tag": int(aperture_tag),
             "aperture_segments": int(m),
             "azimuth_quadrature_points": int(n_psi),
+            "complex_k": config.formulation == BIEFormulation.COMPLEX_K,
+            "complex_k_shift": float(config.complex_k_shift),
+            "robin": bool(np.any(beta != 0.0)),
+            "aperture_pressure_continuity_rel": aperture_pressure_continuity_rel,
             "dense_solve_rcond": dense_solve_rcond,
             "dense_solve_rcond_estimator": "lapack_gecon_1norm",
         }
@@ -805,14 +783,10 @@ def run_sweep_coupled_ib(
                 logger.info("Early stop requested after %.1f Hz", frequency)
                 break
 
-    sp_avg = (
-        {
-            int(tag): np.asarray(values, dtype=np.complex128)
-            for tag, values in surface_pavg.items()
-        }
-        if surface_pavg is not None
-        else None
-    )
+    sp_avg = {
+        int(tag): np.asarray(values, dtype=np.complex128)
+        for tag, values in surface_pavg.items()
+    }
     timings = {
         "solve_s": sum(float(entry["timing_s"]) for entry in solver_log),
         "assembly_s": sum(float(entry["assembly_s"]) for entry in solver_log),
@@ -2903,13 +2877,11 @@ def _evaluate_coupled_ib_points_pressure(
         baffle_z=None,
         n_psi=n_psi,
     )
-    # Half-space Rayleigh single-layer: 2x the free-space single-layer of the
-    # aperture velocity. The single-layer field kernel carries a -s_mat sign
-    # convention (see _evaluate_points_pressure: the general exterior field and
-    # the flat baffled-sheet Rayleigh disk both return -s_mat @ q). Using +2*s_mat
-    # here inverted the radiated pressure by 180 deg (directivity, which is
-    # sign-normalized, was unaffected, so consistency tests missed it).
-    out[active] = -2.0 * (s_mat @ np.asarray(aperture_neumann, dtype=np.complex128))
+    # The augmented coupling row enforces p_aperture = 2*S_R*q_aperture.
+    # Evaluate the exterior Rayleigh field with that same trace convention;
+    # changing this sign independently creates a 180-degree pressure jump at
+    # the aperture even though normalized directivity remains unchanged.
+    out[active] = 2.0 * (s_mat @ np.asarray(aperture_neumann, dtype=np.complex128))
     return out
 
 
@@ -3197,12 +3169,121 @@ def _validate_closed_or_baffled_meridian(
     baffle_z: float | None,
 ) -> None:
     if baffle_z is not None:
+        if not _is_flat_baffled_sheet(meridian, baffle_z):
+            raise ValueError(
+                "circsym_baffle_z is only supported for a coplanar flat "
+                "Rayleigh sheet; recessed or non-planar waveguides require "
+                "circsym_aperture_tag coupled infinite-baffle mode"
+            )
         return
     endpoint_rho = np.asarray([meridian.nodes[0, 0], meridian.nodes[-1, 0]], dtype=np.float64)
     if np.any(endpoint_rho > 1.0e-9):
         raise ValueError(
-            "CircSym meridian endpoints must close on the symmetry axis when "
-            "circsym_baffle_z is not set; open meridians need an explicit baffle plane."
+            "CircSym one-trace BEM requires a closed body-of-revolution meridian "
+            "with both endpoints on the symmetry axis; bare/open meridians need "
+            "a dedicated open-screen formulation"
+        )
+
+
+def _validate_coupled_ib_meridian(
+    meridian: MeridianMesh,
+    aperture_tag: int,
+    *,
+    geom: SimpleNamespace | None = None,
+) -> None:
+    """Validate the axisymmetric interior-channel/Rayleigh aperture contract."""
+    if geom is None:
+        geom = meridian.segment_geometry()
+    tolerance = 1.0e-9
+    tags = meridian.physical_tags
+    aperture_indices = np.where(tags == int(aperture_tag))[0]
+    if aperture_indices.size == 0:
+        raise ValueError("circsym_aperture_tag must select at least one segment")
+
+    aperture_segments = meridian.segments[aperture_indices]
+    aperture_nodes = np.unique(aperture_segments.reshape(-1))
+    if not np.all(np.abs(meridian.nodes[aperture_nodes, 1]) <= tolerance):
+        raise ValueError(
+            "circsym_aperture_tag segments must be coplanar on the global z=0 "
+            "baffle plane"
+        )
+    aperture_normals = meridian.normals[aperture_indices]
+    if not (
+        np.all(np.abs(aperture_normals[:, 0]) <= tolerance)
+        and np.all(np.abs(aperture_normals[:, 1] + 1.0) <= tolerance)
+    ):
+        raise ValueError(
+            "circsym_aperture_tag normals must point -Z into the interior cavity"
+        )
+    if np.any(meridian.nodes[:, 1] > tolerance):
+        raise ValueError(
+            "coupled infinite-baffle CircSym requires the entire cavity at z <= 0"
+        )
+
+    def _degrees(segments: NDArray[np.int32]) -> dict[int, int]:
+        degrees: dict[int, int] = {}
+        for start, end in np.asarray(segments, dtype=np.int64):
+            degrees[int(start)] = degrees.get(int(start), 0) + 1
+            degrees[int(end)] = degrees.get(int(end), 0) + 1
+        return degrees
+
+    aperture_degrees = _degrees(aperture_segments)
+    aperture_endpoints = [node for node, degree in aperture_degrees.items() if degree == 1]
+    if (
+        len(aperture_endpoints) != 2
+        or any(degree > 2 for degree in aperture_degrees.values())
+    ):
+        raise ValueError(
+            "circsym_aperture_tag must form one unbranched contiguous mouth-to-axis disc"
+        )
+    aperture_adjacency = {node: [] for node in aperture_degrees}
+    for start, end in np.asarray(aperture_segments, dtype=np.int64):
+        aperture_adjacency[int(start)].append(int(end))
+        aperture_adjacency[int(end)].append(int(start))
+    visited = {aperture_endpoints[0]}
+    stack = [aperture_endpoints[0]]
+    while stack:
+        node = stack.pop()
+        for neighbour in aperture_adjacency[node]:
+            if neighbour not in visited:
+                visited.add(neighbour)
+                stack.append(neighbour)
+    if visited != set(aperture_degrees):
+        raise ValueError(
+            "circsym_aperture_tag must form one unbranched contiguous mouth-to-axis disc"
+        )
+    endpoint_radii = meridian.nodes[np.asarray(aperture_endpoints), 0]
+    if int(np.count_nonzero(endpoint_radii <= tolerance)) != 1:
+        raise ValueError(
+            "circsym_aperture_tag must span exactly from the mouth rim to the symmetry axis"
+        )
+
+    full_degrees = _degrees(meridian.segments)
+    full_endpoints = [node for node, degree in full_degrees.items() if degree == 1]
+    if len(full_endpoints) != 2 or any(degree > 2 for degree in full_degrees.values()):
+        raise ValueError(
+            "coupled infinite-baffle CircSym meridian must be one closed, unbranched channel"
+        )
+    if np.any(meridian.nodes[np.asarray(full_endpoints), 0] > tolerance):
+        raise ValueError(
+            "coupled infinite-baffle CircSym channel must close on the symmetry axis "
+            "at the throat and aperture"
+        )
+    full_adjacency = {node: [] for node in full_degrees}
+    for start, end in np.asarray(meridian.segments, dtype=np.int64):
+        full_adjacency[int(start)].append(int(end))
+        full_adjacency[int(end)].append(int(start))
+    visited = {full_endpoints[0]}
+    stack = [full_endpoints[0]]
+    while stack:
+        node = stack.pop()
+        for neighbour in full_adjacency[node]:
+            if neighbour not in visited:
+                visited.add(neighbour)
+                stack.append(neighbour)
+    if visited != set(full_degrees):
+        raise ValueError(
+            "coupled infinite-baffle CircSym meridian must be one closed, unbranched channel"
         )
 
 

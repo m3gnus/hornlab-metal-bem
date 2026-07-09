@@ -303,7 +303,150 @@ def validate_native_infinite_baffle_aperture(
             f"({normal[0]:.6g}, {normal[1]:.6g}, {normal[2]:.6g})"
         )
 
+    _validate_coupled_ib_topology(
+        buffers,
+        aperture_mask=aperture_mask,
+        source_tags=source_tags,
+        symmetry_plane=plane,
+        tolerance=tolerance,
+    )
+
     return tag
+
+
+def _validate_coupled_ib_topology(
+    buffers: MetalGeometryBuffers,
+    *,
+    aperture_mask: NDArray[np.bool_],
+    source_tags: set[int],
+    symmetry_plane: str | None,
+    tolerance: float,
+) -> None:
+    """Validate that the aperture closes one manifold interior domain.
+
+    A full coupled-IB mesh is watertight after the aperture disc is included.
+    A symmetry-reduced mesh may be open only along the requested image planes.
+    The aperture patch itself must be connected and its physical rim must be
+    shared with non-coplanar, non-source wall triangles.  These checks prevent
+    a detached disc or a partially tagged mouth from reaching the native
+    augmented BIE/Rayleigh system.
+    """
+    triangles = np.asarray(buffers.triangles_nx3_i32, dtype=np.int32)
+    coords = np.asarray(buffers.vertices_3xn_f32, dtype=np.float64).T
+    tags = np.asarray(buffers.physical_tags_i32, dtype=np.int32)
+
+    used_vertices = np.unique(triangles.reshape(-1))
+    forward = coords[used_vertices, 2] > float(tolerance)
+    if np.any(forward):
+        vertex = int(used_vertices[int(np.flatnonzero(forward)[0])])
+        raise MetalGeometryError(
+            "coupled infinite-baffle cavity geometry must lie at or behind "
+            f"Z=0; vertex {vertex} has Z={coords[vertex, 2]:.6g}"
+        )
+
+    edge_uses: dict[tuple[int, int], list[tuple[int, int, int]]] = {}
+    for tri_index, (a, b, c) in enumerate(triangles):
+        for start, end in ((int(a), int(b)), (int(b), int(c)), (int(c), int(a))):
+            key = (start, end) if start < end else (end, start)
+            edge_uses.setdefault(key, []).append((tri_index, start, end))
+
+    requested_components: tuple[int, ...]
+    if symmetry_plane is None:
+        requested_components = ()
+    else:
+        requested_components = tuple(
+            component
+            for token, component in (("yz", 0), ("xz", 1))
+            if token in symmetry_plane
+        )
+
+    def _on_requested_plane(edge: tuple[int, int]) -> bool:
+        return any(
+            bool(np.all(np.abs(coords[list(edge), component]) <= tolerance))
+            for component in requested_components
+        )
+
+    for edge, uses in edge_uses.items():
+        if len(uses) > 2:
+            raise MetalGeometryError(
+                "coupled infinite-baffle mesh must be edge-manifold; "
+                f"edge {edge} belongs to {len(uses)} triangles"
+            )
+        if len(uses) == 1:
+            if symmetry_plane is None:
+                raise MetalGeometryError(
+                    "coupled infinite-baffle full-domain mesh must be watertight; "
+                    f"edge {edge} is open"
+                )
+            if not _on_requested_plane(edge):
+                raise MetalGeometryError(
+                    "coupled infinite-baffle reduced mesh may have open edges "
+                    "only on the requested symmetry plane(s); "
+                    f"edge {edge} is off {symmetry_plane!r}"
+                )
+            continue
+
+        (_, start0, end0), (_, start1, end1) = uses
+        if start0 != end1 or end0 != start1:
+            raise MetalGeometryError(
+                "coupled infinite-baffle mesh has inconsistent triangle winding "
+                f"across edge {edge}"
+            )
+
+    aperture_indices = set(int(i) for i in np.flatnonzero(aperture_mask))
+    aperture_adjacency = {index: set() for index in aperture_indices}
+    rim_edges = 0
+    for edge, uses in edge_uses.items():
+        aperture_uses = [use for use in uses if use[0] in aperture_indices]
+        if len(aperture_uses) == 2:
+            left, right = aperture_uses[0][0], aperture_uses[1][0]
+            aperture_adjacency[left].add(right)
+            aperture_adjacency[right].add(left)
+            continue
+        if len(aperture_uses) != 1:
+            continue
+
+        if len(uses) == 1:
+            # A patch edge is allowed to be unshared only where the entire
+            # reduced domain is cut by a requested image plane.
+            if symmetry_plane is None or not _on_requested_plane(edge):
+                raise MetalGeometryError(
+                    "aperture patch has a detached boundary edge "
+                    f"{edge} that is not shared with the cavity wall"
+                )
+            continue
+
+        other = uses[0] if uses[1][0] in aperture_indices else uses[1]
+        other_index = other[0]
+        if int(tags[other_index]) in source_tags:
+            raise MetalGeometryError(
+                "aperture rim must be shared with cavity wall triangles, not "
+                f"velocity-source triangle {other_index}"
+            )
+        other_vertices = triangles[other_index]
+        if np.all(np.abs(coords[other_vertices, 2]) <= tolerance):
+            raise MetalGeometryError(
+                "aperture_tag selects only part of a coplanar mouth patch; "
+                f"boundary edge {edge} is shared with coplanar triangle {other_index}"
+            )
+        rim_edges += 1
+
+    seed = next(iter(aperture_indices))
+    visited = {seed}
+    pending = [seed]
+    while pending:
+        current = pending.pop()
+        for adjacent in aperture_adjacency[current] - visited:
+            visited.add(adjacent)
+            pending.append(adjacent)
+    if visited != aperture_indices:
+        raise MetalGeometryError(
+            "aperture_tag triangles must form one edge-connected mouth patch"
+        )
+    if rim_edges == 0:
+        raise MetalGeometryError(
+            "aperture patch has no physical rim shared with cavity wall triangles"
+        )
 
 
 def _validate_open_edges_on_symmetry_planes(

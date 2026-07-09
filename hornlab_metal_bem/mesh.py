@@ -14,7 +14,6 @@ from .result import MeshInfo
 logger = logging.getLogger(__name__)
 
 _SYMMETRY_SNAP_TOLERANCE = 1.0e-6
-_CANONICAL_COUPLED_IB_APERTURE_TAG = 12
 _CANONICAL_COUPLED_IB_APERTURE_NAME = "mouth_aperture"
 
 
@@ -23,6 +22,11 @@ class LoadedMesh:
     grid: object
     physical_tags: NDArray[np.int32]
     info: MeshInfo
+    # Set only when the caller explicitly requested coupled infinite-baffle
+    # mode or the mesh declares the canonical ``mouth_aperture`` physical
+    # group.  Keeping this on the loaded artifact lets the public solve API
+    # preserve mesh semantics instead of silently routing it as free space.
+    coupled_ib_aperture_tag: int | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +94,10 @@ def load_mesh(
     verts = np.asarray(mesh.points, dtype=np.float64) * scale
     phys_tags = _extract_physical_tags(mesh, tri_key)
     phys_group_names = _extract_physical_names(path)
+    for name, raw in getattr(mesh, "field_data", {}).items():
+        values = np.asarray(raw).reshape(-1)
+        if values.size >= 2 and int(values[1]) == 2:
+            phys_group_names[int(values[0])] = str(name)
 
     verts, triangles, merged_vertices = _merge_duplicate_vertices(
         verts, triangles, merge_tol,
@@ -154,7 +162,12 @@ def load_mesh(
         info.n_vertices, info.n_triangles, info.physical_groups,
     )
 
-    return LoadedMesh(grid=grid, physical_tags=phys_tags, info=info)
+    return LoadedMesh(
+        grid=grid,
+        physical_tags=phys_tags,
+        info=info,
+        coupled_ib_aperture_tag=coupled_ib_aperture_tag,
+    )
 
 
 def make_pure_grid(
@@ -492,17 +505,40 @@ def _resolve_coupled_ib_aperture_tag(
     """Return the aperture tag when physical tags identify coupled IB topology."""
     present = {int(tag) for tag in np.unique(phys_tags)}
     explicit = _coerce_aperture_tag(aperture_tag)
+    named = [
+        int(tag)
+        for tag, name in phys_group_names.items()
+        if str(name).strip().lower() == _CANONICAL_COUPLED_IB_APERTURE_NAME
+    ]
+    if len(named) > 1:
+        raise MeshError(
+            "Mesh declares more than one mouth_aperture physical group: "
+            f"{sorted(named)}"
+        )
+    named_tag = named[0] if named else None
+    if named_tag is not None and named_tag not in present:
+        raise MeshError(
+            "Mesh declares mouth_aperture physical tag "
+            f"{named_tag}, but no triangle uses that tag"
+        )
+
     if explicit is not None:
-        return explicit if explicit in present else None
+        if explicit not in present:
+            raise MeshError(
+                f"aperture_tag {explicit} is not present in the mesh; "
+                f"available physical tags: {sorted(present)}"
+            )
+        if named_tag is not None and explicit != named_tag:
+            raise MeshError(
+                f"Explicit aperture_tag {explicit} conflicts with canonical "
+                f"mouth_aperture physical tag {named_tag}"
+            )
+        return explicit
 
-    for tag, name in phys_group_names.items():
-        if str(name).strip().lower() == _CANONICAL_COUPLED_IB_APERTURE_NAME:
-            tag_int = int(tag)
-            return tag_int if tag_int in present else None
-
-    if _CANONICAL_COUPLED_IB_APERTURE_TAG in present:
-        return _CANONICAL_COUPLED_IB_APERTURE_TAG
-    return None
+    # Do not infer coupled-IB semantics from a raw numeric tag.  Tag 12 is the
+    # mesher's current canonical value, but external meshes are free to use it
+    # for an unrelated boundary.  The physical name is the semantic contract.
+    return named_tag
 
 
 def _coerce_aperture_tag(aperture_tag: int | None) -> int | None:

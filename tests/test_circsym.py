@@ -469,6 +469,43 @@ def test_baffled_flat_piston_matches_airy_directivity_and_first_null():
     assert abs(null_angle - first_null) <= 1.0
 
 
+def test_baffled_flat_piston_absolute_complex_pressure_matches_rayleigh_phase():
+    radius = 0.05
+    frequency = 1800.0
+    distances = np.array([0.6, 1.0, 1.8], dtype=np.float64)
+    points = np.column_stack(
+        [np.zeros_like(distances), np.zeros_like(distances), distances]
+    )
+    config = SolveConfig(
+        velocity_sources={2: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        formulation="standard",
+        circsym_baffle_z=0.0,
+        observation=ObservationConfig(
+            angle_count=distances.size,
+            planes=["horizontal"],
+            origin="throat",
+            custom_points={"horizontal": points},
+        ),
+    )
+    result = metal_bem.solve_circsym_frequencies(
+        _piston_meridian(radius=radius, segments=50),
+        [frequency],
+        config,
+    )
+
+    k = 2.0 * np.pi * frequency / SPEED_OF_SOUND
+    omega = 2.0 * np.pi * frequency
+    edge_distance = np.sqrt(distances * distances + radius * radius)
+    rayleigh_slp = (
+        np.exp(1j * k * edge_distance) - np.exp(1j * k * distances)
+    ) / (1j * k)
+    expected = -1j * config.air_density * omega * rayleigh_slp
+    np.testing.assert_allclose(
+        result.pressure_complex[0, 0], expected, rtol=2.0e-4, atol=2.0e-4
+    )
+
+
 def test_baffled_flat_piston_surface_impedance_matches_analytic_value():
     radius = 0.1
     ka = np.array([2.0], dtype=np.float64)
@@ -537,12 +574,9 @@ def test_circsym_default_complex_k_wiring_and_chief_tames_sphere_irregularity():
     assert chief_error < 0.1 * standard_error
 
 
-def test_open_meridian_without_baffle_solves():
-    # An open meridian is valid: a bare (zero-wall) free-standing horn is a
-    # genuine open shell -- throat cap on the axis + inner wall radiating from an
-    # open mouth -- and matches the full-3D open shell. CircSym must solve it
-    # (the degenerate sealed-aperture case is the infinite-baffle image, blocked
-    # upstream in the mesher's build_meridian).
+def test_open_meridian_without_baffle_is_rejected():
+    # A zero-thickness open shell needs a two-trace/open-screen formulation;
+    # applying the closed-surface one-trace BIE silently solves the wrong problem.
     meridian = MeridianMesh.from_polyline(
         np.array([[0.0, 0.0], [0.04, 0.03], [0.08, 0.06]], dtype=np.float64),
         tags=2,
@@ -554,6 +588,24 @@ def test_open_meridian_without_baffle_solves():
         observation=ObservationConfig(angle_count=3, planes=["horizontal"]),
     )
 
-    result = metal_bem.solve_circsym_frequencies(meridian, [1000.0], config)
-    assert np.all(np.isfinite(result.pressure_complex))
-    assert np.any(np.abs(result.pressure_complex) > 0.0)
+    with pytest.raises(ValueError, match="bare/open meridians"):
+        metal_bem.solve_circsym_frequencies(meridian, [1000.0], config)
+
+
+def test_legacy_baffle_image_rejects_recessed_or_nonplanar_meridian():
+    meridian = MeridianMesh.from_polyline(
+        np.array(
+            [[0.0, -0.04], [0.02, -0.04], [0.05, 0.0]],
+            dtype=np.float64,
+        ),
+        tags=2,
+    )
+    config = SolveConfig(
+        velocity_sources={2: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        formulation="standard",
+        circsym_baffle_z=0.0,
+        observation=ObservationConfig(angle_count=3, planes=["horizontal"]),
+    )
+    with pytest.raises(ValueError, match="only supported for a coplanar flat"):
+        metal_bem.solve_circsym_frequencies(meridian, [1000.0], config)

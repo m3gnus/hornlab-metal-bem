@@ -413,8 +413,8 @@ def test_native_coupled_ib_deep_circular_channel_matches_circsym(
 # to a global sign/phase on the radiated field. A 180 deg inversion of the
 # coupled-IB Rayleigh field therefore slips through them silently (and native and
 # CircSym shared the same convention, so native-vs-CircSym could not catch it).
-# These tests pin the ABSOLUTE outward-radiation sign of the coupled solve
-# against the analytic baffled piston, so a resurrected +/- error fails loudly.
+# These tests pin the ABSOLUTE pressure convention of the coupled solve against
+# the established flat-piston Rayleigh convention, so a +/- drift fails loudly.
 
 _SPEED_OF_SOUND = 343.0
 _AIR_DENSITY = SolveConfig().air_density
@@ -423,14 +423,14 @@ _AIR_DENSITY = SolveConfig().air_density
 def _analytic_baffled_piston(radius: float, points: np.ndarray, k: float) -> np.ndarray:
     """Absolute complex pressure of a uniform unit-velocity baffled piston.
 
-    p = i*omega*rho * (half-space single-layer of the aperture velocity), where
-    the single-layer helper ``_rayleigh_pressure_uniform_disc`` is the analytic
-    reference already validated to 8e-4 in
+    This package uses q=+i*rho*omega*v with an exterior field of -S*q, hence
+    p=-i*omega*rho times the half-space single-layer. The single-layer helper
+    ``_rayleigh_pressure_uniform_disc`` is the analytic reference validated in
     ``test_uniform_full3d_rayleigh_disc_matches_baffled_piston_analytic``.
     """
     omega = k * _SPEED_OF_SOUND
     verts, tris = _triangulated_disc(radius, rings=20, sectors=128)
-    return (1j * omega * _AIR_DENSITY) * _rayleigh_pressure_uniform_disc(
+    return (-1j * omega * _AIR_DENSITY) * _rayleigh_pressure_uniform_disc(
         verts, tris, points, k
     )
 
