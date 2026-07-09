@@ -41,8 +41,9 @@ class TestAirDensityInNeumann:
             np.complex64,
         )
 
-        v_n = 1.0 / (1j * omega)
-        expected_coeff = 1j * 1.2041 * omega * v_n
+        # Acceleration drive a*cos(omega t) under e^{-i omega t}: the momentum
+        # equation gives q = dp/dn = -rho * a, frequency-independent.
+        expected_coeff = -1.2041 * 1.0
 
         source_dofs = np.where(tags == 2)[0]
         for dof in source_dofs:
@@ -69,8 +70,7 @@ class TestAirDensityInNeumann:
             np.complex128,
         )
 
-        v_n = 1.0 / (1j * omega)
-        expected_coeff = 1j * custom_rho * omega * v_n
+        expected_coeff = -custom_rho * 1.0
 
         source_dofs = np.where(tags == 2)[0]
         for dof in source_dofs:
@@ -756,8 +756,9 @@ class TestAxialNeumannCoeffs:
         dp0_space = SimpleNamespace(global_dof_count=2)
         tags = np.array([2, 2], dtype=np.int32)
         omega = 2 * np.pi * 800.0
-        # Acceleration mode (default): v_n = weight*scale/(1j*omega), so the
-        # coefficient 1j*rho*omega*v_n collapses to rho*weight*scale (real).
+        # Acceleration mode (default): v_n = weight*scale/(-1j*omega), so the
+        # coefficient 1j*rho*omega*v_n collapses to -rho*weight*scale (real);
+        # the momentum equation dp/dn = -rho*a_n, per face.
         config = SolveConfig(
             velocity_sources={2: 2.0}, source_motion=SourceMotion.AXIAL,
         )
@@ -767,7 +768,7 @@ class TestAxialNeumannCoeffs:
             dp0_space, tags, omega, config, np.complex128,
             axial_face_scale=scale,
         )
-        expected = config.air_density * 2.0 * scale
+        expected = -config.air_density * 2.0 * scale
         np.testing.assert_allclose(coeffs, expected, rtol=1e-9)
 
     def test_axial_respects_impedance_skip(self):

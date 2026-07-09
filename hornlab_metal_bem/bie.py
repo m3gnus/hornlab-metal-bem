@@ -351,13 +351,17 @@ def _build_driver_neumann_coeffs(
             # Uniform normal velocity (breathing cap). Unchanged historical path.
             v_n = weight
             if config.velocity_mode == VelocityMode.ACCELERATION:
-                v_n = weight / (1j * omega) if omega > 0 else 0.0
+                # Under e^{-i omega t}, a*cos(omega t) integrates to
+                # v = a/(-i omega), so q = i rho omega v = -rho a — the
+                # momentum equation dp/dn = -rho a_n. Cross-validated against
+                # ABEC3 absolute pressure (2026-07-09).
+                v_n = weight / (-1j * omega) if omega > 0 else 0.0
             coeffs[idx] = 1j * air_density * omega * v_n
         else:
             # Rigid axial (piston) motion: v_n(face) = weight * (n_hat . axis).
             v_n = weight * axial_face_scale[idx]
             if config.velocity_mode == VelocityMode.ACCELERATION:
-                v_n = v_n / (1j * omega) if omega > 0 else np.zeros_like(v_n)
+                v_n = v_n / (-1j * omega) if omega > 0 else np.zeros_like(v_n)
             coeffs[idx] = 1j * air_density * omega * v_n
     return coeffs
 

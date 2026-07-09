@@ -1088,7 +1088,10 @@ def _build_driver_neumann_segments(
         else:
             v_n = weight * np.asarray(source_scale[idx], dtype=np.complex128)
         if config.velocity_mode == VelocityMode.ACCELERATION:
-            v_n = v_n / (1j * omega) if omega > 0.0 else np.zeros_like(v_n)
+            # Under e^{-i omega t}, v = a/(-i omega) for a*cos(omega t), so
+            # q = -rho a (momentum: dp/dn = -rho a_n). Matches bie.py and the
+            # 2026-07-09 ABEC3 absolute-pressure validation.
+            v_n = v_n / (-1j * omega) if omega > 0.0 else np.zeros_like(v_n)
         coeffs[idx] = 1j * config.air_density * omega * v_n
     return coeffs
 

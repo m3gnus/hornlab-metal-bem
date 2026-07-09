@@ -546,3 +546,53 @@ def test_native_coupled_ib_radiates_outward_absolute_sign():
             result.pressure_complex, frequencies_hz, radius, distance, angles
         )
     )
+
+
+def test_circsym_coupled_ib_acceleration_drive_absolute_sign():
+    """Acceleration drive a*cos(omega t): p = rho*a*(half-space single layer).
+
+    Under e^{-i omega t} the velocity phasor for a*cos(omega t) is
+    v = a/(-i omega), so p = -i*omega*rho*SL(v) = rho*a*SL(unit). Before
+    2026-07-09 the mapping used v = a/(+i omega) (the e^{+j omega t} rule),
+    which inverted every acceleration-driven field; the inversion was found by
+    comparing un-normalized pressure exports against ABEC3 (global -1, both the
+    3D coupled-IB and CircSym paths). Magnitudes, normalized directivity, and
+    impedance are invariant to it, so only this absolute gate protects it.
+    """
+    radius, depth, distance = 0.04, 0.003, 1.5
+    frequencies_hz = np.array([800.0, 2000.0], dtype=np.float64)
+    angles = np.linspace(0.0, 90.0, 10)
+    config = SolveConfig(
+        velocity_sources={TAG_THROAT: 1.0},
+        velocity_mode=VelocityMode.ACCELERATION,
+        circsym_aperture_tag=TAG_APERTURE,
+        observation=ObservationConfig(
+            distance_m=distance,
+            angle_min_deg=0.0,
+            angle_max_deg=90.0,
+            angle_count=angles.size,
+            planes=["horizontal"],
+            origin="mouth",
+        ),
+    )
+    result = metal_bem.solve_circsym_frequencies(
+        _straight_channel_meridian(radius, depth, target_edge=radius / 5.0),
+        frequencies_hz,
+        config,
+    )
+    pts = np.column_stack(
+        [
+            distance * np.sin(np.deg2rad(angles)),
+            np.zeros_like(angles),
+            distance * np.cos(np.deg2rad(angles)),
+        ]
+    )
+    verts, tris = _triangulated_disc(radius, rings=20, sectors=128)
+    for i, f in enumerate(frequencies_hz):
+        k = 2.0 * np.pi * float(f) / _SPEED_OF_SOUND
+        analytic = _AIR_DENSITY * _rayleigh_pressure_uniform_disc(verts, tris, pts, k)
+        measured = result.pressure_complex[i, 0, :]
+        scale = complex(np.vdot(analytic, measured) / np.vdot(analytic, analytic))
+        assert scale.real > 0.5, f"acceleration field inverted (scale={scale:+.3f})"
+        assert abs(scale.imag) < 0.30, f"unexpected phase (scale={scale:+.3f})"
+        assert 0.8 < abs(scale) < 1.3, f"magnitude off (scale={scale:+.3f})"
