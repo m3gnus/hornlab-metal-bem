@@ -68,6 +68,12 @@ Mesh requirements:
 - source/radiator tags must match `config.velocity_sources`
 - the default source tag is `2`
 
+Signed-volume winding validation is applied to closed two-manifold meshes. For
+supported open meshes (bare horns and mirror-reduced domains), signed volume is
+origin-dependent, so loading does not flip or reject winding from that scalar;
+the source-normal, symmetry/open-edge, and native geometry contracts remain the
+relevant checks.
+
 A Gmsh surface physical group named `mouth_aperture` is the canonical coupled
 infinite-baffle declaration. `load_mesh()` carries that declaration into the
 public solve APIs, which automatically resolve `SolveConfig.aperture_tag` and

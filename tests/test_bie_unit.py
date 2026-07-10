@@ -633,31 +633,49 @@ class TestSourceFaceScaleProfiles:
     def test_raised_cosine_taper_decreases_with_normalized_radius(self):
         from hornlab_metal_bem.bie import _build_source_face_scale
 
-        grid = _flat_radial_source_grid([0.0, 0.5, 1.0])
-        tags = np.array([2, 2, 2], dtype=np.int32)
+        grid = _flat_radial_source_grid([-1.0, -0.5, 0.0, 0.5, 1.0])
+        tags = np.full(5, 2, dtype=np.int32)
         config = SolveConfig(
             velocity_sources={2: 1.0},
             source_velocity_profiles={2: TaperProfile(start=0.0)},
         )
 
         scale = _build_source_face_scale(grid, tags, config, self.AXIS, self.CENTER)
-        np.testing.assert_allclose(scale[0], 1.0, atol=1e-12)
-        assert scale[0] >= scale[1] >= scale[2]
-        np.testing.assert_allclose(scale[1], 0.5, atol=1e-12)
-        np.testing.assert_allclose(scale[2], 0.0, atol=1e-12)
+        np.testing.assert_allclose(scale, [0.0, 0.5, 1.0, 0.5, 0.0], atol=1e-12)
 
     def test_annular_profile_selects_normalized_radius_band(self):
         from hornlab_metal_bem.bie import _build_source_face_scale
 
-        grid = _flat_radial_source_grid([0.1, 0.5, 0.9])
-        tags = np.array([2, 2, 2], dtype=np.int32)
+        grid = _flat_radial_source_grid([-0.9, -0.5, -0.1, 0.1, 0.5, 0.9])
+        tags = np.full(6, 2, dtype=np.int32)
         config = SolveConfig(
             velocity_sources={2: 1.0},
             source_velocity_profiles={2: AnnularProfile(0.4, 0.7)},
         )
 
         scale = _build_source_face_scale(grid, tags, config, self.AXIS, self.CENTER)
-        np.testing.assert_allclose(scale, [0.0, 1.0, 0.0], atol=1e-12)
+        np.testing.assert_allclose(
+            scale, [0.0, 1.0, 0.0, 0.0, 1.0, 0.0], atol=1e-12
+        )
+
+    def test_secondary_tag_taper_uses_its_own_translated_center(self):
+        from hornlab_metal_bem.bie import _build_source_face_scale
+
+        grid = _flat_radial_source_grid([-1.0, 0.0, 1.0, 9.0, 10.0, 11.0])
+        tags = np.array([2, 2, 2, 3, 3, 3], dtype=np.int32)
+        config = SolveConfig(
+            velocity_sources={2: 1.0, 3: 1.0},
+            source_velocity_profiles={
+                2: TaperProfile(kind="linear", start=0.0),
+                3: TaperProfile(kind="linear", start=0.0),
+            },
+        )
+
+        scale = _build_source_face_scale(
+            grid, tags, config, self.AXIS, self.CENTER
+        )
+        np.testing.assert_allclose(scale[:3], [0.0, 1.0, 0.0], atol=1e-12)
+        np.testing.assert_allclose(scale[3:], scale[:3], atol=1e-12)
 
     def test_per_face_profile_applies_in_physical_tag_face_order(self):
         from hornlab_metal_bem.bie import _build_source_face_scale
@@ -697,7 +715,7 @@ class TestSourceFaceScaleProfiles:
         assert seen["centroids"].shape == (2, 3)
         np.testing.assert_allclose(seen["normals"], [[0.0, 0.0, 1.0]] * 2)
         np.testing.assert_allclose(seen["axis"], self.AXIS)
-        np.testing.assert_allclose(seen["source_center"], self.CENTER)
+        np.testing.assert_allclose(seen["source_center"], [0.5, 0.0, 0.0])
 
 
 # ---------------------------------------------------------------------------

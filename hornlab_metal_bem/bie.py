@@ -219,6 +219,16 @@ def _build_source_face_scale(
             continue
         profile = effective_profiles[tag]
         any_source = True
+        # ``source_center`` belongs to the tag used for frame inference, while
+        # configured source tags can be spatially separate. Derive an
+        # area-weighted center independently for every tag so identical
+        # translated drivers receive identical radial profiles. The supplied
+        # center remains the fallback for a degenerate tag.
+        tag_center = center
+        tag_areas = mags[idx]
+        area_sum = float(np.sum(tag_areas))
+        if np.isfinite(area_sum) and area_sum > 1.0e-15:
+            tag_center = np.average(centroids[idx], weights=tag_areas, axis=0)
         if isinstance(profile, NormalProfile):
             values = np.ones(idx.size, dtype=np.float64)
         elif isinstance(profile, AxialProfile):
@@ -231,13 +241,13 @@ def _build_source_face_scale(
             assert axis_unit is not None
             axial = _tag_axial_projection(raw, mags, idx, axis_unit)
             values = axial * _taper_values(
-                _normalized_tag_radius(centroids, idx, axis_unit, center),
+                _normalized_tag_radius(centroids, idx, axis_unit, tag_center),
                 profile,
             )
         elif isinstance(profile, AnnularProfile):
             assert axis_unit is not None
             axial = _tag_axial_projection(raw, mags, idx, axis_unit)
-            t = _normalized_tag_radius(centroids, idx, axis_unit, center)
+            t = _normalized_tag_radius(centroids, idx, axis_unit, tag_center)
             annulus = (
                 (t >= profile.r_inner) & (t <= profile.r_outer)
             ).astype(np.float64)
@@ -259,7 +269,7 @@ def _build_source_face_scale(
                     centroids[idx],
                     unit_normals[idx],
                     axis_unit.copy(),
-                    center.copy(),
+                    np.asarray(tag_center, dtype=np.float64).copy(),
                 ),
                 dtype=np.complex128,
             )
