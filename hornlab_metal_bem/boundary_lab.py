@@ -590,6 +590,10 @@ def _boundary_lab_channel_drive(channel: Any | None, frequency_hz: float) -> com
         raise BoundaryLabSolverError(
             f"polarity must be -1 or 1, got {polarity!r}"
         )
+    # These weights multiply the conjugated (engineering e^{+j omega t})
+    # channel basis, mirroring blab.channel_synthesis.channel_drive: a time
+    # delay of tau is e^{-j omega tau} there — the conjugate of the
+    # solver-side drive in _level_polarity_delay_filter_drive.
     delay = np.exp(-1j * omega * (float(_first(channel, "delay_ms", default=0.0)) / 1000.0))
     crossover = 1.0 + 0.0j
     for name in ("hpf", "lpf"):

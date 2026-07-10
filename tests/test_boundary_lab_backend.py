@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from hornlab_metal_bem.boundary_lab import BACKEND_ID, BoundaryLabSolverError, create_backend
+from hornlab_metal_bem.boundary_lab import _boundary_lab_channel_drive
 from hornlab_metal_bem.boundary_lab import _coerce_symmetry_plane
 from hornlab_metal_bem.boundary_lab import _crossover_response
 from hornlab_metal_bem.boundary_lab import _frequency_result_from_channel_basis_entry
@@ -310,6 +311,40 @@ def test_drive_delay_uses_positive_phase_for_lagging_channel():
 def test_drive_rejects_polarity_outside_unit():
     with pytest.raises(BoundaryLabSolverError, match="polarity"):
         _level_polarity_delay_filter_drive({"polarity": 0}, 1000.0)
+
+
+def test_boundary_lab_channel_delay_uses_negative_phase_on_conjugated_basis():
+    # The streaming channel-basis path conjugates the Metal pressures into
+    # Boundary Lab's engineering e^{+j omega t} convention before synthesis
+    # (see _frequency_result_from_channel_basis_entry), and blab's own
+    # channel_drive delays with e^{-j omega tau} on that basis. The adapter's
+    # synthesis weight must match: 1 ms at 250 Hz is a quarter turn, 1 -> -j
+    # (the conjugate of the solver-side +j).
+    drive = _boundary_lab_channel_drive({"delay_ms": 1.0}, 250.0)
+    np.testing.assert_allclose(drive, np.exp(-1j * np.pi / 2.0), rtol=1e-12)
+
+
+@pytest.mark.parametrize("frequency_hz", [250.0, 1000.0, 4000.0, 12_000.0])
+def test_boundary_lab_channel_drive_is_conjugate_of_solver_side_drive(frequency_hz):
+    # The same channel settings are applied through two disjoint paths: at
+    # solve time as velocity drives in the Metal e^{-i omega t} convention
+    # (_level_polarity_delay_filter_drive), or post-solve as synthesis
+    # weights on the conjugated basis (_boundary_lab_channel_drive). They
+    # describe the same physics exactly when the whole drive is a conjugate
+    # pair: conj(w_eng * conj(p)) == conj(w_eng) * p == w_solver * p. A sign
+    # "fix" to either delay (or a dropped crossover conjugation) breaks this.
+    channel = {
+        "level_db": 2.0,
+        "polarity": -1,
+        "delay_ms": 0.37,
+        "hpf": {"type": "hpf", "filter": "butterworth", "order": 3, "frequency_hz": 800.0},
+        "lpf": {"type": "lpf", "filter": "linkwitz_riley", "order": 4, "frequency_hz": 4000.0},
+    }
+    np.testing.assert_allclose(
+        _boundary_lab_channel_drive(channel, frequency_hz),
+        np.conj(_level_polarity_delay_filter_drive(channel, frequency_hz)),
+        rtol=1e-12,
+    )
 
 
 def test_crossover_response_is_conjugate_of_scipy_convention():
