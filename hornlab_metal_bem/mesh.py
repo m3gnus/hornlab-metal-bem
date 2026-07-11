@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.spatial import cKDTree
 
 from .result import MeshInfo
 
@@ -404,22 +405,15 @@ def _merge_duplicate_vertices(
 ) -> tuple[NDArray[np.float64], NDArray[np.int32], int]:
     """Merge seam vertices within the requested Euclidean tolerance.
 
-    Quantising coordinates with ``round(vertex / tol)`` is not a distance
-    test: it misses close points on opposite sides of a bin boundary and can
-    merge diagonal points farther apart than ``tol``.  Use neighbouring spatial
-    hash cells only to find candidates, then union vertices after an exact
-    squared-distance check.
+    Pairs come from a spatial tree, then union only after an exact
+    squared-distance check. This preserves the Euclidean tolerance semantics
+    at hash-cell boundaries without making every mesh load Python-loop bound.
     """
     if tol <= 0 or len(verts) == 0:
         return verts, tris, 0
 
     if not np.isfinite(tol):
         raise MeshError("merge_tol must be finite")
-
-    cells = np.floor(verts / tol).astype(np.int64)
-    buckets: dict[tuple[int, int, int], list[int]] = {}
-    for index, key in enumerate(map(tuple, cells)):
-        buckets.setdefault(key, []).append(index)
 
     parent = np.arange(len(verts), dtype=np.int64)
 
@@ -429,31 +423,22 @@ def _merge_duplicate_vertices(
             index = int(parent[index])
         return index
 
-    offsets = (
-        (dx, dy, dz)
-        for dx in (-1, 0, 1)
-        for dy in (-1, 0, 1)
-        for dz in (-1, 0, 1)
-    )
-    neighbor_offsets = tuple(offsets)
     tol_sq = float(tol) ** 2
-    for key, indices in buckets.items():
-        candidates: list[int] = []
-        for dx, dy, dz in neighbor_offsets:
-            candidates.extend(
-                buckets.get((key[0] + dx, key[1] + dy, key[2] + dz), ())
-            )
-        for left in indices:
-            for right in candidates:
-                if right <= left:
-                    continue
-                delta = verts[right] - verts[left]
-                if float(delta @ delta) > tol_sq:
-                    continue
-                root_left = find(left)
-                root_right = find(right)
-                if root_left != root_right:
-                    parent[max(root_left, root_right)] = min(root_left, root_right)
+    # ``query_pairs(tol)`` can exclude a pair whose squared distance rounds to
+    # exactly ``tol_sq``. Search one representable step wider, then retain the
+    # pre-existing squared-distance predicate as the semantic authority.
+    search_radius = np.nextafter(float(tol), np.inf)
+    pairs = cKDTree(verts).query_pairs(search_radius, output_type="ndarray")
+    for left, right in pairs:
+        left_index = int(left)
+        right_index = int(right)
+        delta = verts[right_index] - verts[left_index]
+        if float(delta @ delta) > tol_sq:
+            continue
+        root_left = find(left_index)
+        root_right = find(right_index)
+        if root_left != root_right:
+            parent[max(root_left, root_right)] = min(root_left, root_right)
 
     roots = np.fromiter(
         (find(index) for index in range(len(verts))),

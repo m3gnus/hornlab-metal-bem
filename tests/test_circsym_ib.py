@@ -12,6 +12,7 @@ import pytest
 from scipy.special import j1
 
 import hornlab_metal_bem as metal_bem
+import hornlab_metal_bem.circsym as circsym
 from hornlab_metal_bem._constants import SPEED_OF_SOUND
 from hornlab_metal_bem.circsym import (
     MeridianMesh,
@@ -251,6 +252,85 @@ def test_coupled_ib_complex_k_and_robin_are_applied():
     assert not np.allclose(
         regularized.surface_pressure_avg[TAG_THROAT],
         standard.surface_pressure_avg[TAG_THROAT],
+    )
+
+
+def test_coupled_ib_complex_k_aperture_block_matches_full_assembly(monkeypatch):
+    """The reduced real-k Rayleigh block is parity-pinned to the old full path."""
+    meridian = _channel_meridian(0.025, 0.05, 0.04, h=0.005)
+    config = SolveConfig(
+        velocity_sources={TAG_THROAT: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        circsym_aperture_tag=TAG_DISC,
+        formulation="complex_k",
+        complex_k_shift=0.01,
+        return_surface_pressure=True,
+        observation=ObservationConfig(
+            distance_m=1.0,
+            angle_count=3,
+            planes=["horizontal"],
+            origin="mouth",
+        ),
+    )
+
+    def legacy_full_aperture_matrix(
+        meridian,
+        aperture_indices,
+        k,
+        *,
+        geom,
+        n_psi,
+    ):
+        del geom
+        full_s, _ = circsym._assemble_boundary_matrices(
+            meridian,
+            k,
+            None,
+            n_psi=n_psi,
+        )
+        indices = np.asarray(aperture_indices, dtype=np.int64)
+        return full_s[np.ix_(indices, indices)]
+
+    with monkeypatch.context() as context:
+        context.setattr(
+            circsym,
+            "_assemble_coupled_ib_rayleigh_aperture_matrix",
+            legacy_full_aperture_matrix,
+        )
+        legacy = metal_bem.solve_circsym_frequencies(meridian, [1500.0], config)
+    optimized = metal_bem.solve_circsym_frequencies(meridian, [1500.0], config)
+
+    np.testing.assert_allclose(
+        optimized.pressure_complex,
+        legacy.pressure_complex,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        optimized.directivity_db,
+        legacy.directivity_db,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        optimized.impedance,
+        legacy.impedance,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    assert optimized.surface_pressure_complex is not None
+    assert legacy.surface_pressure_complex is not None
+    np.testing.assert_allclose(
+        optimized.surface_pressure_complex,
+        legacy.surface_pressure_complex,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        optimized.surface_pressure_avg[TAG_THROAT],
+        legacy.surface_pressure_avg[TAG_THROAT],
+        rtol=1e-12,
+        atol=1e-12,
     )
 
 

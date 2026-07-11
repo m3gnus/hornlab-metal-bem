@@ -296,6 +296,11 @@ class MetalNativeStandardSession:
                 "regular_triangle_order and duffy_1d_order are fixed at 4; "
                 "the native helper does not yet honor quadrature overrides"
             )
+        if precision != "complex64":
+            raise ValueError(
+                "precision is fixed at 'complex64'; the native helper does not "
+                "yet honor precision overrides"
+            )
 
         status = runtime_status
         if status is None or not status.available:

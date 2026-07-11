@@ -332,6 +332,11 @@ class SolveConfig:
             beta_value = complex(beta)
             if not math.isfinite(beta_value.real) or not math.isfinite(beta_value.imag):
                 raise ValueError("impedance_sources values must be finite complex numbers")
+            if beta_value.real < 0.0:
+                raise ValueError(
+                    "impedance_sources admittance must be passive "
+                    "(Re(beta) >= 0)"
+                )
         if self.chief_points is not None:
             import numpy as _np
 

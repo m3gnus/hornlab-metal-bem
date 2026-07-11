@@ -44,6 +44,15 @@ def _arg_after(command: list[str], op: str, offset: int) -> str:
     return command[command.index(op) + offset]
 
 
+def test_native_session_rejects_unhonored_precision_before_discovery(monkeypatch):
+    def unexpected_discovery(*args, **kwargs):
+        raise AssertionError("precision validation must precede helper discovery")
+
+    monkeypatch.setattr(native, "discover_native_runtime", unexpected_discovery)
+    with pytest.raises(ValueError, match="does not yet honor precision overrides"):
+        MetalNativeStandardSession.create_session(precision="complex128")
+
+
 def _tiny_geometry_buffers():
     grid = SimpleNamespace(
         vertices=np.array(

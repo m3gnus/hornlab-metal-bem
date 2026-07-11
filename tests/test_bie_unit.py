@@ -462,6 +462,29 @@ def _flat_radial_source_grid(radii: list[float]) -> SimpleNamespace:
     )
 
 
+def _flat_source_grid_at_centroids(
+    centroids: list[tuple[float, float]],
+) -> SimpleNamespace:
+    """Flat +z triangles with the requested (x, y) face centroids."""
+    eps = 0.01
+    vertices = []
+    elements = []
+    for x, y in centroids:
+        base = len(vertices)
+        vertices.extend(
+            [
+                [x - eps, y - eps, 0.0],
+                [x + eps, y - eps, 0.0],
+                [x, y + 2.0 * eps, 0.0],
+            ]
+        )
+        elements.append([base, base + 1, base + 2])
+    return SimpleNamespace(
+        vertices=np.asarray(vertices, dtype=np.float64).T,
+        elements=np.asarray(elements, dtype=np.int32).T,
+    )
+
+
 def _two_sided_diaphragm_grid() -> SimpleNamespace:
     """Two equal-area faces with one normal +z and one normal -z."""
     verts = np.array(
@@ -676,6 +699,51 @@ class TestSourceFaceScaleProfiles:
         )
         np.testing.assert_allclose(scale[:3], [0.0, 1.0, 0.0], atol=1e-12)
         np.testing.assert_allclose(scale[3:], scale[:3], atol=1e-12)
+
+    def test_quarter_cap_taper_matches_full_mesh_scales(self):
+        """Native yz+xz symmetry must not move a radial profile off-axis."""
+        from hornlab_metal_bem.bie import _build_source_face_scale
+
+        radii = [0.1, 0.5, 1.0]
+        quadrant = [
+            (radius / np.sqrt(2.0), radius / np.sqrt(2.0))
+            for radius in radii
+        ]
+        full = [
+            (sign_x * x, sign_y * y)
+            for x, y in quadrant
+            for sign_x in (1.0, -1.0)
+            for sign_y in (1.0, -1.0)
+        ]
+        profile = TaperProfile(kind="linear", start=0.0)
+        full_scale = _build_source_face_scale(
+            _flat_source_grid_at_centroids(full),
+            np.full(len(full), 2, dtype=np.int32),
+            SolveConfig(
+                velocity_sources={2: 1.0},
+                source_velocity_profiles={2: profile},
+            ),
+            self.AXIS,
+            self.CENTER,
+        )
+        quadrant_scale = _build_source_face_scale(
+            _flat_source_grid_at_centroids(quadrant),
+            np.full(len(quadrant), 2, dtype=np.int32),
+            SolveConfig(
+                velocity_sources={2: 1.0},
+                source_velocity_profiles={2: profile},
+                native_symmetry_plane="yz+xz",
+            ),
+            self.AXIS,
+            self.CENTER,
+        )
+
+        np.testing.assert_allclose(
+            quadrant_scale,
+            full_scale.reshape(len(radii), 4)[:, 0],
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(quadrant_scale, [0.9, 0.5, 0.0], atol=1e-12)
 
     def test_per_face_profile_applies_in_physical_tag_face_order(self):
         from hornlab_metal_bem.bie import _build_source_face_scale

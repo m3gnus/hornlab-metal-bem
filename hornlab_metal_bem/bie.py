@@ -15,6 +15,7 @@ from .config import (
     TaperProfile,
     VelocityMode,
 )
+from .observation import _project_to_symmetry_subspace
 
 
 def _build_axial_face_scale(
@@ -229,6 +230,15 @@ def _build_source_face_scale(
         area_sum = float(np.sum(tag_areas))
         if np.isfinite(area_sum) and area_sum > 1.0e-15:
             tag_center = np.average(centroids[idx], weights=tag_areas, axis=0)
+        # A mirror-reduced source tag contains only one half/quadrant of the
+        # physical driver. Its geometric centroid is consequently off-axis,
+        # whereas radial profiles are defined on the mirrored full driver.
+        # Keep the per-tag translated-driver contract for full meshes, but
+        # project the reduced tag center back onto its symmetry subspace.
+        tag_center = _project_to_symmetry_subspace(
+            tag_center,
+            config.native_symmetry_plane,
+        )
         if isinstance(profile, NormalProfile):
             values = np.ones(idx.size, dtype=np.float64)
         elif isinstance(profile, AxialProfile):

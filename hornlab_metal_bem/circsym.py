@@ -641,12 +641,16 @@ def run_sweep_coupled_ib(
             geometry_cache=assembly_cache,
         )
         if k.imag == 0.0:
-            S_rayleigh = S
+            S_rayleigh_aperture = S[np.ix_(idx_a, idx_a)]
         else:
-            S_rayleigh, _ = _assemble_boundary_matrices(
+            # Rayleigh coupling is deliberately evaluated at the physical real
+            # wavenumber. Only its aperture-to-aperture single-layer block is
+            # consumed, so avoid a discarded full second S/H assembly.
+            S_rayleigh_aperture = _assemble_coupled_ib_rayleigh_aperture_matrix(
                 meridian,
+                idx_a,
                 k_field,
-                None,
+                geom=geom,
                 n_psi=n_psi,
             )
         q_driver = _build_driver_neumann_segments(
@@ -673,7 +677,7 @@ def run_sweep_coupled_ib(
         A[:n, n:] = -S[:, idx_a]
         b[:n] = S @ q_driver
         A[n + np.arange(m), idx_a] = 1.0
-        A[n:, n:] = -2.0 * S_rayleigh[np.ix_(idx_a, idx_a)]
+        A[n:, n:] = -2.0 * S_rayleigh_aperture
         assembly_s = time.time() - t_assembly
 
         t_solve = time.time()
@@ -685,7 +689,7 @@ def run_sweep_coupled_ib(
 
         p_srf = np.asarray(x[:n], dtype=np.complex128)
         q_a = np.asarray(x[n:], dtype=np.complex128)
-        aperture_trace = 2.0 * (S_rayleigh[np.ix_(idx_a, idx_a)] @ q_a)
+        aperture_trace = 2.0 * (S_rayleigh_aperture @ q_a)
         aperture_trace_denom = max(float(np.linalg.norm(p_srf[idx_a])), 1.0e-30)
         aperture_pressure_continuity_rel = float(
             np.linalg.norm(aperture_trace - p_srf[idx_a]) / aperture_trace_denom
@@ -2498,6 +2502,54 @@ def _assemble_boundary_block(
     return int(start), int(stop), s_block, h_block
 
 
+def _assemble_coupled_ib_rayleigh_aperture_matrix(
+    meridian: MeridianMesh,
+    aperture_indices: NDArray[np.int64] | NDArray[np.int32],
+    k: complex,
+    *,
+    geom: SimpleNamespace,
+    n_psi: int,
+) -> NDArray[np.complex128]:
+    """Assemble the real-k Rayleigh single-layer aperture block only.
+
+    Coupled infinite-baffle assembly consumes this block for the pressure
+    trace.  Match the ordinary/near split used by full boundary assembly so
+    this reduced work remains numerically identical to slicing a full matrix.
+    """
+    indices = np.asarray(aperture_indices, dtype=np.int64).reshape(-1)
+    targets = geom.midpoints[indices]
+    s_block, _ = _integrate_ordinary_segment_kernels_targets_batched(
+        target_rho=targets[:, 0],
+        target_z=targets[:, 1],
+        meridian=meridian,
+        geom=geom,
+        source_indices=indices,
+        k=k,
+        baffle_z=None,
+        n_psi=n_psi,
+    )
+    far_mask = _ordinary_far_source_mask_targets(
+        targets[:, 0],
+        targets[:, 1],
+        geom,
+        source_indices=indices,
+    )
+    near_rows, near_cols = np.nonzero(~far_mask)
+    for row_local, source_local in zip(near_rows, near_cols):
+        s_block[row_local, source_local] = _integrate_segment_kernel(
+            target_rho=float(targets[row_local, 0]),
+            target_z=float(targets[row_local, 1]),
+            meridian=meridian,
+            geom=geom,
+            source_index=int(indices[source_local]),
+            k=k,
+            baffle_z=None,
+            n_psi=n_psi,
+            target_index=int(indices[row_local]),
+        )[0]
+    return s_block
+
+
 def _assemble_boundary_row(
     row_index: int,
     *,
@@ -3167,6 +3219,14 @@ def _boundary_free_terms(
     return terms
 
 
+def _meridian_node_degrees(segments: NDArray[np.int32]) -> dict[int, int]:
+    degrees: dict[int, int] = {}
+    for start, end in np.asarray(segments, dtype=np.int64):
+        degrees[int(start)] = degrees.get(int(start), 0) + 1
+        degrees[int(end)] = degrees.get(int(end), 0) + 1
+    return degrees
+
+
 def _validate_closed_or_baffled_meridian(
     meridian: MeridianMesh,
     baffle_z: float | None,
@@ -3179,7 +3239,15 @@ def _validate_closed_or_baffled_meridian(
                 "circsym_aperture_tag coupled infinite-baffle mode"
             )
         return
-    endpoint_rho = np.asarray([meridian.nodes[0, 0], meridian.nodes[-1, 0]], dtype=np.float64)
+    degrees = _meridian_node_degrees(meridian.segments)
+    endpoint_nodes = [node for node, degree in degrees.items() if degree == 1]
+    if len(endpoint_nodes) != 2:
+        raise ValueError(
+            "CircSym one-trace BEM requires a closed body-of-revolution meridian "
+            "with both endpoints on the symmetry axis; bare/open meridians need "
+            "a dedicated open-screen formulation"
+        )
+    endpoint_rho = meridian.nodes[np.asarray(endpoint_nodes, dtype=np.int64), 0]
     if np.any(endpoint_rho > 1.0e-9):
         raise ValueError(
             "CircSym one-trace BEM requires a closed body-of-revolution meridian "
@@ -3223,14 +3291,7 @@ def _validate_coupled_ib_meridian(
             "coupled infinite-baffle CircSym requires the entire cavity at z <= 0"
         )
 
-    def _degrees(segments: NDArray[np.int32]) -> dict[int, int]:
-        degrees: dict[int, int] = {}
-        for start, end in np.asarray(segments, dtype=np.int64):
-            degrees[int(start)] = degrees.get(int(start), 0) + 1
-            degrees[int(end)] = degrees.get(int(end), 0) + 1
-        return degrees
-
-    aperture_degrees = _degrees(aperture_segments)
+    aperture_degrees = _meridian_node_degrees(aperture_segments)
     aperture_endpoints = [node for node, degree in aperture_degrees.items() if degree == 1]
     if (
         len(aperture_endpoints) != 2
@@ -3261,7 +3322,7 @@ def _validate_coupled_ib_meridian(
             "circsym_aperture_tag must span exactly from the mouth rim to the symmetry axis"
         )
 
-    full_degrees = _degrees(meridian.segments)
+    full_degrees = _meridian_node_degrees(meridian.segments)
     full_endpoints = [node for node, degree in full_degrees.items() if degree == 1]
     if len(full_endpoints) != 2 or any(degree > 2 for degree in full_degrees.values()):
         raise ValueError(
@@ -3712,14 +3773,25 @@ def _ring_remainder_kernel_m0_targets_batched(
     R2 = rt * rt + rs * rs - 2.0 * rt * rs * cos_psi + dz * dz
     R = np.sqrt(np.maximum(R2, 0.0))
     q = complex(k) * R
-    phase = np.exp(1j * q)
     with np.errstate(divide="ignore", invalid="ignore"):
-        rem_g = (phase - 1.0) / (4.0 * np.pi * R)
+        rem_g = np.expm1(1j * q) / (4.0 * np.pi * R)
+    rem_g = np.where(R > 1e-13, rem_g, 1j * complex(k) / (4.0 * np.pi))
 
     num = (rs - rt * cos_psi) * n_rho + dz * n_z
-    expr = phase * (1j * q - 1.0) + 1.0
+    expr = np.exp(1j * q) * (1j * q - 1.0) + 1.0
+    small = np.abs(q) < 1e-5
+    if np.any(small):
+        qs = q[small]
+        expr = expr.astype(np.complex128, copy=True)
+        expr[small] = (
+            -0.5 * qs * qs
+            - (1j / 3.0) * qs ** 3
+            + 0.125 * qs ** 4
+            + (1j / 30.0) * qs ** 5
+        )
     with np.errstate(divide="ignore", invalid="ignore"):
         rem_h = expr * num / (4.0 * np.pi * R2 * R)
+    rem_h = np.where(R > 1e-13, rem_h, 0.0 + 0.0j)
 
     G = 2.0 * np.sum(rem_g * weights[None, None, None, :], axis=3)
     H = 2.0 * np.sum(rem_h * weights[None, None, None, :], axis=3)

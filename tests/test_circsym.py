@@ -13,6 +13,9 @@ from hornlab_metal_bem.circsym import (
     _evaluate_points_pressure,
     _is_flat_baffled_sheet,
     _integrate_segment_kernel,
+    _ring_remainder_kernel_m0,
+    _ring_remainder_kernel_m0_targets_batched,
+    _validate_closed_or_baffled_meridian,
     ring_kernel_m0,
 )
 from hornlab_metal_bem.config import (
@@ -188,6 +191,52 @@ def test_ring_kernels_match_dense_azimuth_quadrature_off_diagonal_and_near():
     )
     assert np.isfinite(g_self)
     assert np.isfinite(h_self)
+
+
+@pytest.mark.parametrize(
+    "k",
+    [1.0e-8 + 0.0j, 1.0e-5 + 1.0e-6j, 0.2 + 0.03j, 30.0 + 1.0j],
+)
+def test_targets_batched_ring_remainder_matches_scalar_across_q_ranges(k: complex):
+    """The target-batched remainder keeps the scalar small-|q| guard."""
+    target_rho = np.array([0.02, 0.13, 0.40], dtype=np.float64)
+    target_z = np.array([-0.03, 0.08, 0.15], dtype=np.float64)
+    source_rho = np.array([[0.01, 0.03, 0.08], [0.12, 0.17, 0.23]])
+    source_z = np.array([[-0.07, -0.02, 0.01], [0.05, 0.09, 0.12]])
+    normal_rho = np.array([0.6, -0.8], dtype=np.float64)
+    normal_z = np.array([0.8, 0.6], dtype=np.float64)
+
+    actual_g, actual_h = _ring_remainder_kernel_m0_targets_batched(
+        target_rho,
+        target_z,
+        source_rho,
+        source_z,
+        normal_rho,
+        normal_z,
+        k,
+        n_psi=48,
+    )
+    expected_g = np.empty_like(actual_g)
+    expected_h = np.empty_like(actual_h)
+    for target_index, (rho, z) in enumerate(zip(target_rho, target_z)):
+        for source_index in range(source_rho.shape[0]):
+            g_value, h_value = _ring_remainder_kernel_m0(
+                float(rho),
+                float(z),
+                source_rho[source_index],
+                source_z[source_index],
+                np.array(
+                    [normal_rho[source_index], normal_z[source_index]],
+                    dtype=np.float64,
+                ),
+                k,
+                n_psi=48,
+            )
+            expected_g[target_index, source_index] = g_value
+            expected_h[target_index, source_index] = h_value
+
+    np.testing.assert_allclose(actual_g, expected_g, rtol=1e-14, atol=1e-30)
+    np.testing.assert_allclose(actual_h, expected_h, rtol=1e-14, atol=1e-30)
 
 
 @pytest.mark.parametrize("baffled_sheet", [False, True])
@@ -590,6 +639,40 @@ def test_open_meridian_without_baffle_is_rejected():
 
     with pytest.raises(ValueError, match="bare/open meridians"):
         metal_bem.solve_circsym_frequencies(meridian, [1000.0], config)
+
+
+def test_closed_meridian_validation_uses_topological_endpoints():
+    original = _sphere_meridian(radius=0.1, segments=12)
+    permutation = np.array([4, 0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 12, 11])
+    old_to_new = np.empty_like(permutation)
+    old_to_new[permutation] = np.arange(permutation.size)
+    shuffled = MeridianMesh(
+        original.nodes[permutation],
+        old_to_new[original.segments],
+        original.physical_tags,
+        original.normals,
+    )
+    assert shuffled.nodes[0, 0] > 1.0e-9
+    assert shuffled.nodes[-1, 0] > 1.0e-9
+
+    _validate_closed_or_baffled_meridian(shuffled, None)
+
+
+def test_closed_meridian_validation_rejects_off_axis_topological_endpoints():
+    # Array endpoints are on-axis, but the degree-one polyline ends are not.
+    meridian = MeridianMesh(
+        nodes=np.array(
+            [[0.0, -0.01], [0.03, -0.01], [0.08, 0.02], [0.0, 0.01]],
+            dtype=np.float64,
+        ),
+        segments=np.array([[1, 0], [0, 3], [3, 2]], dtype=np.int32),
+        physical_tags=np.full(3, 2, dtype=np.int32),
+    )
+    assert meridian.nodes[0, 0] == 0.0
+    assert meridian.nodes[-1, 0] == 0.0
+
+    with pytest.raises(ValueError, match="bare/open meridians"):
+        _validate_closed_or_baffled_meridian(meridian, None)
 
 
 def test_legacy_baffle_image_rejects_recessed_or_nonplanar_meridian():

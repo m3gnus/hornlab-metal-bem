@@ -217,10 +217,15 @@ def test_impedance_source_callback_passivity_guard():
         impedance_sources={8: 0.0 + 0.0j},
         impedance_source_callback=lambda f: {8: -0.1 + 0.0j},
     )
-    with pytest.raises(ValueError, match="passive"):
+    with pytest.raises(ValueError, match="admittance must be passive"):
         _impedance_sources_for_frequencies(
             tags, np.array([500.0], dtype=np.float64), cfg
         )
+
+
+def test_static_impedance_source_passivity_guard():
+    with pytest.raises(ValueError, match="admittance must be passive"):
+        SolveConfig(impedance_sources={8: -0.1 + 0.0j})
 
 
 def test_impedance_source_callback_rejects_nonfinite_beta():
