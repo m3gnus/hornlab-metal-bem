@@ -10,9 +10,14 @@ from hornlab_metal_bem.circsym import (
     MeridianMesh,
     _BoundaryAssemblyGeometryCache,
     _assemble_boundary_matrices,
+    _build_far_remainder_compact_geometry,
+    _build_far_remainder_geometry_parts,
+    _evaluate_far_remainder_block,
+    _evaluate_far_remainder_onthefly_compiled,
     _evaluate_points_pressure,
     _is_flat_baffled_sheet,
     _integrate_segment_kernel,
+    _load_circsym_remainder_c_kernel,
     _ring_remainder_kernel_m0,
     _ring_remainder_kernel_m0_targets_batched,
     _validate_closed_or_baffled_meridian,
@@ -302,6 +307,65 @@ def test_cached_boundary_assembly_matches_uncached(baffled_sheet: bool):
     np.testing.assert_allclose(H_cached, H_uncached, rtol=6e-13, atol=6e-14)
 
 
+def test_far_onthefly_compiled_matches_precomputed_reference():
+    kernel = _load_circsym_remainder_c_kernel()
+    if kernel is None:
+        pytest.skip("runtime C compiler is unavailable")
+
+    meridians = [
+        (_sphere_meridian(radius=0.1, segments=7), None),
+        (_sphere_meridian(radius=0.1, segments=7), -0.137),
+    ]
+    for meridian, baffle_z in meridians:
+        geom = meridian.segment_geometry()
+        compact = _build_far_remainder_compact_geometry(
+            meridian,
+            geom,
+            baffle_z,
+            n_psi=48,
+        )
+        reference_parts = _build_far_remainder_geometry_parts(
+            meridian,
+            geom,
+            baffle_z,
+            n_psi=48,
+        )
+        assert compact.source_rho.shape == (meridian.segment_count, 16)
+        assert compact.cos_psi.shape == (48,)
+
+        for k in (0.2 + 0.03j, 30.0 + 1.0j):
+            actual_s, actual_h = _evaluate_far_remainder_onthefly_compiled(
+                kernel,
+                compact,
+                k,
+                workers=2,
+            )
+            expected_s = np.zeros_like(actual_s)
+            expected_h = np.zeros_like(actual_h)
+            for reference_part in reference_parts:
+                s_part, h_part = _evaluate_far_remainder_block(
+                    reference_part,
+                    k,
+                    0,
+                    meridian.segment_count,
+                )
+                expected_s += s_part
+                expected_h += h_part
+
+            np.testing.assert_allclose(
+                actual_s,
+                expected_s,
+                rtol=3e-13,
+                atol=3e-14,
+            )
+            np.testing.assert_allclose(
+                actual_h,
+                expected_h,
+                rtol=3e-13,
+                atol=3e-14,
+            )
+
+
 def test_boundary_assembly_cache_release_and_budget_fallback(monkeypatch):
     k = 37.0 + 0.02j
     meridian = _sphere_meridian(radius=0.1, segments=9)
@@ -310,15 +374,17 @@ def test_boundary_assembly_cache_release_and_budget_fallback(monkeypatch):
         None,
         reusable_n_psi={96},
         n_psi_use_counts={96: 1},
+        cache_single_use=False,
     )
 
-    S_cached, H_cached = _assemble_boundary_matrices(
-        meridian,
+    assembled = cache.assemble(
         k,
-        None,
         n_psi=96,
-        geometry_cache=cache,
+        meridian=meridian,
+        baffle_z=None,
     )
+    assert assembled is not None
+    S_cached, H_cached = assembled
     assert 96 not in cache._quadrature
     assert cache.assemble(k, n_psi=96, meridian=meridian, baffle_z=None) is None
 
@@ -333,7 +399,24 @@ def test_boundary_assembly_cache_release_and_budget_fallback(monkeypatch):
 
     monkeypatch.setenv("HORNLAB_CIRCSYM_ASSEMBLY_CACHE_MAX_BYTES", "1")
     budget_cache = _BoundaryAssemblyGeometryCache(meridian, None)
-    assert budget_cache.assemble(k, n_psi=96, meridian=meridian, baffle_z=None) is None
+
+    def unexpected_scalar_fallback(*args, **kwargs):
+        raise AssertionError("compact far assembly must not use the scalar fallback")
+
+    monkeypatch.setattr(
+        "hornlab_metal_bem.circsym._assemble_boundary_matrices_uncached",
+        unexpected_scalar_fallback,
+    )
+    S_budget, H_budget = _assemble_boundary_matrices(
+        meridian,
+        k,
+        None,
+        n_psi=96,
+        geometry_cache=budget_cache,
+    )
+    assert budget_cache._quadrature[96].far.source_rho.shape == (9, 16)
+    np.testing.assert_allclose(S_budget, S_uncached, rtol=6e-13, atol=6e-14)
+    np.testing.assert_allclose(H_budget, H_uncached, rtol=6e-13, atol=6e-14)
 
 
 def test_vectorized_field_evaluation_matches_scalar_closed_meridian():

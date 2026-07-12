@@ -63,7 +63,6 @@ _FIELD_KERNEL_MAX_WORKERS = 8
 _ASSEMBLY_KERNEL_BLOCK_ELEMENTS = 3_000_000
 _ASSEMBLY_KERNEL_MAX_TARGET_BLOCK = 16
 _ASSEMBLY_KERNEL_PARALLEL_TARGET_BLOCK = 5
-_ASSEMBLY_GEOMETRY_CACHE_MAX_BYTES = 1_000_000_000
 
 
 @dataclass
@@ -1207,6 +1206,20 @@ class _FarRemainderGeometry:
 
 
 @dataclass
+class _FarRemainderCompactGeometry:
+    target_rho: NDArray[np.float64]
+    target_z: NDArray[np.float64]
+    source_rho: NDArray[np.float64]
+    source_z: NDArray[np.float64]
+    measure: NDArray[np.float64]
+    normal_rho: NDArray[np.float64]
+    normal_z: NDArray[np.float64]
+    cos_psi: NDArray[np.float64]
+    psi_weights: NDArray[np.float64]
+    baffle_z: float | None
+
+
+@dataclass
 class _NearRemainderGeometry:
     R: NDArray[np.float64]
     num: NDArray[np.float64]
@@ -1215,7 +1228,7 @@ class _NearRemainderGeometry:
 
 @dataclass
 class _BoundaryAssemblyQuadratureGeometry:
-    far_parts: tuple[_FarRemainderGeometry, ...]
+    far: _FarRemainderCompactGeometry
     near_parts: tuple[_NearRemainderGeometry, ...]
 
 
@@ -1241,7 +1254,9 @@ class _BoundaryAssemblyGeometryCache:
             if n_psi_use_counts is None
             else {int(key): int(value) for key, value in n_psi_use_counts.items()}
         )
-        self._cache_single_use = bool(cache_single_use)
+        # Retain the legacy keyword for internal callers; compact far geometry
+        # is cheap enough that single-use orders are always assembled here.
+        del cache_single_use
         self._exhausted_n_psi: set[int] = set()
         self._static_s: NDArray[np.complex128] | None = None
         self._static_h: NDArray[np.complex128] | None = None
@@ -1266,27 +1281,7 @@ class _BoundaryAssemblyGeometryCache:
             return None
         if self._remaining_uses is not None and n_psi_int in self._exhausted_n_psi:
             return None
-        if (
-            n_psi_int not in self._quadrature
-            and _estimate_boundary_geometry_cache_bytes(
-                self.meridian,
-                self.baffle_z,
-                n_psi_int,
-            )
-            > _assembly_geometry_cache_max_bytes()
-        ):
-            return None
         c_kernel = _load_circsym_remainder_c_kernel()
-        remaining_uses = (
-            None if self._remaining_uses is None else self._remaining_uses.get(n_psi_int)
-        )
-        if (
-            remaining_uses is not None
-            and remaining_uses <= 1
-            and n_psi_int not in self._quadrature
-            and (c_kernel is None or not self._cache_single_use)
-        ):
-            return None
 
         try:
             static_s, static_h, near_rows, near_cols = self._static_geometry()
@@ -1341,7 +1336,7 @@ class _BoundaryAssemblyGeometryCache:
         cached = self._quadrature.get(int(n_psi))
         if cached is None:
             cached = _BoundaryAssemblyQuadratureGeometry(
-                far_parts=_build_far_remainder_geometry_parts(
+                far=_build_far_remainder_compact_geometry(
                     self.meridian,
                     self.geom,
                     self.baffle_z,
@@ -1381,32 +1376,6 @@ def _same_optional_float(a: float | None, b: float | None) -> bool:
     return float(a) == float(b)
 
 
-def _assembly_geometry_cache_max_bytes() -> int:
-    raw = os.environ.get("HORNLAB_CIRCSYM_ASSEMBLY_CACHE_MAX_BYTES")
-    if raw is not None:
-        try:
-            return max(0, int(raw))
-        except ValueError:
-            return _ASSEMBLY_GEOMETRY_CACHE_MAX_BYTES
-    return _ASSEMBLY_GEOMETRY_CACHE_MAX_BYTES
-
-
-def _estimate_boundary_geometry_cache_bytes(
-    meridian: MeridianMesh,
-    baffle_z: float | None,
-    n_psi: int,
-) -> int:
-    image_factor = 2 if baffle_z is not None else 1
-    far_values = (
-        int(meridian.segment_count)
-        * int(meridian.segment_count)
-        * int(_LINE_QUAD_ORDER)
-        * int(n_psi)
-    )
-    # Far geometry stores R, G weights, and H weights as float64 arrays.
-    return int(far_values * 3 * np.dtype(np.float64).itemsize * image_factor)
-
-
 def _assemble_boundary_matrices_from_geometry(
     static_s: NDArray[np.complex128],
     static_h: NDArray[np.complex128],
@@ -1423,15 +1392,14 @@ def _assemble_boundary_matrices_from_geometry(
     n = S.shape[0]
     workers = _assembly_worker_count(n)
     if c_kernel is not None:
-        for part in qgeom.far_parts:
-            s_part, h_part = _evaluate_far_remainder_compiled(
-                c_kernel,
-                part,
-                k,
-                workers=workers,
-            )
-            S += s_part
-            H += h_part
+        s_part, h_part = _evaluate_far_remainder_onthefly_compiled(
+            c_kernel,
+            qgeom.far,
+            k,
+            workers=workers,
+        )
+        S += s_part
+        H += h_part
     else:
         _accumulate_far_remainder_numpy(S, H, qgeom, k, n_psi=n_psi, workers=workers)
 
@@ -1464,34 +1432,14 @@ def _accumulate_far_remainder_numpy(
     n_psi: int,
     workers: int,
 ) -> None:
-    n = S.shape[0]
-    block_size = _assembly_target_block_size(n, int(n_psi))
-    if workers > 1:
-        block_size = min(block_size, _ASSEMBLY_KERNEL_PARALLEL_TARGET_BLOCK)
-    ranges = [(start, min(n, start + block_size)) for start in range(0, n, block_size)]
-
-    def compute_block(
-        span: tuple[int, int],
-    ) -> tuple[int, int, NDArray[np.complex128], NDArray[np.complex128]]:
-        start, stop = span
-        s_dyn = np.zeros((stop - start, n), dtype=np.complex128)
-        h_dyn = np.zeros_like(s_dyn)
-        for part in qgeom.far_parts:
-            s_part, h_part = _evaluate_far_remainder_block(part, k, start, stop)
-            s_dyn += s_part
-            h_dyn += h_part
-        return start, stop, s_dyn, h_dyn
-
-    if workers <= 1 or len(ranges) <= 1:
-        for span in ranges:
-            start, stop, s_dyn, h_dyn = compute_block(span)
-            S[start:stop] += s_dyn
-            H[start:stop] += h_dyn
-    else:
-        with ThreadPoolExecutor(max_workers=min(workers, len(ranges))) as executor:
-            for start, stop, s_dyn, h_dyn in executor.map(compute_block, ranges):
-                S[start:stop] += s_dyn
-                H[start:stop] += h_dyn
+    del n_psi
+    s_dyn, h_dyn = _evaluate_far_remainder_onthefly_reference(
+        qgeom.far,
+        k,
+        workers=workers,
+    )
+    S += s_dyn
+    H += h_dyn
 
 
 _CIRCSYM_REMAINDER_C_SOURCE = r"""
@@ -1519,6 +1467,34 @@ typedef struct {
     int64_t start;
     int64_t stop;
 } FarThreadTask;
+
+typedef struct {
+    int64_t nt;
+    int64_t ns;
+    int64_t nl;
+    int64_t np;
+    const double *target_rho;
+    const double *target_z;
+    const double *source_rho;
+    const double *source_z;
+    const double *measure;
+    const double *normal_rho;
+    const double *normal_z;
+    const double *cos_psi;
+    const double *psi_weights;
+    int32_t has_baffle;
+    double baffle_z;
+    double kr;
+    double ki;
+    double *out_s;
+    double *out_h;
+} FarOntheflyTask;
+
+typedef struct {
+    const FarOntheflyTask *task;
+    int64_t start;
+    int64_t stop;
+} FarOntheflyThreadTask;
 
 typedef struct {
     int64_t pair_count;
@@ -1609,6 +1585,119 @@ static void eval_far_range(const FarTask *task, int64_t start, int64_t stop) {
 static void *eval_far_worker(void *raw) {
     const FarThreadTask *thread_task = (const FarThreadTask *)raw;
     eval_far_range(thread_task->task, thread_task->start, thread_task->stop);
+    return NULL;
+}
+
+static void eval_far_onthefly_range(
+    const FarOntheflyTask *task,
+    int64_t start,
+    int64_t stop
+) {
+    const int64_t ns = task->ns;
+    const int64_t nl = task->nl;
+    const int64_t np = task->np;
+    const double *target_rho = task->target_rho;
+    const double *target_z = task->target_z;
+    const double *source_rho = task->source_rho;
+    const double *source_z = task->source_z;
+    const double *measure = task->measure;
+    const double *normal_rho = task->normal_rho;
+    const double *normal_z = task->normal_z;
+    const double *cos_psi = task->cos_psi;
+    const double *psi_weights = task->psi_weights;
+    const int32_t image_count = task->has_baffle ? 2 : 1;
+    const double baffle_z = task->baffle_z;
+    const double kr = task->kr;
+    const double ki = task->ki;
+    double *out_s = task->out_s;
+    double *out_h = task->out_h;
+    const double pi = 3.141592653589793238462643383279502884;
+
+    for (int64_t i = start; i < stop; ++i) {
+        const double rt = target_rho[i];
+        const double zt = target_z[i];
+        for (int64_t j = 0; j < ns; ++j) {
+            double s_re = 0.0;
+            double s_im = 0.0;
+            double h_re = 0.0;
+            double h_im = 0.0;
+            const double nr = normal_rho[j];
+            const double source_nz = normal_z[j];
+
+            for (int32_t image = 0; image < image_count; ++image) {
+                double part_s_re = 0.0;
+                double part_s_im = 0.0;
+                double part_h_re = 0.0;
+                double part_h_im = 0.0;
+                const double nz = image ? -source_nz : source_nz;
+
+                for (int64_t u = 0; u < nl; ++u) {
+                    const int64_t source_idx = j * nl + u;
+                    const double source_measure = measure[source_idx];
+                    if (source_measure == 0.0) {
+                        continue;
+                    }
+                    const double rs = source_rho[source_idx];
+                    const double base_zs = source_z[source_idx];
+                    const double zs = image ? 2.0 * baffle_z - base_zs : base_zs;
+                    const double dz = zs - zt;
+
+                    for (int64_t p = 0; p < np; ++p) {
+                        const double cp = cos_psi[p];
+                        double r2 =
+                            rt * rt + rs * rs - 2.0 * rt * rs * cp + dz * dz;
+                        if (r2 < 0.0) {
+                            r2 = 0.0;
+                        }
+                        const double r = sqrt(r2);
+                        if (r <= 1.0e-13) {
+                            continue;
+                        }
+
+                        const double weighted_measure =
+                            (source_measure * (2.0 * psi_weights[p])) / (4.0 * pi);
+                        const double g_weight = weighted_measure / r;
+                        const double num = (rs - rt * cp) * nr + dz * nz;
+                        const double h_weight =
+                            (weighted_measure * num) / ((r * r) * r);
+                        const double kr_r = kr * r;
+                        const double ki_r = ki * r;
+                        const double decay = exp(-ki_r);
+                        const double phase_re = decay * cos(kr_r);
+                        const double phase_im = decay * sin(kr_r);
+
+                        part_s_re += (phase_re - 1.0) * g_weight;
+                        part_s_im += phase_im * g_weight;
+
+                        const double factor_re = -ki_r - 1.0;
+                        const double factor_im = kr_r;
+                        const double expr_re =
+                            phase_re * factor_re - phase_im * factor_im + 1.0;
+                        const double expr_im =
+                            phase_re * factor_im + phase_im * factor_re;
+                        part_h_re += expr_re * h_weight;
+                        part_h_im += expr_im * h_weight;
+                    }
+                }
+                s_re += part_s_re;
+                s_im += part_s_im;
+                h_re += part_h_re;
+                h_im += part_h_im;
+            }
+
+            const int64_t out_idx = 2 * (i * ns + j);
+            out_s[out_idx] = s_re;
+            out_s[out_idx + 1] = s_im;
+            out_h[out_idx] = h_re;
+            out_h[out_idx + 1] = h_im;
+        }
+    }
+}
+
+static void *eval_far_onthefly_worker(void *raw) {
+    const FarOntheflyThreadTask *thread_task =
+        (const FarOntheflyThreadTask *)raw;
+    eval_far_onthefly_range(thread_task->task, thread_task->start, thread_task->stop);
     return NULL;
 }
 
@@ -1789,6 +1878,107 @@ int circsym_eval_far_remainder(
     return 0;
 }
 
+int circsym_eval_far_remainder_onthefly(
+    int64_t nt,
+    int64_t ns,
+    int64_t nl,
+    int64_t np,
+    const double *target_rho,
+    const double *target_z,
+    const double *source_rho,
+    const double *source_z,
+    const double *measure,
+    const double *normal_rho,
+    const double *normal_z,
+    const double *cos_psi,
+    const double *psi_weights,
+    int32_t has_baffle,
+    double baffle_z,
+    double kr,
+    double ki,
+    double *out_s,
+    double *out_h,
+    int32_t requested_threads
+) {
+    if (nt < 0 || ns < 0 || nl < 0 || np < 0 ||
+        target_rho == NULL || target_z == NULL ||
+        source_rho == NULL || source_z == NULL || measure == NULL ||
+        normal_rho == NULL || normal_z == NULL ||
+        cos_psi == NULL || psi_weights == NULL ||
+        out_s == NULL || out_h == NULL) {
+        return -1;
+    }
+
+    FarOntheflyTask task;
+    task.nt = nt;
+    task.ns = ns;
+    task.nl = nl;
+    task.np = np;
+    task.target_rho = target_rho;
+    task.target_z = target_z;
+    task.source_rho = source_rho;
+    task.source_z = source_z;
+    task.measure = measure;
+    task.normal_rho = normal_rho;
+    task.normal_z = normal_z;
+    task.cos_psi = cos_psi;
+    task.psi_weights = psi_weights;
+    task.has_baffle = has_baffle;
+    task.baffle_z = baffle_z;
+    task.kr = kr;
+    task.ki = ki;
+    task.out_s = out_s;
+    task.out_h = out_h;
+
+    int32_t threads = requested_threads;
+    if (threads < 1) {
+        threads = 1;
+    }
+    if ((int64_t)threads > nt) {
+        threads = (int32_t)nt;
+    }
+    if (threads <= 1 || nt <= 1) {
+        eval_far_onthefly_range(&task, 0, nt);
+        return 0;
+    }
+
+    pthread_t *handles = (pthread_t *)malloc((size_t)threads * sizeof(pthread_t));
+    FarOntheflyThreadTask *thread_tasks = (FarOntheflyThreadTask *)malloc(
+        (size_t)threads * sizeof(FarOntheflyThreadTask)
+    );
+    if (handles == NULL || thread_tasks == NULL) {
+        free(handles);
+        free(thread_tasks);
+        eval_far_onthefly_range(&task, 0, nt);
+        return 0;
+    }
+
+    int32_t created = 0;
+    for (int32_t t = 0; t < threads; ++t) {
+        const int64_t start = (nt * (int64_t)t) / (int64_t)threads;
+        const int64_t stop = (nt * (int64_t)(t + 1)) / (int64_t)threads;
+        thread_tasks[t].task = &task;
+        thread_tasks[t].start = start;
+        thread_tasks[t].stop = stop;
+        if (pthread_create(
+                &handles[t], NULL, eval_far_onthefly_worker, &thread_tasks[t]
+            ) != 0) {
+            break;
+        }
+        created += 1;
+    }
+
+    for (int32_t t = 0; t < created; ++t) {
+        pthread_join(handles[t], NULL);
+    }
+    if (created != threads) {
+        eval_far_onthefly_range(&task, 0, nt);
+    }
+    free(handles);
+    free(thread_tasks);
+    return 0;
+}
+
 int circsym_eval_near_remainder(
     int64_t pair_count,
     int64_t node_count,
@@ -1888,6 +2078,30 @@ class _CircsymRemainderCKernel:
             ctypes.c_int32,
         ]
         self.eval_far.restype = ctypes.c_int
+        self.eval_far_onthefly = self.library.circsym_eval_far_remainder_onthefly
+        self.eval_far_onthefly.argtypes = [
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            double_ptr,
+            double_ptr,
+            double_ptr,
+            double_ptr,
+            double_ptr,
+            double_ptr,
+            double_ptr,
+            double_ptr,
+            double_ptr,
+            ctypes.c_int32,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_double,
+            double_ptr,
+            double_ptr,
+            ctypes.c_int32,
+        ]
+        self.eval_far_onthefly.restype = ctypes.c_int
         self.eval_near.argtypes = [
             ctypes.c_int64,
             ctypes.c_int64,
@@ -1981,6 +2195,60 @@ def _evaluate_far_remainder_compiled(
     return s_out, h_out
 
 
+def _evaluate_far_remainder_onthefly_compiled(
+    kernel: _CircsymRemainderCKernel,
+    part: _FarRemainderCompactGeometry,
+    k: complex,
+    *,
+    workers: int,
+) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    target_rho = np.ascontiguousarray(part.target_rho, dtype=np.float64)
+    target_z = np.ascontiguousarray(part.target_z, dtype=np.float64)
+    source_rho = np.ascontiguousarray(part.source_rho, dtype=np.float64)
+    source_z = np.ascontiguousarray(part.source_z, dtype=np.float64)
+    measure = np.ascontiguousarray(part.measure, dtype=np.float64)
+    normal_rho = np.ascontiguousarray(part.normal_rho, dtype=np.float64)
+    normal_z = np.ascontiguousarray(part.normal_z, dtype=np.float64)
+    cos_psi = np.ascontiguousarray(part.cos_psi, dtype=np.float64)
+    psi_weights = np.ascontiguousarray(part.psi_weights, dtype=np.float64)
+    target_count = int(target_rho.size)
+    source_count, line_count = source_rho.shape
+    psi_count = int(cos_psi.size)
+    s_out = np.empty((target_count, source_count), dtype=np.complex128)
+    h_out = np.empty_like(s_out)
+    double_ptr = ctypes.POINTER(ctypes.c_double)
+    k_value = complex(k)
+    status = kernel.eval_far_onthefly(
+        ctypes.c_int64(target_count),
+        ctypes.c_int64(source_count),
+        ctypes.c_int64(line_count),
+        ctypes.c_int64(psi_count),
+        target_rho.ctypes.data_as(double_ptr),
+        target_z.ctypes.data_as(double_ptr),
+        source_rho.ctypes.data_as(double_ptr),
+        source_z.ctypes.data_as(double_ptr),
+        measure.ctypes.data_as(double_ptr),
+        normal_rho.ctypes.data_as(double_ptr),
+        normal_z.ctypes.data_as(double_ptr),
+        cos_psi.ctypes.data_as(double_ptr),
+        psi_weights.ctypes.data_as(double_ptr),
+        ctypes.c_int32(part.baffle_z is not None),
+        ctypes.c_double(0.0 if part.baffle_z is None else float(part.baffle_z)),
+        ctypes.c_double(float(k_value.real)),
+        ctypes.c_double(float(k_value.imag)),
+        s_out.ctypes.data_as(double_ptr),
+        h_out.ctypes.data_as(double_ptr),
+        ctypes.c_int32(max(1, int(workers))),
+    )
+    if int(status) != 0:
+        return _evaluate_far_remainder_onthefly_reference(
+            part,
+            k,
+            workers=workers,
+        )
+    return s_out, h_out
+
+
 def _evaluate_near_remainder_compiled(
     kernel: _CircsymRemainderCKernel,
     part: _NearRemainderGeometry,
@@ -2038,6 +2306,55 @@ def _evaluate_far_remainder_block(
         np.asarray(s_rem, dtype=np.complex128),
         np.asarray(h_rem, dtype=np.complex128),
     )
+
+
+def _evaluate_far_remainder_onthefly_reference(
+    part: _FarRemainderCompactGeometry,
+    k: complex,
+    *,
+    workers: int,
+) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    target_count = int(part.target_rho.size)
+    source_count = int(part.source_rho.shape[0])
+    psi_count = int(part.cos_psi.size)
+    s_out = np.empty((target_count, source_count), dtype=np.complex128)
+    h_out = np.empty_like(s_out)
+    block_size = _assembly_target_block_size(source_count, psi_count)
+    if workers > 1:
+        block_size = min(block_size, _ASSEMBLY_KERNEL_PARALLEL_TARGET_BLOCK)
+    ranges = [
+        (start, min(target_count, start + block_size))
+        for start in range(0, target_count, block_size)
+    ]
+
+    def compute_block(
+        span: tuple[int, int],
+    ) -> tuple[int, int, NDArray[np.complex128], NDArray[np.complex128]]:
+        start, stop = span
+        s_block = np.zeros((stop - start, source_count), dtype=np.complex128)
+        h_block = np.zeros_like(s_block)
+        for expanded in _expand_far_remainder_geometry_parts(part, start, stop):
+            s_part, h_part = _evaluate_far_remainder_block(
+                expanded,
+                k,
+                0,
+                stop - start,
+            )
+            s_block += s_part
+            h_block += h_part
+        return start, stop, s_block, h_block
+
+    if workers <= 1 or len(ranges) <= 1:
+        blocks = map(compute_block, ranges)
+        for start, stop, s_block, h_block in blocks:
+            s_out[start:stop] = s_block
+            h_out[start:stop] = h_block
+    else:
+        with ThreadPoolExecutor(max_workers=min(workers, len(ranges))) as executor:
+            for start, stop, s_block, h_block in executor.map(compute_block, ranges):
+                s_out[start:stop] = s_block
+                h_out[start:stop] = h_block
+    return s_out, h_out
 
 
 def _evaluate_near_remainder(
@@ -2234,6 +2551,38 @@ def _integrate_static_segment_kernel(
     return complex(np.sum(g * measure)), complex(np.sum(h * measure))
 
 
+def _build_far_remainder_compact_geometry(
+    meridian: MeridianMesh,
+    geom: SimpleNamespace,
+    baffle_z: float | None,
+    *,
+    n_psi: int,
+) -> _FarRemainderCompactGeometry:
+    u, w = _ordinary_interval(0.0, 1.0)
+    psi, psi_weights = _leggauss_psi(int(n_psi))
+    p0 = geom.p0
+    delta = geom.delta
+    lengths = geom.lengths
+    source = p0[:, None, :] + u[None, :, None] * delta[:, None, :]
+    rho_s = source[:, :, 0]
+    z_s = source[:, :, 1]
+    measure = rho_s * lengths[:, None] * w[None, :]
+    normal_rho = meridian.normals[:, 0]
+    normal_z = meridian.normals[:, 1]
+    return _FarRemainderCompactGeometry(
+        target_rho=np.ascontiguousarray(geom.rho_mid, dtype=np.float64),
+        target_z=np.ascontiguousarray(geom.z_mid, dtype=np.float64),
+        source_rho=np.ascontiguousarray(rho_s, dtype=np.float64),
+        source_z=np.ascontiguousarray(z_s, dtype=np.float64),
+        measure=np.ascontiguousarray(measure, dtype=np.float64),
+        normal_rho=np.ascontiguousarray(normal_rho, dtype=np.float64),
+        normal_z=np.ascontiguousarray(normal_z, dtype=np.float64),
+        cos_psi=np.ascontiguousarray(np.cos(psi), dtype=np.float64),
+        psi_weights=np.ascontiguousarray(psi_weights, dtype=np.float64),
+        baffle_z=None if baffle_z is None else float(baffle_z),
+    )
+
+
 def _build_far_remainder_geometry_parts(
     meridian: MeridianMesh,
     geom: SimpleNamespace,
@@ -2282,6 +2631,43 @@ def _build_far_remainder_geometry_parts(
     return tuple(parts)
 
 
+def _expand_far_remainder_geometry_parts(
+    compact: _FarRemainderCompactGeometry,
+    start: int,
+    stop: int,
+) -> tuple[_FarRemainderGeometry, ...]:
+    target_rho = compact.target_rho[int(start) : int(stop)]
+    target_z = compact.target_z[int(start) : int(stop)]
+    parts = [
+        _build_far_remainder_geometry_from_cos(
+            target_rho,
+            target_z,
+            compact.source_rho,
+            compact.source_z,
+            compact.measure,
+            compact.normal_rho,
+            compact.normal_z,
+            compact.cos_psi,
+            compact.psi_weights,
+        )
+    ]
+    if compact.baffle_z is not None:
+        parts.append(
+            _build_far_remainder_geometry_from_cos(
+                target_rho,
+                target_z,
+                compact.source_rho,
+                2.0 * float(compact.baffle_z) - compact.source_z,
+                compact.measure,
+                compact.normal_rho,
+                -compact.normal_z,
+                compact.cos_psi,
+                compact.psi_weights,
+            )
+        )
+    return tuple(parts)
+
+
 def _build_far_remainder_geometry(
     target_rho: NDArray[np.float64],
     target_z: NDArray[np.float64],
@@ -2293,13 +2679,37 @@ def _build_far_remainder_geometry(
     psi: NDArray[np.float64],
     psi_weights: NDArray[np.float64],
 ) -> _FarRemainderGeometry:
+    return _build_far_remainder_geometry_from_cos(
+        target_rho,
+        target_z,
+        rho_s,
+        z_s,
+        measure,
+        normal_rho,
+        normal_z,
+        np.cos(psi),
+        psi_weights,
+    )
+
+
+def _build_far_remainder_geometry_from_cos(
+    target_rho: NDArray[np.float64],
+    target_z: NDArray[np.float64],
+    rho_s: NDArray[np.float64],
+    z_s: NDArray[np.float64],
+    measure: NDArray[np.float64],
+    normal_rho: NDArray[np.float64],
+    normal_z: NDArray[np.float64],
+    cos_psi_values: NDArray[np.float64],
+    psi_weights: NDArray[np.float64],
+) -> _FarRemainderGeometry:
     n_target = int(target_rho.shape[0])
     n_source, n_line = rho_s.shape
-    n_psi = int(psi.shape[0])
+    n_psi = int(cos_psi_values.shape[0])
     R_out = np.empty((n_target, n_source, n_line, n_psi), dtype=np.float64)
     g_weight = np.empty_like(R_out)
     h_weight = np.empty_like(R_out)
-    cos_psi = np.cos(psi)[None, None, None, :]
+    cos_psi = np.asarray(cos_psi_values, dtype=np.float64).reshape(1, 1, 1, -1)
     rs = rho_s[None, :, :, None]
     zs = z_s[None, :, :, None]
     nr = np.asarray(normal_rho, dtype=np.float64).reshape(1, -1, 1, 1)
