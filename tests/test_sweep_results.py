@@ -247,3 +247,55 @@ def test_chief_points_deep_interior_do_not_warn(caplog):
             mesh, np.array([[5.0, 5.0, 5.0]]), max_edge_m=float(np.sqrt(2.0))
         )
     assert not caplog.records
+
+
+def _sphere_test_frame():
+    from hornlab_metal_bem.observation import ObservationFrame
+
+    return ObservationFrame(
+        axis=np.array([0.0, 0.0, 1.0]),
+        origin=np.array([0.0, 0.0, 0.0]),
+        u=np.array([1.0, 0.0, 0.0]),
+        v=np.array([0.0, 1.0, 0.0]),
+        mouth_center=np.array([0.0, 0.0, 1.0]),
+        source_center=np.array([0.0, 0.0, 0.0]),
+    )
+
+
+def test_resolve_sphere_observation_passthrough_grid_and_none():
+    from hornlab_metal_bem.config import ObservationConfig
+
+    frame = _sphere_test_frame()
+
+    explicit = ObservationConfig(sphere_points=np.ones((4, 3)))
+    points, theta, phi = sweep._resolve_sphere_observation(frame, explicit)
+    assert points.shape == (4, 3)
+    assert theta is None and phi is None
+
+    grid = ObservationConfig(distance_m=2.0, sphere_grid=(3, 4))
+    points, theta, phi = sweep._resolve_sphere_observation(frame, grid)
+    assert points.shape == (12, 3)
+    assert theta.shape == (12,) and phi.shape == (12,)
+    np.testing.assert_allclose(np.linalg.norm(points, axis=1), 2.0, atol=1e-12)
+
+    disabled = ObservationConfig()
+    assert sweep._resolve_sphere_observation(frame, disabled) == (None, None, None)
+
+
+def test_sphere_pressure_from_log_stacks_and_guards():
+    rows = [
+        {"observation_sphere_pressure_complex": np.arange(3, dtype=np.complex128)},
+        {"observation_sphere_pressure_complex": np.arange(3, dtype=np.complex128) + 1j},
+    ]
+    stacked = sweep._sphere_pressure_from_log(rows, n_sphere=3)
+    assert stacked.shape == (2, 3)
+    assert stacked.dtype == np.complex128
+
+    assert sweep._sphere_pressure_from_log(rows, n_sphere=0) is None
+    assert sweep._sphere_pressure_from_log([], n_sphere=3) is None
+    assert (
+        sweep._sphere_pressure_from_log(
+            rows + [{"observation_sphere_pressure_complex": None}], n_sphere=3
+        )
+        is None
+    )

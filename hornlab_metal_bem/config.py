@@ -123,6 +123,18 @@ class ObservationConfig:
     # no shape change to the arc outputs).
     sphere_points: NDArray[np.float64] | None = None
 
+    # Frame-relative balloon grid as (n_theta, n_phi). Unlike ``sphere_points``
+    # (absolute mesh coordinates), the grid is built inside the solve from the
+    # inferred observation frame: theta measured from the frame axis, phi
+    # around it with phi=0 along the horizontal (u) direction, radius =
+    # ``distance_m``, centred on the observation origin. Theta spans
+    # [0, sphere_theta_max_deg] inclusive (90 for half-space balloons); phi
+    # spans [0, 360) without the wrap duplicate; ordering is theta-major.
+    # Per-frequency pressure lands in ``observation_sphere_pressure_complex``
+    # and first-class on SolveResult (sphere_pressure_complex + theta/phi).
+    sphere_grid: tuple[int, int] | None = None
+    sphere_theta_max_deg: float = 180.0
+
     def __post_init__(self) -> None:
         if not self.planes:
             raise ValueError("observation planes must not be empty")
@@ -142,6 +154,25 @@ class ObservationConfig:
                 raise ValueError("sphere_points must be non-empty when set")
             if not _np.all(_np.isfinite(pts)):
                 raise ValueError("sphere_points must be finite")
+        if self.sphere_grid is not None:
+            if self.sphere_points is not None:
+                raise ValueError(
+                    "sphere_grid and sphere_points are mutually exclusive; "
+                    "pass explicit coordinates OR a frame-relative grid"
+                )
+            grid = tuple(self.sphere_grid)
+            if len(grid) != 2:
+                raise ValueError("sphere_grid must be (n_theta, n_phi)")
+            n_theta, n_phi = (int(grid[0]), int(grid[1]))
+            if n_theta < 2:
+                raise ValueError("sphere_grid n_theta must be at least 2")
+            if n_phi < 3:
+                raise ValueError("sphere_grid n_phi must be at least 3")
+            if n_theta * n_phi > 100_000:
+                raise ValueError("sphere_grid is too dense (n_theta*n_phi > 100000)")
+            self.sphere_grid = (n_theta, n_phi)
+        if not (0.0 < float(self.sphere_theta_max_deg) <= 180.0):
+            raise ValueError("sphere_theta_max_deg must be in (0, 180]")
 
 
 @dataclass

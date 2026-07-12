@@ -311,3 +311,44 @@ def build_observation_points(
 
     points = np.stack(plane_points, axis=0)  # (P, N_angles, 3)
     return points, angles_deg
+
+
+def build_sphere_grid_points(
+    frame: ObservationFrame,
+    config: ObservationConfig,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    """Build the frame-relative balloon grid requested by ``sphere_grid``.
+
+    theta is the polar angle from ``frame.axis`` (0 = on-axis, matching the
+    polar arcs), phi rotates around the axis with phi=0 along ``frame.u``
+    (horizontal) and phi=90 along ``frame.v`` (vertical), so the grid's
+    phi=0/180 meridian coincides with the horizontal arc and phi=90/270 with
+    the vertical arc. Points sit at ``distance_m`` from ``frame.origin``.
+
+    Returns:
+        points: (n_theta * n_phi, 3) absolute coordinates, theta-major
+        theta_deg: (n_theta * n_phi,) polar angle per point
+        phi_deg: (n_theta * n_phi,) azimuth per point in [0, 360)
+    """
+    if config.sphere_grid is None:
+        raise ValueError("build_sphere_grid_points requires sphere_grid to be set")
+    n_theta, n_phi = config.sphere_grid
+    theta_deg = np.linspace(0.0, float(config.sphere_theta_max_deg), int(n_theta))
+    phi_deg = np.arange(int(n_phi), dtype=np.float64) * (360.0 / int(n_phi))
+
+    theta_grid, phi_grid = np.meshgrid(theta_deg, phi_deg, indexing="ij")
+    theta_rad = np.deg2rad(theta_grid.reshape(-1))
+    phi_rad = np.deg2rad(phi_grid.reshape(-1))
+
+    sin_theta = np.sin(theta_rad)
+    directions = (
+        (sin_theta * np.cos(phi_rad))[:, None] * frame.u[None, :]
+        + (sin_theta * np.sin(phi_rad))[:, None] * frame.v[None, :]
+        + np.cos(theta_rad)[:, None] * frame.axis[None, :]
+    )
+    points = frame.origin[None, :] + config.distance_m * directions
+    return (
+        np.ascontiguousarray(points, dtype=np.float64),
+        np.rad2deg(theta_rad),
+        np.rad2deg(phi_rad),
+    )

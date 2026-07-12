@@ -26,7 +26,7 @@ from .config import (
     SolveConfig,
 )
 from .mesh import LoadedMesh, make_pure_function_spaces
-from .observation import ObservationFrame, build_observation_points
+from .observation import ObservationFrame, build_observation_points, build_sphere_grid_points
 from .result import SolveResult
 
 logger = logging.getLogger(__name__)
@@ -310,6 +310,42 @@ def _append_sphere_field_points(
         np.asarray(sphere_points, dtype=np.float64).T, dtype=np.float32
     )
     return np.concatenate([field_points, sphere_3xn], axis=1), int(sphere_3xn.shape[1])
+
+
+def _resolve_sphere_observation(
+    frame: ObservationFrame,
+    observation,
+) -> tuple[
+    NDArray[np.float64] | None,
+    NDArray[np.float64] | None,
+    NDArray[np.float64] | None,
+]:
+    """Resolve the sphere observation request to concrete points.
+
+    Explicit ``sphere_points`` pass through unchanged (absolute coordinates,
+    caller-owned theta/phi metadata); a ``sphere_grid`` is built here from the
+    inferred observation frame so the balloon stays aligned with the polar
+    arcs. Returns ``(points, theta_deg, phi_deg)`` — all None when no sphere
+    sampling was requested.
+    """
+    if observation.sphere_points is not None:
+        return np.asarray(observation.sphere_points, dtype=np.float64), None, None
+    if observation.sphere_grid is not None:
+        return build_sphere_grid_points(frame, observation)
+    return None, None, None
+
+
+def _sphere_pressure_from_log(
+    solver_log: list[dict],
+    n_sphere: int,
+) -> NDArray[np.complex128] | None:
+    """Stack per-frequency sphere pressure rows recorded in the solver log."""
+    if not n_sphere or not solver_log:
+        return None
+    rows = [entry.get("observation_sphere_pressure_complex") for entry in solver_log]
+    if any(row is None for row in rows):
+        return None
+    return np.stack([np.asarray(row, dtype=np.complex128) for row in rows], axis=0)
 
 
 def _mesh_vertices_elements(
@@ -701,8 +737,11 @@ def run_sweep_native_metal(
     on_axis_idx = int(np.argmin(np.abs(angles_deg)))
     impedance_source_tag = min(config.velocity_sources.keys(), default=2)
     n_planes, n_angles, _ = obs_points.shape
+    sphere_points_arr, sphere_theta_deg, sphere_phi_deg = _resolve_sphere_observation(
+        frame, config.observation
+    )
     field_points, n_sphere = _append_sphere_field_points(
-        _field_points_3xn(obs_points), config.observation.sphere_points
+        _field_points_3xn(obs_points), sphere_points_arr
     )
 
     with MetalNativeStandardSession.create_session(
@@ -923,6 +962,10 @@ def run_sweep_native_metal(
             else None
         ),
         native_diagnostics=native_diagnostics_rows,
+        sphere_pressure_complex=_sphere_pressure_from_log(solver_log, n_sphere),
+        sphere_points=sphere_points_arr,
+        sphere_theta_deg=sphere_theta_deg,
+        sphere_phi_deg=sphere_phi_deg,
     )
 
 
@@ -1082,8 +1125,11 @@ def run_sweep_native_metal_multi_source(
     completed_freqs: list[list[float]] = [[] for _ in range(n_sources)]
     on_axis_idx = int(np.argmin(np.abs(angles_deg)))
     n_planes, n_angles, _ = obs_points.shape
+    sphere_points_arr, sphere_theta_deg, sphere_phi_deg = _resolve_sphere_observation(
+        frame, config.observation
+    )
     field_points, n_sphere = _append_sphere_field_points(
-        _field_points_3xn(obs_points), config.observation.sphere_points
+        _field_points_3xn(obs_points), sphere_points_arr
     )
 
     freq_values = np.asarray(frequencies, dtype=np.float64)
@@ -1296,6 +1342,12 @@ def run_sweep_native_metal_multi_source(
                     else None
                 ),
                 native_diagnostics=native_diagnostics_rows[source_index],
+                sphere_pressure_complex=_sphere_pressure_from_log(
+                    solver_log, n_sphere
+                ),
+                sphere_points=sphere_points_arr,
+                sphere_theta_deg=sphere_theta_deg,
+                sphere_phi_deg=sphere_phi_deg,
             )
         )
     return results

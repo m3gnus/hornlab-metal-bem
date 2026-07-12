@@ -58,6 +58,18 @@ class SolveResult:
     # Native helper per-frequency diagnostics and resident batch metadata.
     native_diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
+    # Balloon/sphere observation block, populated when ObservationConfig
+    # requested sphere sampling. sphere_pressure_complex is (F, M) complex
+    # pressure at the M sphere points evaluated from the same solved system
+    # as the polar arcs; sphere_points is (M, 3) absolute coordinates.
+    # theta/phi are (M,) degrees relative to the observation frame and are
+    # set only for frame-relative ``sphere_grid`` requests — explicit
+    # ``sphere_points`` callers own their angular metadata.
+    sphere_pressure_complex: NDArray[np.complex128] | None = None
+    sphere_points: NDArray[np.float64] | None = None
+    sphere_theta_deg: NDArray[np.float64] | None = None
+    sphere_phi_deg: NDArray[np.float64] | None = None
+
     @property
     def spl_norm_db(self) -> NDArray[np.float64]:
         """Alias for normalized directivity in dB."""

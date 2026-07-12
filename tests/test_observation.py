@@ -14,6 +14,7 @@ from hornlab_metal_bem.config import ObservationConfig
 from hornlab_metal_bem.observation import (
     ObservationFrame,
     build_observation_points,
+    build_sphere_grid_points,
     infer_frame,
 )
 
@@ -569,3 +570,92 @@ class TestInferFrameSymmetryReduced:
         frame = infer_frame(grid, tags, source_tag=2)
 
         np.testing.assert_allclose(frame.axis, [0.0, 0.0, 1.0], atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Sphere grid (balloon) observation
+# ---------------------------------------------------------------------------
+
+class TestSphereGridConfig:
+    def test_rejects_sphere_grid_with_sphere_points(self):
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            ObservationConfig(sphere_points=np.ones((5, 3)), sphere_grid=(4, 8))
+
+    @pytest.mark.parametrize("bad", [(1, 8), (4, 2), (4,), (4, 8, 2), (400, 400)])
+    def test_rejects_bad_sphere_grid(self, bad):
+        with pytest.raises(ValueError, match="sphere_grid"):
+            ObservationConfig(sphere_grid=bad)
+
+    @pytest.mark.parametrize("bad", [0.0, -10.0, 180.5])
+    def test_rejects_bad_sphere_theta_max(self, bad):
+        with pytest.raises(ValueError, match="sphere_theta_max_deg"):
+            ObservationConfig(sphere_theta_max_deg=bad)
+
+    def test_normalizes_grid_counts_to_ints(self):
+        cfg = ObservationConfig(sphere_grid=(4.0, 8.0))
+        assert cfg.sphere_grid == (4, 8)
+
+
+class TestBuildSphereGridPoints:
+    def test_requires_sphere_grid(self):
+        frame = _make_frame()
+        with pytest.raises(ValueError, match="sphere_grid"):
+            build_sphere_grid_points(frame, ObservationConfig())
+
+    def test_full_sphere_geometry_and_ordering(self):
+        frame = _make_frame()
+        cfg = ObservationConfig(distance_m=2.0, sphere_grid=(5, 8))
+        points, theta_deg, phi_deg = build_sphere_grid_points(frame, cfg)
+
+        assert points.shape == (40, 3)
+        assert theta_deg.shape == (40,)
+        assert phi_deg.shape == (40,)
+
+        # All points on the sphere of radius distance_m about the origin.
+        np.testing.assert_allclose(
+            np.linalg.norm(points - frame.origin, axis=1), 2.0, atol=1e-12
+        )
+
+        # Theta-major ordering: first n_phi rows are the theta=0 pole.
+        np.testing.assert_allclose(theta_deg[:8], 0.0, atol=1e-12)
+        np.testing.assert_allclose(phi_deg[:8], np.arange(8) * 45.0, atol=1e-12)
+        np.testing.assert_allclose(points[:8], [[0.0, 0.0, 2.0]] * 8, atol=1e-12)
+
+        # theta=90, phi=0 lies on the horizontal (u) axis; phi=90 on vertical.
+        idx_h = 2 * 8 + 0
+        idx_v = 2 * 8 + 2
+        np.testing.assert_allclose(points[idx_h], [2.0, 0.0, 0.0], atol=1e-12)
+        np.testing.assert_allclose(points[idx_v], [0.0, 2.0, 0.0], atol=1e-12)
+
+        # Rear pole.
+        np.testing.assert_allclose(points[-1], [0.0, 0.0, -2.0], atol=1e-12)
+
+    def test_hemisphere_and_offset_origin(self):
+        origin = np.array([1.0, -2.0, 3.0])
+        frame = _make_frame(origin=origin)
+        cfg = ObservationConfig(
+            distance_m=1.5, sphere_grid=(4, 6), sphere_theta_max_deg=90.0
+        )
+        points, theta_deg, phi_deg = build_sphere_grid_points(frame, cfg)
+
+        assert theta_deg.max() == pytest.approx(90.0)
+        np.testing.assert_allclose(
+            np.linalg.norm(points - origin, axis=1), 1.5, atol=1e-12
+        )
+        # Frame axis is +z: a hemisphere grid never dips below the origin plane.
+        assert np.all(points[:, 2] >= origin[2] - 1e-9)
+
+    def test_rotated_frame_alignment(self):
+        frame = _make_frame(
+            axis=np.array([0.0, 1.0, 0.0]),
+            u=np.array([0.0, 0.0, 1.0]),
+            v=np.array([1.0, 0.0, 0.0]),
+        )
+        cfg = ObservationConfig(distance_m=2.0, sphere_grid=(3, 4))
+        points, theta_deg, _ = build_sphere_grid_points(frame, cfg)
+
+        # theta=0 follows the frame axis (+y), theta=90/phi=0 follows u (+z).
+        np.testing.assert_allclose(points[0], [0.0, 2.0, 0.0], atol=1e-12)
+        idx_h = 1 * 4 + 0
+        assert theta_deg[idx_h] == pytest.approx(90.0)
+        np.testing.assert_allclose(points[idx_h], [0.0, 0.0, 2.0], atol=1e-12)

@@ -46,6 +46,8 @@ from .sweep import (
     _build_frequency_grid,
     _directivity_from_pressure,
     _impedance_sources_for_frequencies,
+    _resolve_sphere_observation,
+    _sphere_pressure_from_log,
 )
 
 logger = logging.getLogger(__name__)
@@ -244,6 +246,10 @@ def run_sweep_circsym(
     geom = meridian.segment_geometry()
     frame = _infer_circsym_frame(meridian, config)
     obs_points, angles_deg = build_observation_points(frame, config.observation)
+    sphere_points_arr, sphere_theta_deg, sphere_phi_deg = _resolve_sphere_observation(
+        frame, config.observation
+    )
+    n_sphere = 0 if sphere_points_arr is None else int(sphere_points_arr.shape[0])
     source_tags = list(config.velocity_sources.keys())
     source_scale = _build_source_segment_scale(meridian, config, frame)
     impedance_sources_arg = _impedance_sources_for_frequencies(
@@ -386,13 +392,13 @@ def run_sweep_circsym(
                 meridian,
                 pressure,
                 q_total,
-                np.asarray(config.observation.sphere_points, dtype=np.float64),
+                sphere_points_arr,
                 k_field,
                 config.circsym_baffle_z,
                 geom=geom,
                 n_psi=n_psi,
             )
-            if config.observation.sphere_points is not None
+            if sphere_points_arr is not None
             else None
         )
         field_s = time.time() - t_field
@@ -500,6 +506,10 @@ def run_sweep_circsym(
             else None
         ),
         native_diagnostics=native_diagnostics,
+        sphere_pressure_complex=_sphere_pressure_from_log(solver_log, n_sphere),
+        sphere_points=sphere_points_arr,
+        sphere_theta_deg=sphere_theta_deg,
+        sphere_phi_deg=sphere_phi_deg,
     )
 
 
@@ -572,6 +582,10 @@ def run_sweep_coupled_ib(
         raise ValueError("velocity_sources throat area must be positive")
 
     obs_points, angles_deg = build_observation_points(frame, config.observation)
+    sphere_points_arr, sphere_theta_deg, sphere_phi_deg = _resolve_sphere_observation(
+        frame, config.observation
+    )
+    n_sphere = 0 if sphere_points_arr is None else int(sphere_points_arr.shape[0])
 
     n_planes, n_angles, _ = obs_points.shape
     on_axis_idx = int(np.argmin(np.abs(angles_deg)))
@@ -708,16 +722,12 @@ def run_sweep_coupled_ib(
         field_pressure = flat_pressure.reshape(n_planes, n_angles)
 
         sphere_pressure = None
-        if config.observation.sphere_points is not None:
-            sphere_points = np.asarray(
-                config.observation.sphere_points,
-                dtype=np.float64,
-            )
+        if sphere_points_arr is not None:
             sphere_pressure = _evaluate_coupled_ib_points_pressure(
                 meridian,
                 q_a,
                 idx_a,
-                sphere_points,
+                sphere_points_arr,
                 k_field,
                 geom=geom,
                 n_psi=n_psi,
@@ -817,6 +827,10 @@ def run_sweep_coupled_ib(
             else None
         ),
         native_diagnostics=native_diagnostics,
+        sphere_pressure_complex=_sphere_pressure_from_log(solver_log, n_sphere),
+        sphere_points=sphere_points_arr,
+        sphere_theta_deg=sphere_theta_deg,
+        sphere_phi_deg=sphere_phi_deg,
     )
 
 
