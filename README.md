@@ -22,6 +22,9 @@ on Windows.
 
 The solver uses a NumPy-only mesh/grid/function-space loader and does not
 depend on `bempp-cl`. There is no OpenCL/Bempp fallback path in this package.
+On Apple Silicon, the normal package build requires Swift from the Xcode
+command-line tools and compiles a release helper into the installed package,
+avoiding a slow first-use source compilation.
 
 ## Quick Start
 
@@ -239,6 +242,18 @@ python -m pip install -e ".[dev]"
 python scripts/build_metal_native_release.py --require-metallib
 python -m pytest tests/test_config.py tests/test_hornlab_metal_bem_namespace.py tests/test_metal_native.py -q
 ```
+
+Cross-repository parity tests import their dependencies from the active Python
+environment and never reach into sibling checkouts. Install the public
+packages when running that coverage:
+
+```bash
+python -m pip install \
+  "hornlab-waveguide-mesher @ git+https://github.com/m3gnus/hornlab-waveguide-mesher.git" \
+  "hornlab-bempp-bem @ git+https://github.com/m3gnus/hornlab-bempp-bem.git"
+```
+
+Those tests skip cleanly when their optional dependencies are not installed.
 
 ## Maintainer Docs
 

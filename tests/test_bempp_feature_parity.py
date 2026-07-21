@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import numpy as np
 import pytest
 
@@ -13,18 +10,12 @@ from hornlab_metal_bem.mesh import make_pure_grid
 from hornlab_metal_bem.result import MeshInfo as MetalMeshInfo
 
 
-_WORKSPACE = Path(__file__).resolve().parents[2]
-_BEMPP_REPO = _WORKSPACE / "hornlab-bempp-bem"
-
-
 def _require_bempp_and_native():
-    if str(_BEMPP_REPO) not in sys.path:
-        sys.path.insert(0, str(_BEMPP_REPO))
     try:
         import bempp_cl.api as bempp_api
         import hornlab_bempp_bem as bempp_bem
     except Exception as exc:  # pragma: no cover - environment dependent
-        pytest.skip(f"bempp parity dependencies unavailable: {exc}")
+        pytest.skip(f"installed Bempp parity dependencies unavailable: {exc}")
 
     from hornlab_metal_bem.metal import discover_native_runtime
 

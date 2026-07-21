@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -14,10 +13,6 @@ from hornlab_metal_bem.metal.geometry import (
     build_metal_geometry_buffers,
     validate_native_infinite_baffle_aperture,
 )
-
-MESHER_REPO = Path(__file__).resolve().parents[2] / "hornlab-waveguide-mesher"
-if MESHER_REPO.exists() and str(MESHER_REPO) not in sys.path:
-    sys.path.insert(0, str(MESHER_REPO))
 
 config_builder = pytest.importorskip("hornlab_mesher.config_builder")
 build_from_config = config_builder.build_from_config

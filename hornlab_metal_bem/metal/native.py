@@ -1936,7 +1936,11 @@ def _find_helper_executable(
         if candidate.is_file():
             if (
                 main_source.is_file()
-                and candidate.stat().st_mtime < main_source.stat().st_mtime
+                # Wheel installers extract files sequentially, so a packaged
+                # helper can appear fractionally older than its source even
+                # though both came from the same build. Reserve the warning
+                # for a meaningful timestamp gap.
+                and candidate.stat().st_mtime + 2.0 < main_source.stat().st_mtime
             ):
                 logger.warning(
                     "Native helper binary %s is older than %s; numeric changes "
