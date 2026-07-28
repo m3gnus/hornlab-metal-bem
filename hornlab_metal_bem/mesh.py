@@ -91,14 +91,53 @@ def load_mesh(
     if tri_key not in mesh.cells_dict:
         raise MeshError("No triangles found in mesh")
 
-    triangles = np.asarray(mesh.cells_dict[tri_key], dtype=np.int32)
     verts = np.asarray(mesh.points, dtype=np.float64) * scale
-    phys_tags = _extract_physical_tags(mesh, tri_key)
+    if verts.ndim != 2 or verts.shape[1] != 3 or verts.shape[0] == 0:
+        raise MeshError(
+            "Mesh points must have shape (n_vertices, 3) with at least one vertex"
+        )
+    if not np.all(np.isfinite(verts)):
+        raise MeshError("Mesh points must contain only finite coordinates")
+
+    raw_triangles = np.asarray(mesh.cells_dict[tri_key])
+    if (
+        raw_triangles.ndim != 2
+        or raw_triangles.shape[1] != 3
+        or raw_triangles.shape[0] == 0
+    ):
+        raise MeshError(
+            "Mesh triangles must have shape (n_triangles, 3) "
+            "with at least one triangle"
+        )
+    if not np.issubdtype(raw_triangles.dtype, np.integer):
+        raise MeshError("Mesh triangle indices must be integers")
+    min_index = int(raw_triangles.min())
+    max_index = int(raw_triangles.max())
+    if min_index < 0 or max_index >= len(verts):
+        raise MeshError(
+            "Mesh triangle indices must be zero-based and reference existing "
+            f"vertices; got range [{min_index}, {max_index}] for {len(verts)} vertices"
+        )
+    if max_index > np.iinfo(np.int32).max:
+        raise MeshError("Mesh triangle indices must fit int32")
+    triangles = np.ascontiguousarray(raw_triangles, dtype=np.int32)
+    phys_tags = _extract_physical_tags(
+        mesh,
+        tri_key,
+        n_triangles=len(triangles),
+    )
     phys_group_names = _extract_physical_names(path)
     for name, raw in getattr(mesh, "field_data", {}).items():
         values = np.asarray(raw).reshape(-1)
         if values.size >= 2 and int(values[1]) == 2:
             phys_group_names[int(values[0])] = str(name)
+
+    verts, triangles, unused_vertices = _compact_surface_vertices(verts, triangles)
+    if unused_vertices:
+        logger.info(
+            "Removed %d vertices unused by triangle surface cells",
+            unused_vertices,
+        )
 
     verts, triangles, merged_vertices = _merge_duplicate_vertices(
         verts, triangles, merge_tol,
@@ -112,11 +151,23 @@ def load_mesh(
         | (triangles[:, 1] == triangles[:, 2])
         | (triangles[:, 0] == triangles[:, 2])
     )
+    valid &= _triangle_areas(verts, triangles) > 0.0
     n_degen = np.sum(~valid)
     if n_degen > 0:
         logger.info("Removed %d degenerate triangles", n_degen)
         triangles = triangles[valid]
         phys_tags = phys_tags[valid]
+        if len(triangles) == 0:
+            raise MeshError("Mesh has no non-degenerate triangles")
+        verts, triangles, unused_vertices = _compact_surface_vertices(
+            verts,
+            triangles,
+        )
+        if unused_vertices:
+            logger.info(
+                "Removed %d vertices unused after degenerate triangle removal",
+                unused_vertices,
+            )
 
     coupled_ib_aperture_tag = _resolve_coupled_ib_aperture_tag(
         phys_tags,
@@ -365,11 +416,65 @@ def _triangle_areas(
     )
 
 
-def _extract_physical_tags(mesh, tri_key: str) -> NDArray[np.int32]:
-    for key, by_type in mesh.cell_data_dict.items():
-        if "physical" in key and tri_key in by_type:
-            return np.asarray(by_type[tri_key], dtype=np.int32)
-    raise MeshError("Mesh file has no triangle physical-group tags")
+def _extract_physical_tags(
+    mesh,
+    tri_key: str,
+    *,
+    n_triangles: int,
+) -> NDArray[np.int32]:
+    cell_data = mesh.cell_data_dict
+    candidates = [
+        (key, by_type[tri_key])
+        for key, by_type in cell_data.items()
+        if "physical" in str(key).lower() and tri_key in by_type
+    ]
+    preferred = [candidate for candidate in candidates if candidate[0] == "gmsh:physical"]
+    if preferred:
+        _key, raw_tags = preferred[0]
+    elif len(candidates) == 1:
+        _key, raw_tags = candidates[0]
+    elif len(candidates) > 1:
+        keys = sorted(str(key) for key, _tags in candidates)
+        raise MeshError(
+            "Mesh file has ambiguous triangle physical-group data: "
+            f"{keys}"
+        )
+    else:
+        raise MeshError("Mesh file has no triangle physical-group tags")
+
+    tags = np.asarray(raw_tags)
+    if tags.shape != (n_triangles,):
+        raise MeshError(
+            "Mesh must provide one physical-group tag per triangle: "
+            f"expected {(n_triangles,)}, got {tags.shape}"
+        )
+    if not np.issubdtype(tags.dtype, np.integer):
+        raise MeshError("Mesh physical-group tags must be integers")
+    min_tag = int(tags.min())
+    max_tag = int(tags.max())
+    int32 = np.iinfo(np.int32)
+    if min_tag < int32.min or max_tag > int32.max:
+        raise MeshError(
+            "Mesh physical-group tags must fit int32; "
+            f"got range [{min_tag}, {max_tag}]"
+        )
+    return np.ascontiguousarray(tags, dtype=np.int32)
+
+
+def _compact_surface_vertices(
+    verts: NDArray[np.float64],
+    tris: NDArray[np.int32],
+) -> tuple[NDArray[np.float64], NDArray[np.int32], int]:
+    """Drop vertices not referenced by surface triangles and remap connectivity."""
+    used_vertices, inverse = np.unique(tris, return_inverse=True)
+    if len(used_vertices) == len(verts):
+        return verts, tris, 0
+    compact_tris = inverse.reshape(tris.shape).astype(np.int32, copy=False)
+    return (
+        np.ascontiguousarray(verts[used_vertices], dtype=np.float64),
+        np.ascontiguousarray(compact_tris, dtype=np.int32),
+        len(verts) - len(used_vertices),
+    )
 
 
 def _extract_physical_names(path: Path) -> dict[int, str]:
