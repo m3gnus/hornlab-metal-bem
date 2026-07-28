@@ -7,6 +7,7 @@ import pytest
 
 from hornlab_metal_bem.metal.geometry import (
     MetalGeometryError,
+    _build_metal_geometry_buffers_with_max_edge,
     build_metal_geometry_buffers,
     validate_native_infinite_baffle_aperture,
 )
@@ -95,6 +96,34 @@ def test_build_metal_geometry_buffers_exports_scratch_shapes_and_dtypes():
             dtype=np.float32,
         ),
     )
+
+
+def test_build_metal_geometry_buffers_reuses_geometry_for_max_edge():
+    grid = _mock_grid()
+    grid.vertices[2, 1] = 9.0e-7
+    buffers, max_edge_m = _build_metal_geometry_buffers_with_max_edge(
+        grid,
+        np.array([1, 2], dtype=np.int64),
+        _mock_p1(),
+        _mock_dp0(),
+    )
+    reference = build_metal_geometry_buffers(
+        grid,
+        np.array([1, 2], dtype=np.int64),
+        _mock_p1(),
+        _mock_dp0(),
+    )
+
+    assert max_edge_m == np.sqrt(2.0 + (9.0e-7) ** 2)
+    for name in (
+        "vertices_3xn_f32",
+        "triangles_3xm_i32",
+        "physical_tags_i32",
+        "p1_local2global_i32",
+        "triangle_areas_f32",
+        "triangle_normals_3xm_f32",
+    ):
+        np.testing.assert_array_equal(getattr(buffers, name), getattr(reference, name))
 
 
 def test_build_metal_geometry_buffers_accepts_tag_column_vector():

@@ -182,24 +182,6 @@ def test_mesh_resolution_policy_marks_underresolved_frequency():
     assert diagnostics["mesh_resolution_suspect"] is True
 
 
-def test_mesh_max_edge_accepts_bempp_shaped_arrays():
-    mesh = SimpleNamespace(
-        grid=SimpleNamespace(
-            vertices=np.array(
-                [
-                    [0.0, 1.0, 0.0],
-                    [0.0, 0.0, 1.0],
-                    [0.0, 0.0, 0.0],
-                ],
-                dtype=np.float64,
-            ),
-            elements=np.array([[0], [1], [2]], dtype=np.int32),
-        )
-    )
-
-    np.testing.assert_allclose(sweep._mesh_max_edge_m(mesh), np.sqrt(2.0))
-
-
 def test_dense_solve_policy_marks_availability():
     checked = {"dense_solve_rcond": 1e-2}
     sweep._apply_dense_solve_policy(checked, threshold=1e-6)

@@ -365,21 +365,6 @@ def _mesh_vertices_elements(
     return vertices, elements
 
 
-def _mesh_max_edge_m(mesh: LoadedMesh) -> float:
-    vertices, elements = _mesh_vertices_elements(mesh)
-    if elements.size == 0:
-        return 0.0
-    p0 = vertices[elements[:, 0]]
-    p1 = vertices[elements[:, 1]]
-    p2 = vertices[elements[:, 2]]
-    max_edge = max(
-        float(np.max(np.linalg.norm(p1 - p0, axis=1))),
-        float(np.max(np.linalg.norm(p2 - p1, axis=1))),
-        float(np.max(np.linalg.norm(p0 - p2, axis=1))),
-    )
-    return max_edge
-
-
 def _warn_near_boundary_chief_points(
     mesh: LoadedMesh,
     chief_points: NDArray[np.float64],
@@ -676,7 +661,7 @@ def run_sweep_native_metal(
         )
 
     try:
-        from .metal.geometry import build_metal_geometry_buffers
+        from .metal.geometry import _build_metal_geometry_buffers_with_max_edge
         from .metal.native import MetalNativeStandardSession
     except Exception as exc:  # pragma: no cover - import/runtime specific.
         raise AssemblyBackendUnavailable(
@@ -691,13 +676,12 @@ def run_sweep_native_metal(
     t_total = time.time()
     obs_points, angles_deg = build_observation_points(frame, config.observation)
     p1_space, dp0_space = make_pure_function_spaces(mesh.grid)
-    geometry_buffers = build_metal_geometry_buffers(
+    geometry_buffers, mesh_max_edge_m = _build_metal_geometry_buffers_with_max_edge(
         mesh.grid,
         mesh.physical_tags,
         p1_space,
         dp0_space,
     )
-    mesh_max_edge_m = _mesh_max_edge_m(mesh)
 
     source_tags = list(config.velocity_sources.keys())
     # Per-face source profile multiplier, built once (geometry-only) and reused
@@ -1055,7 +1039,7 @@ def run_sweep_native_metal_multi_source(
             )
 
     try:
-        from .metal.geometry import build_metal_geometry_buffers
+        from .metal.geometry import _build_metal_geometry_buffers_with_max_edge
         from .metal.native import MetalNativeStandardSession
     except Exception as exc:  # pragma: no cover - import/runtime specific.
         raise AssemblyBackendUnavailable(
@@ -1070,13 +1054,12 @@ def run_sweep_native_metal_multi_source(
     t_total = time.time()
     obs_points, angles_deg = build_observation_points(frame, config.observation)
     p1_space, dp0_space = make_pure_function_spaces(mesh.grid)
-    geometry_buffers = build_metal_geometry_buffers(
+    geometry_buffers, mesh_max_edge_m = _build_metal_geometry_buffers_with_max_edge(
         mesh.grid,
         mesh.physical_tags,
         p1_space,
         dp0_space,
     )
-    mesh_max_edge_m = _mesh_max_edge_m(mesh)
 
     # Union of all source tags: every source's result records the average
     # surface pressure on every tag any source drives (or lists at zero

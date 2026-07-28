@@ -107,8 +107,44 @@ def build_metal_geometry_buffers(
         function rejects one-based or out-of-range input rather than converting
         it implicitly.
     """
-    vertices_f64 = _require_vertices_3xn(grid)
-    vertices_f64 = vertices_f64.copy()
+    buffers, _ = _build_metal_geometry_buffers(
+        grid,
+        physical_tags,
+        p1_space,
+        dp0_space,
+        include_max_edge=False,
+    )
+    return buffers
+
+
+def _build_metal_geometry_buffers_with_max_edge(
+    grid: Any,
+    physical_tags: Any,
+    p1_space: Any,
+    dp0_space: Any | None = None,
+) -> tuple[MetalGeometryBuffers, float]:
+    """Build buffers and reuse the triangle gather to find the longest edge."""
+    buffers, max_edge_m = _build_metal_geometry_buffers(
+        grid,
+        physical_tags,
+        p1_space,
+        dp0_space,
+        include_max_edge=True,
+    )
+    assert max_edge_m is not None
+    return buffers, max_edge_m
+
+
+def _build_metal_geometry_buffers(
+    grid: Any,
+    physical_tags: Any,
+    p1_space: Any,
+    dp0_space: Any | None,
+    *,
+    include_max_edge: bool,
+) -> tuple[MetalGeometryBuffers, float | None]:
+    input_vertices_f64 = _require_vertices_3xn(grid)
+    vertices_f64 = input_vertices_f64.copy()
     vertices_f64[np.abs(vertices_f64) <= _PLANE_SNAP_TOLERANCE] = 0.0
     triangles_i32 = _require_triangles_3xm(grid, vertices_f64.shape[1])
     n_triangles = int(triangles_i32.shape[1])
@@ -123,20 +159,34 @@ def build_metal_geometry_buffers(
     p1_dof_count = _resolve_p1_dof_count(p1_space, p1_local2global_i32)
     dp0_dof_count = _resolve_dp0_dof_count(dp0_space, n_triangles)
 
-    triangle_areas_f32, triangle_normals_3xm_f32 = _compute_areas_normals(
-        vertices_f64,
-        triangles_i32,
-    )
+    max_edge_m: float | None = None
+    if include_max_edge:
+        (
+            triangle_areas_f32,
+            triangle_normals_3xm_f32,
+            max_edge_m,
+        ) = _compute_areas_normals_and_max_edge(
+            input_vertices_f64,
+            triangles_i32,
+        )
+    else:
+        triangle_areas_f32, triangle_normals_3xm_f32 = _compute_areas_normals(
+            vertices_f64,
+            triangles_i32,
+        )
 
-    return MetalGeometryBuffers(
-        vertices_3xn_f32=np.ascontiguousarray(vertices_f64, dtype=np.float32),
-        triangles_3xm_i32=np.ascontiguousarray(triangles_i32, dtype=np.int32),
-        physical_tags_i32=physical_tags_i32,
-        p1_local2global_i32=p1_local2global_i32,
-        triangle_areas_f32=triangle_areas_f32,
-        triangle_normals_3xm_f32=triangle_normals_3xm_f32,
-        p1_dof_count=p1_dof_count,
-        dp0_dof_count=dp0_dof_count,
+    return (
+        MetalGeometryBuffers(
+            vertices_3xn_f32=np.ascontiguousarray(vertices_f64, dtype=np.float32),
+            triangles_3xm_i32=np.ascontiguousarray(triangles_i32, dtype=np.int32),
+            physical_tags_i32=physical_tags_i32,
+            p1_local2global_i32=p1_local2global_i32,
+            triangle_areas_f32=triangle_areas_f32,
+            triangle_normals_3xm_f32=triangle_normals_3xm_f32,
+            p1_dof_count=p1_dof_count,
+            dp0_dof_count=dp0_dof_count,
+        ),
+        max_edge_m,
     )
 
 
@@ -611,6 +661,35 @@ def _compute_areas_normals(
     p0 = vertices_nx3[triangles_nx3[:, 0]]
     p1 = vertices_nx3[triangles_nx3[:, 1]]
     p2 = vertices_nx3[triangles_nx3[:, 2]]
+    return _areas_normals_from_points(p0, p1, p2)
+
+
+def _compute_areas_normals_and_max_edge(
+    input_vertices_3xn: NDArray[np.float64],
+    triangles_3xm: NDArray[np.int32],
+) -> tuple[NDArray[np.float32], NDArray[np.float32], float]:
+    """Compute snapped geometry and the original mesh edge metric in one gather."""
+    vertices_nx3 = input_vertices_3xn.T
+    triangles_nx3 = triangles_3xm.T
+    p0 = vertices_nx3[triangles_nx3[:, 0]]
+    p1 = vertices_nx3[triangles_nx3[:, 1]]
+    p2 = vertices_nx3[triangles_nx3[:, 2]]
+    max_edge_m = max(
+        float(np.max(np.linalg.norm(p1 - p0, axis=1))),
+        float(np.max(np.linalg.norm(p2 - p1, axis=1))),
+        float(np.max(np.linalg.norm(p0 - p2, axis=1))),
+    )
+    for points in (p0, p1, p2):
+        points[np.abs(points) <= _PLANE_SNAP_TOLERANCE] = 0.0
+    areas, normals = _areas_normals_from_points(p0, p1, p2)
+    return areas, normals, max_edge_m
+
+
+def _areas_normals_from_points(
+    p0: NDArray[np.float64],
+    p1: NDArray[np.float64],
+    p2: NDArray[np.float64],
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
     cross = np.cross(p1 - p0, p2 - p0)
     twice_area = np.linalg.norm(cross, axis=1)
     degenerate = twice_area <= 0.0
