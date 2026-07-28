@@ -36,7 +36,7 @@ def _principal_axis(vertices: NDArray[np.float64], center: NDArray[np.float64]) 
     Used as a last-resort axis estimate when source-element normals are
     unavailable or degenerate.
     """
-    centered = vertices - center[None, :]
+    centered = vertices - center
     if centered.shape[0] == 0:
         return np.array([0.0, 1.0, 0.0], dtype=np.float64)
     cov = centered.T @ centered
@@ -154,11 +154,9 @@ def infer_frame(
                 source_center = np.average(centroids, weights=areas, axis=0)
 
     # Fall back to PCA principal axis if no usable source normal.
-    if avg_normal is None:
+    source_from_tags = avg_normal is not None
+    if not source_from_tags:
         avg_normal = _principal_axis(vertices, source_center)
-        source_from_tags = False
-    else:
-        source_from_tags = True
 
     if symmetry_plane is not None:
         # Full-model axes are mirror-invariant; reduced normals/PCA can be
@@ -201,9 +199,9 @@ def infer_frame(
 
     # Mouth centre: vertices near the max projection along axis
     proj_along_axis = vertices @ axis
-    mouth_threshold = proj_along_axis.max() - 0.02 * (
-        proj_along_axis.max() - proj_along_axis.min()
-    )
+    mouth_min = proj_along_axis.min()
+    mouth_max = proj_along_axis.max()
+    mouth_threshold = mouth_max - 0.02 * (mouth_max - mouth_min)
     mouth_verts = vertices[proj_along_axis >= mouth_threshold]
     mouth_center = mouth_verts.mean(axis=0)
 
@@ -250,9 +248,6 @@ def build_observation_points(
     """
     if config.custom_points is not None:
         # Custom observation grids — caller provides exact coordinates.
-        angles_deg = np.linspace(
-            config.angle_min_deg, config.angle_max_deg, config.angle_count,
-        )
         plane_points = []
         for plane in config.planes:
             if plane not in config.custom_points:
@@ -274,13 +269,11 @@ def build_observation_points(
                 f"All custom_points planes must have the same number of "
                 f"points, got {dict(zip(config.planes, counts))}"
             )
-        # Override angle_count to match actual custom point count
-        if counts[0] != config.angle_count:
-            angles_deg = np.linspace(
-                config.angle_min_deg, config.angle_max_deg, counts[0],
-            )
 
         points = np.stack(plane_points, axis=0)  # (P, N_points, 3)
+        angles_deg = np.linspace(
+            config.angle_min_deg, config.angle_max_deg, counts[0],
+        )
         return points, angles_deg
 
     angles_deg = np.linspace(
@@ -336,9 +329,8 @@ def build_sphere_grid_points(
     theta_deg = np.linspace(0.0, float(config.sphere_theta_max_deg), int(n_theta))
     phi_deg = np.arange(int(n_phi), dtype=np.float64) * (360.0 / int(n_phi))
 
-    theta_grid, phi_grid = np.meshgrid(theta_deg, phi_deg, indexing="ij")
-    theta_rad = np.deg2rad(theta_grid.reshape(-1))
-    phi_rad = np.deg2rad(phi_grid.reshape(-1))
+    theta_rad = np.deg2rad(np.repeat(theta_deg, int(n_phi)))
+    phi_rad = np.deg2rad(np.tile(phi_deg, int(n_theta)))
 
     sin_theta = np.sin(theta_rad)
     directions = (
