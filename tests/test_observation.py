@@ -459,6 +459,42 @@ class TestInferFrameAreaWeighting:
         # Large triangle has normal +z and dominates; axis should be +z
         assert frame.axis[2] > 0.99
 
+    def test_tiny_reversed_first_triangle_does_not_reverse_enclosed_axis(self):
+        """A small winding outlier must not determine the normal hemisphere."""
+        tiny_reversed = np.array([
+            [-0.001, -0.001, 0.5],
+            [-0.001, 0.001, 0.5],
+            [0.001, -0.001, 0.5],
+        ])
+        source = np.array([
+            [-0.1, -0.1, 0.5],
+            [0.1, -0.1, 0.5],
+            [0.1, 0.1, 0.5],
+            [-0.1, 0.1, 0.5],
+        ])
+        enclosure = np.array([
+            [-0.2, -0.2, 0.0],
+            [0.2, -0.2, 0.0],
+            [-0.2, -0.2, 1.0],
+            [0.2, -0.2, 1.0],
+        ])
+        vertices = np.vstack([tiny_reversed, source, enclosure])
+        elements = np.array([
+            [0, 1, 2],  # tiny -z winding outlier deliberately comes first
+            [3, 4, 5],
+            [3, 5, 6],
+            [7, 8, 9],
+            [8, 9, 10],
+        ])
+        tags = np.array([2, 2, 2, 1, 1], dtype=np.int32)
+
+        grid = _mock_grid(vertices.T, elements.T)
+        frame = infer_frame(grid, tags, source_tag=2, origin_at="mouth")
+
+        # The enclosed-geometry branch trusts the source normal; the tiny
+        # reversed face must not flip it away from +z.
+        assert frame.axis[2] > 0.99
+
 
 # ---------------------------------------------------------------------------
 # infer_frame — origin_at selection

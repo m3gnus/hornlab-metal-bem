@@ -141,8 +141,10 @@ def infer_frame(
             centroids = (p0[valid_area_mask] + p1[valid_area_mask] + p2[valid_area_mask]) / 3.0
 
             # Sign-align normals into one hemisphere so mixed winding does
-            # not cancel the axis. Matches WG's robust axis detection.
-            ref = normals[0]
+            # not cancel the axis. Anchor the hemisphere to the largest face
+            # so a tiny winding outlier cannot reverse an enclosed model's
+            # inferred forward direction merely by appearing first.
+            ref = normals[int(np.argmax(areas))]
             signs = np.sign(normals @ ref)
             signs[signs == 0] = 1.0
 
