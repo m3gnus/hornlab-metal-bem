@@ -44,6 +44,52 @@ def _arg_after(command: list[str], op: str, offset: int) -> str:
     return command[command.index(op) + offset]
 
 
+def test_complex_output_descriptors_keep_real_and_imaginary_pairs_in_sync(
+    tmp_path,
+):
+    output_dir = tmp_path / "case" / "outputs"
+
+    outputs = native._solve_field_output_manifests(
+        output_dir,
+        surface_shape=(4,),
+        field_shape=(2, 3),
+        write_field=True,
+        write_surface=True,
+        relative_to=tmp_path,
+    )
+
+    assert outputs == {
+        "observation_pressure_real_f32": {
+            "path": "case/outputs/obs_pressure_re_f32.bin",
+            "shape": [2, 3],
+            "dtype": "float32",
+            "byte_order": "little",
+            "order": "C",
+        },
+        "observation_pressure_imag_f32": {
+            "path": "case/outputs/obs_pressure_im_f32.bin",
+            "shape": [2, 3],
+            "dtype": "float32",
+            "byte_order": "little",
+            "order": "C",
+        },
+        "pressure_real_f32": {
+            "path": "case/outputs/pressure_re_f32.bin",
+            "shape": [4],
+            "dtype": "float32",
+            "byte_order": "little",
+            "order": "C",
+        },
+        "pressure_imag_f32": {
+            "path": "case/outputs/pressure_im_f32.bin",
+            "shape": [4],
+            "dtype": "float32",
+            "byte_order": "little",
+            "order": "C",
+        },
+    }
+
+
 def test_native_session_rejects_unhonored_precision_before_discovery(monkeypatch):
     def unexpected_discovery(*args, **kwargs):
         raise AssertionError("precision validation must precede helper discovery")

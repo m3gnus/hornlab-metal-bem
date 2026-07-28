@@ -405,7 +405,6 @@ class MetalNativeStandardSession:
         """
         from .session import (
             AssemblyPayload,
-            BinaryArrayDescriptor,
             DenseAssemblyResult,
             read_json_manifest,
             write_json_manifest,
@@ -428,33 +427,19 @@ class MetalNativeStandardSession:
         )
         n = self.geometry_payload.p1_dof_count
         outputs = {
-            "A_real_f32": BinaryArrayDescriptor(
-                path=(outputs_dir / "A_re_f32.bin").relative_to(
-                    self.info.work_dir
-                ).as_posix(),
+            **_complex_output_descriptors(
+                outputs_dir,
+                key_prefix="A",
+                file_prefix="A",
                 shape=(n, n),
-                dtype="float32",
+                relative_to=self.info.work_dir,
             ),
-            "A_imag_f32": BinaryArrayDescriptor(
-                path=(outputs_dir / "A_im_f32.bin").relative_to(
-                    self.info.work_dir
-                ).as_posix(),
-                shape=(n, n),
-                dtype="float32",
-            ),
-            "rhs_real_f32": BinaryArrayDescriptor(
-                path=(outputs_dir / "rhs_re_f32.bin").relative_to(
-                    self.info.work_dir
-                ).as_posix(),
+            **_complex_output_descriptors(
+                outputs_dir,
+                key_prefix="rhs",
+                file_prefix="rhs",
                 shape=(n,),
-                dtype="float32",
-            ),
-            "rhs_imag_f32": BinaryArrayDescriptor(
-                path=(outputs_dir / "rhs_im_f32.bin").relative_to(
-                    self.info.work_dir
-                ).as_posix(),
-                shape=(n,),
-                dtype="float32",
+                relative_to=self.info.work_dir,
             ),
         }
         payload = AssemblyPayload(
@@ -495,7 +480,6 @@ class MetalNativeStandardSession:
         """Assemble multiple standard-Neumann systems in one native helper run."""
         from .session import (
             BatchAssemblyPayload,
-            BinaryArrayDescriptor,
             DenseAssemblyResult,
             read_json_manifest,
             write_json_manifest,
@@ -539,44 +523,31 @@ class MetalNativeStandardSession:
             )
             outputs = {
                 "matrix_layout": "row_major_c",
-                "A_real_f32": BinaryArrayDescriptor(
-                    path=(case_output / "A_re_f32.bin").relative_to(
-                        self.info.work_dir
-                    ).as_posix(),
-                    shape=(n, n),
-                    dtype="float32",
-                ).to_manifest(),
-                "A_imag_f32": BinaryArrayDescriptor(
-                    path=(case_output / "A_im_f32.bin").relative_to(
-                        self.info.work_dir
-                    ).as_posix(),
-                    shape=(n, n),
-                    dtype="float32",
-                ).to_manifest(),
-                "rhs_real_f32": BinaryArrayDescriptor(
-                    path=(case_output / "rhs_re_f32.bin").relative_to(
-                        self.info.work_dir
-                    ).as_posix(),
-                    shape=(n,),
-                    dtype="float32",
-                ).to_manifest(),
-                "rhs_imag_f32": BinaryArrayDescriptor(
-                    path=(case_output / "rhs_im_f32.bin").relative_to(
-                        self.info.work_dir
-                    ).as_posix(),
-                    shape=(n,),
-                    dtype="float32",
-                ).to_manifest(),
+                **_descriptor_manifests(
+                    {
+                        **_complex_output_descriptors(
+                            case_output,
+                            key_prefix="A",
+                            file_prefix="A",
+                            shape=(n, n),
+                            relative_to=self.info.work_dir,
+                        ),
+                        **_complex_output_descriptors(
+                            case_output,
+                            key_prefix="rhs",
+                            file_prefix="rhs",
+                            shape=(n,),
+                            relative_to=self.info.work_dir,
+                        ),
+                    }
+                ),
             }
             cases.append(
                 {
                     "case_id": case_id,
                     "frequency_hz": float(freq),
                     "k_real_f32": float(np.float32(kval)),
-                    "neumann_dp0": {
-                        key: descriptor.to_manifest()
-                        for key, descriptor in neumann.items()
-                    },
+                    "neumann_dp0": _descriptor_manifests(neumann),
                     "outputs": outputs,
                 }
             )
@@ -630,7 +601,6 @@ class MetalNativeStandardSession:
         """Assemble and directly solve standard-Neumann systems in one helper run."""
         from .session import (
             BatchAssemblySolvePayload,
-            BinaryArrayDescriptor,
             DenseSolveResult,
             read_json_manifest,
             write_json_manifest,
@@ -672,31 +642,21 @@ class MetalNativeStandardSession:
                 case_input / "neumann",
                 relative_to=self.info.work_dir,
             )
-            outputs = {
-                "pressure_real_f32": BinaryArrayDescriptor(
-                    path=(case_output / "pressure_re_f32.bin").relative_to(
-                        self.info.work_dir
-                    ).as_posix(),
+            outputs = _descriptor_manifests(
+                _complex_output_descriptors(
+                    case_output,
+                    key_prefix="pressure",
+                    file_prefix="pressure",
                     shape=(n,),
-                    dtype="float32",
-                ).to_manifest(),
-                "pressure_imag_f32": BinaryArrayDescriptor(
-                    path=(case_output / "pressure_im_f32.bin").relative_to(
-                        self.info.work_dir
-                    ).as_posix(),
-                    shape=(n,),
-                    dtype="float32",
-                ).to_manifest(),
-            }
+                    relative_to=self.info.work_dir,
+                )
+            )
             cases.append(
                 {
                     "case_id": case_id,
                     "frequency_hz": float(freq),
                     "k_real_f32": float(np.float32(kval)),
-                    "neumann_dp0": {
-                        key: descriptor.to_manifest()
-                        for key, descriptor in neumann.items()
-                    },
+                    "neumann_dp0": _descriptor_manifests(neumann),
                     "outputs": outputs,
                 }
             )
@@ -790,7 +750,6 @@ class MetalNativeStandardSession:
         """
         from .session import (
             BatchAssemblySolveFieldPayload,
-            BinaryArrayDescriptor,
             read_json_manifest,
             write_binary_array,
             write_json_manifest,
@@ -976,22 +935,15 @@ class MetalNativeStandardSession:
         sources_per_case = 1 + n_extra_sources
         batch_outputs: dict[str, Any] | None = None
         if write_batched_field:
-            batch_outputs = {
-                "observation_pressure_real_f32": BinaryArrayDescriptor(
-                    path=(outputs_root / "obs_pressure_re_f32.bin").relative_to(
-                        self.info.work_dir
-                    ).as_posix(),
+            batch_outputs = _descriptor_manifests(
+                _complex_output_descriptors(
+                    outputs_root,
+                    key_prefix="observation_pressure",
+                    file_prefix="obs_pressure",
                     shape=(frequencies.size * sources_per_case, n_obs),
-                    dtype="float32",
-                ).to_manifest(),
-                "observation_pressure_imag_f32": BinaryArrayDescriptor(
-                    path=(outputs_root / "obs_pressure_im_f32.bin").relative_to(
-                        self.info.work_dir
-                    ).as_posix(),
-                    shape=(frequencies.size * sources_per_case, n_obs),
-                    dtype="float32",
-                ).to_manifest(),
-            }
+                    relative_to=self.info.work_dir,
+                )
+            )
         cases: list[dict[str, Any]] = []
         for idx, (freq, kval, kimag) in enumerate(
             zip(frequencies, k_values, k_imag_values)
@@ -1004,37 +956,14 @@ class MetalNativeStandardSession:
                 case_input / "neumann",
                 relative_to=self.info.work_dir,
             )
-            outputs: dict[str, Any] = {}
-            if not write_batched_field:
-                outputs["observation_pressure_real_f32"] = BinaryArrayDescriptor(
-                    path=(case_output / "obs_pressure_re_f32.bin").relative_to(
-                        self.info.work_dir
-                    ).as_posix(),
-                    shape=(n_obs,),
-                    dtype="float32",
-                ).to_manifest()
-                outputs["observation_pressure_imag_f32"] = BinaryArrayDescriptor(
-                    path=(case_output / "obs_pressure_im_f32.bin").relative_to(
-                        self.info.work_dir
-                    ).as_posix(),
-                    shape=(n_obs,),
-                    dtype="float32",
-                ).to_manifest()
-            if write_surface_pressure:
-                outputs["pressure_real_f32"] = BinaryArrayDescriptor(
-                    path=(case_output / "pressure_re_f32.bin").relative_to(
-                        self.info.work_dir
-                    ).as_posix(),
-                    shape=(n,),
-                    dtype="float32",
-                ).to_manifest()
-                outputs["pressure_imag_f32"] = BinaryArrayDescriptor(
-                    path=(case_output / "pressure_im_f32.bin").relative_to(
-                        self.info.work_dir
-                    ).as_posix(),
-                    shape=(n,),
-                    dtype="float32",
-                ).to_manifest()
+            outputs = _solve_field_output_manifests(
+                case_output,
+                surface_shape=(n,),
+                field_shape=(n_obs,),
+                write_field=not write_batched_field,
+                write_surface=write_surface_pressure,
+                relative_to=self.info.work_dir,
+            )
             extra_sources_payload: list[dict[str, Any]] = []
             for extra_idx in range(n_extra_sources):
                 assert extra_neumann_values is not None
@@ -1047,41 +976,14 @@ class MetalNativeStandardSession:
                     source_dir / "neumann",
                     relative_to=self.info.work_dir,
                 )
-                extra_outputs: dict[str, Any] = {}
-                if not write_batched_field:
-                    extra_outputs["observation_pressure_real_f32"] = (
-                        BinaryArrayDescriptor(
-                            path=(source_output / "obs_pressure_re_f32.bin")
-                            .relative_to(self.info.work_dir)
-                            .as_posix(),
-                            shape=(n_obs,),
-                            dtype="float32",
-                        ).to_manifest()
-                    )
-                    extra_outputs["observation_pressure_imag_f32"] = (
-                        BinaryArrayDescriptor(
-                            path=(source_output / "obs_pressure_im_f32.bin")
-                            .relative_to(self.info.work_dir)
-                            .as_posix(),
-                            shape=(n_obs,),
-                            dtype="float32",
-                        ).to_manifest()
-                    )
-                if write_surface_pressure:
-                    extra_outputs["pressure_real_f32"] = BinaryArrayDescriptor(
-                        path=(source_output / "pressure_re_f32.bin")
-                        .relative_to(self.info.work_dir)
-                        .as_posix(),
-                        shape=(n,),
-                        dtype="float32",
-                    ).to_manifest()
-                    extra_outputs["pressure_imag_f32"] = BinaryArrayDescriptor(
-                        path=(source_output / "pressure_im_f32.bin")
-                        .relative_to(self.info.work_dir)
-                        .as_posix(),
-                        shape=(n,),
-                        dtype="float32",
-                    ).to_manifest()
+                extra_outputs = _solve_field_output_manifests(
+                    source_output,
+                    surface_shape=(n,),
+                    field_shape=(n_obs,),
+                    write_field=not write_batched_field,
+                    write_surface=write_surface_pressure,
+                    relative_to=self.info.work_dir,
+                )
                 extra_tag = (
                     extra_impedance_source_tags[extra_idx]
                     if extra_impedance_source_tags is not None
@@ -1089,10 +991,7 @@ class MetalNativeStandardSession:
                 )
                 extra_sources_payload.append(
                     {
-                        "neumann_dp0": {
-                            key: descriptor.to_manifest()
-                            for key, descriptor in extra_neumann.items()
-                        },
+                        "neumann_dp0": _descriptor_manifests(extra_neumann),
                         "outputs": extra_outputs,
                         **(
                             {"impedance_source_tag": int(extra_tag)}
@@ -1108,10 +1007,7 @@ class MetalNativeStandardSession:
                     "k_real_f32": float(np.float32(kval)),
                     "k_imag_f32": float(np.float32(kimag)),
                     "field_k_real_f32": float(np.float32(kval)),
-                    "neumann_dp0": {
-                        key: descriptor.to_manifest()
-                        for key, descriptor in neumann.items()
-                    },
+                    "neumann_dp0": _descriptor_manifests(neumann),
                     "observation_points": obs_desc.to_manifest(),
                     "outputs": outputs,
                     **(
@@ -1468,7 +1364,6 @@ class MetalNativeStandardSession:
     ) -> Any:
         """Evaluate exterior pressure via the native helper reference path."""
         from .session import (
-            BinaryArrayDescriptor,
             FieldPayload,
             FieldResult,
             read_json_manifest,
@@ -1515,22 +1410,13 @@ class MetalNativeStandardSession:
             dtype=np.float32,
             relative_to=self.info.work_dir,
         )
-        output = {
-            "pressure_real_f32": BinaryArrayDescriptor(
-                path=(outputs_dir / "obs_pressure_re_f32.bin").relative_to(
-                    self.info.work_dir
-                ).as_posix(),
-                shape=(n_obs,),
-                dtype="float32",
-            ),
-            "pressure_imag_f32": BinaryArrayDescriptor(
-                path=(outputs_dir / "obs_pressure_im_f32.bin").relative_to(
-                    self.info.work_dir
-                ).as_posix(),
-                shape=(n_obs,),
-                dtype="float32",
-            ),
-        }
+        output = _complex_output_descriptors(
+            outputs_dir,
+            key_prefix="pressure",
+            file_prefix="obs_pressure",
+            shape=(n_obs,),
+            relative_to=self.info.work_dir,
+        )
         payload = FieldPayload(
             session_id=self.info.session_id,
             batch_id=batch_id,
@@ -1572,7 +1458,6 @@ class MetalNativeStandardSession:
         """Evaluate exterior pressure for multiple frequencies in one helper run."""
         from .session import (
             BatchFieldPayload,
-            BinaryArrayDescriptor,
             FieldResult,
             read_json_manifest,
             write_binary_array,
@@ -1647,35 +1532,22 @@ class MetalNativeStandardSession:
                 imag_name="neumann_im_f32.bin",
                 relative_to=self.info.work_dir,
             )
-            output = {
-                "pressure_real_f32": BinaryArrayDescriptor(
-                    path=(case_output / "obs_pressure_re_f32.bin").relative_to(
-                        self.info.work_dir
-                    ).as_posix(),
+            output = _descriptor_manifests(
+                _complex_output_descriptors(
+                    case_output,
+                    key_prefix="pressure",
+                    file_prefix="obs_pressure",
                     shape=(n_obs,),
-                    dtype="float32",
-                ).to_manifest(),
-                "pressure_imag_f32": BinaryArrayDescriptor(
-                    path=(case_output / "obs_pressure_im_f32.bin").relative_to(
-                        self.info.work_dir
-                    ).as_posix(),
-                    shape=(n_obs,),
-                    dtype="float32",
-                ).to_manifest(),
-            }
+                    relative_to=self.info.work_dir,
+                )
+            )
             cases.append(
                 {
                     "case_id": case_id,
                     "frequency_hz": float(freq),
                     "k_real_f32": float(np.float32(kval)),
-                    "pressure_p1": {
-                        key: descriptor.to_manifest()
-                        for key, descriptor in pressure_desc.items()
-                    },
-                    "neumann_dp0": {
-                        key: descriptor.to_manifest()
-                        for key, descriptor in neumann_desc.items()
-                    },
+                    "pressure_p1": _descriptor_manifests(pressure_desc),
+                    "neumann_dp0": _descriptor_manifests(neumann_desc),
                     "output": output,
                 }
             )
@@ -2021,6 +1893,73 @@ def _require_complex_vector(
     if not np.all(np.isfinite(array)):
         raise ValueError(f"{name} must contain only finite values")
     return np.ascontiguousarray(array, dtype=np.complex64)
+
+
+def _complex_output_descriptors(
+    directory: Path,
+    *,
+    key_prefix: str,
+    file_prefix: str,
+    shape: tuple[int, ...],
+    relative_to: Path,
+) -> dict[str, Any]:
+    """Describe the split float32 files for one complex native output."""
+    from .session import BinaryArrayDescriptor
+
+    return {
+        f"{key_prefix}_{component}_f32": BinaryArrayDescriptor(
+            path=(directory / f"{file_prefix}_{suffix}_f32.bin")
+            .relative_to(relative_to)
+            .as_posix(),
+            shape=shape,
+            dtype="float32",
+        )
+        for component, suffix in (("real", "re"), ("imag", "im"))
+    }
+
+
+def _descriptor_manifests(descriptors: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: descriptor.to_manifest()
+        for key, descriptor in descriptors.items()
+    }
+
+
+def _solve_field_output_manifests(
+    directory: Path,
+    *,
+    surface_shape: tuple[int, ...],
+    field_shape: tuple[int, ...],
+    write_field: bool,
+    write_surface: bool,
+    relative_to: Path,
+) -> dict[str, Any]:
+    outputs: dict[str, Any] = {}
+    if write_field:
+        outputs.update(
+            _descriptor_manifests(
+                _complex_output_descriptors(
+                    directory,
+                    key_prefix="observation_pressure",
+                    file_prefix="obs_pressure",
+                    shape=field_shape,
+                    relative_to=relative_to,
+                )
+            )
+        )
+    if write_surface:
+        outputs.update(
+            _descriptor_manifests(
+                _complex_output_descriptors(
+                    directory,
+                    key_prefix="pressure",
+                    file_prefix="pressure",
+                    shape=surface_shape,
+                    relative_to=relative_to,
+                )
+            )
+        )
+    return outputs
 
 
 def _write_complex_vector(
