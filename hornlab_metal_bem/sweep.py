@@ -96,11 +96,18 @@ def _read_complex_f32(
     real_path: Path,
     imag_path: Path,
     shape: tuple[int, ...],
-) -> NDArray[np.complex64]:
+    *,
+    dtype: type[np.complex64] | type[np.complex128] = np.complex64,
+) -> NDArray[np.complex64] | NDArray[np.complex128]:
     count = int(np.prod(shape))
-    real = _read_f32_exact(real_path, count).reshape(shape)
+    values = np.empty(shape, dtype=dtype)
+    values.real = _read_f32_exact(real_path, count).reshape(shape)
     imag = _read_f32_exact(imag_path, count).reshape(shape)
-    return np.ascontiguousarray(real + 1j * imag, dtype=np.complex64)
+    # Match ``real + 1j * imag`` handling of signed imaginary zero in-place,
+    # without materializing the complex multiply and addition temporaries.
+    np.add(imag, np.float32(0.0), out=imag)
+    values.imag = imag
+    return values
 
 
 def _native_env_overrides(config: SolveConfig) -> dict[str, str]:
@@ -528,7 +535,8 @@ def _system_field(
             Path(system.field_real_f32),
             Path(system.field_imag_f32),
             tuple(system.field_shape),
-        ).astype(np.complex128)
+            dtype=np.complex128,
+        )
     flat = np.asarray(field_complex).reshape(-1)
     arc_count = n_planes * n_angles
     arc = flat[:arc_count].reshape(n_planes, n_angles)
@@ -543,7 +551,8 @@ def _system_surface_pressure(system) -> NDArray[np.complex128]:
         Path(system.pressure_real_f32),
         Path(system.pressure_imag_f32),
         tuple(system.pressure_shape),
-    ).astype(np.complex128)
+        dtype=np.complex128,
+    )
 
 
 def _directivity_from_pressure(
@@ -784,7 +793,8 @@ def run_sweep_native_metal(
                     Path(first.field_real_f32),
                     Path(first.field_imag_f32),
                     tuple(first.field_batch_shape),
-                ).astype(np.complex128)
+                    dtype=np.complex128,
+                )
 
             for i, (freq, system) in enumerate(zip(freq_values, systems)):
                 frequency_hz = float(freq)
@@ -1273,7 +1283,8 @@ def run_sweep_native_metal_multi_source(
                 Path(first.field_real_f32),
                 Path(first.field_imag_f32),
                 tuple(first.field_batch_shape),
-            ).astype(np.complex128)
+                dtype=np.complex128,
+            )
 
         for i, (freq, system) in enumerate(zip(freq_values, systems)):
             frequency_hz = _append_case_results(

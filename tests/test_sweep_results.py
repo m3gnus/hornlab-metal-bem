@@ -35,6 +35,34 @@ def test_system_field_splits_arc_and_sphere():
     assert arc_only.shape == (n_planes, n_angles)
 
 
+def test_read_complex_f32_constructs_requested_dtype_exactly(tmp_path):
+    real_values = np.asarray([0.0, -0.0, 1.25, -2.5], dtype="<f4")
+    imag_values = np.asarray([0.0, -0.0, -3.5, 4.75], dtype="<f4")
+    real_path = tmp_path / "real.bin"
+    imag_path = tmp_path / "imag.bin"
+    real_values.tofile(real_path)
+    imag_values.tofile(imag_path)
+    expected = np.ascontiguousarray(
+        real_values + 1j * imag_values,
+        dtype=np.complex64,
+    )
+
+    for dtype in (np.complex64, np.complex128):
+        actual = sweep._read_complex_f32(
+            real_path,
+            imag_path,
+            (2, 2),
+            dtype=dtype,
+        )
+        expected_dtype = expected.astype(dtype).reshape(2, 2)
+        assert actual.dtype == dtype
+        assert actual.flags.c_contiguous
+        np.testing.assert_array_equal(
+            actual.view(np.uint8),
+            expected_dtype.view(np.uint8),
+        )
+
+
 def test_discover_runtime_smoke_cached_reuses_validated_helper(monkeypatch, tmp_path):
     helper = tmp_path / "HornlabMetalBemNative"
     helper.write_text("#!/bin/sh\n", encoding="utf-8")
