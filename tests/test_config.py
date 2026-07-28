@@ -295,6 +295,8 @@ def test_solve_config_accepts_native_check_open_edges_override():
     ("kwargs", "match"),
     [
         ({"freq_count": 0}, "freq_count"),
+        ({"freq_count": 1.5}, "freq_count"),
+        ({"freq_count": True}, "freq_count"),
         ({"freq_min_hz": 0.0}, "freq_min_hz"),
         ({"freq_min_hz": -10.0}, "freq_min_hz"),
         ({"freq_min_hz": 1000.0, "freq_max_hz": 500.0}, "freq_max_hz"),
@@ -313,11 +315,32 @@ def test_solve_config_rejects_degenerate_sweep_settings(kwargs, match):
 
 
 @pytest.mark.parametrize(
+    "field_name",
+    [
+        "freq_min_hz",
+        "freq_max_hz",
+        "complex_k_shift",
+        "mesh_scale",
+        "mesh_merge_tol",
+        "air_density",
+        "dense_solve_rcond_warning_threshold",
+        "mesh_elements_per_wavelength_min",
+    ],
+)
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -float("inf")])
+def test_solve_config_rejects_nonfinite_scalar_settings(field_name, bad_value):
+    with pytest.raises(ValueError, match=field_name):
+        SolveConfig(**{field_name: bad_value})
+
+
+@pytest.mark.parametrize(
     ("kwargs", "match"),
     [
         ({"planes": []}, "planes"),
         ({"distance_m": 0.0}, "distance_m"),
         ({"angle_count": 0}, "angle_count"),
+        ({"angle_count": 1.5}, "angle_count"),
+        ({"angle_count": True}, "angle_count"),
         ({"origin": "Mouth"}, "origin"),
         ({"origin": "centre"}, "origin"),
     ],
@@ -325,6 +348,15 @@ def test_solve_config_rejects_degenerate_sweep_settings(kwargs, match):
 def test_observation_config_rejects_degenerate_settings(kwargs, match):
     with pytest.raises(ValueError, match=match):
         ObservationConfig(**kwargs)
+
+
+@pytest.mark.parametrize("field_name", ["distance_m", "angle_min_deg", "angle_max_deg"])
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -float("inf")])
+def test_observation_config_rejects_nonfinite_scalar_settings(
+    field_name, bad_value,
+):
+    with pytest.raises(ValueError, match=field_name):
+        ObservationConfig(**{field_name: bad_value})
 
 
 def test_solve_config_mesh_loading_options_default_off():
@@ -386,6 +418,12 @@ def test_solve_config_rejects_nonpositive_native_threadgroup_override():
         SolveConfig(metal_native_threads_per_group=0)
 
 
+@pytest.mark.parametrize("bad_value", [True, 1.5, float("nan"), float("inf")])
+def test_solve_config_rejects_nonintegral_native_threadgroup_override(bad_value):
+    with pytest.raises(ValueError, match="metal_native_threads_per_group"):
+        SolveConfig(metal_native_threads_per_group=bad_value)
+
+
 def test_solve_config_accepts_per_kernel_native_threadgroup_overrides():
     cfg = SolveConfig(
         metal_native_matrix_threads_per_group=32,
@@ -414,6 +452,22 @@ def test_solve_config_rejects_nonpositive_per_kernel_native_threadgroup_override
 ):
     with pytest.raises(ValueError, match=field_name):
         SolveConfig(**{field_name: 0})
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "metal_native_matrix_threads_per_group",
+        "metal_native_rhs_threads_per_group",
+        "metal_native_duffy_threads_per_group",
+        "metal_native_field_threads_per_group",
+    ],
+)
+def test_solve_config_rejects_nonintegral_per_kernel_threadgroup_override(
+    field_name,
+):
+    with pytest.raises(ValueError, match=field_name):
+        SolveConfig(**{field_name: 64.5})
 
 
 def test_resolve_backend_raises_when_native_unavailable(monkeypatch):

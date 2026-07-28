@@ -581,12 +581,26 @@ class TestSphereGridConfig:
         with pytest.raises(ValueError, match="mutually exclusive"):
             ObservationConfig(sphere_points=np.ones((5, 3)), sphere_grid=(4, 8))
 
-    @pytest.mark.parametrize("bad", [(1, 8), (4, 2), (4,), (4, 8, 2), (400, 400)])
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            (1, 8),
+            (4, 2),
+            (4,),
+            (4, 8, 2),
+            (400, 400),
+            (4.5, 8),
+            (4, True),
+        ],
+    )
     def test_rejects_bad_sphere_grid(self, bad):
         with pytest.raises(ValueError, match="sphere_grid"):
             ObservationConfig(sphere_grid=bad)
 
-    @pytest.mark.parametrize("bad", [0.0, -10.0, 180.5])
+    @pytest.mark.parametrize(
+        "bad",
+        [0.0, -10.0, 180.5, float("nan"), float("inf"), -float("inf")],
+    )
     def test_rejects_bad_sphere_theta_max(self, bad):
         with pytest.raises(ValueError, match="sphere_theta_max_deg"):
             ObservationConfig(sphere_theta_max_deg=bad)

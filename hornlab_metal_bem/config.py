@@ -101,6 +101,16 @@ MetalNativeAssemblyMode = Literal["corrected", "optimized", "reference", "parity
 NATIVE_SYMMETRY_PLANES: tuple[str, ...] = ("yz", "xz", "xy", "yz+xz")
 
 
+def _is_integral_value(value: object) -> bool:
+    """Return whether ``value`` represents an integer, excluding booleans."""
+    if isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value)) and int(value) == value
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 @dataclass
 class ObservationConfig:
     planes: list[str] = field(default_factory=lambda: ["horizontal", "vertical"])
@@ -138,10 +148,15 @@ class ObservationConfig:
     def __post_init__(self) -> None:
         if not self.planes:
             raise ValueError("observation planes must not be empty")
-        if self.distance_m <= 0:
-            raise ValueError("distance_m must be positive")
-        if self.angle_count < 1:
+        if not (math.isfinite(self.distance_m) and self.distance_m > 0):
+            raise ValueError("distance_m must be finite and positive")
+        if not math.isfinite(self.angle_min_deg):
+            raise ValueError("angle_min_deg must be finite")
+        if not math.isfinite(self.angle_max_deg):
+            raise ValueError("angle_max_deg must be finite")
+        if not _is_integral_value(self.angle_count) or self.angle_count < 1:
             raise ValueError("angle_count must be at least 1")
+        self.angle_count = int(self.angle_count)
         if self.origin not in {"mouth", "throat"}:
             raise ValueError("origin must be 'mouth' or 'throat'")
         if self.sphere_points is not None:
@@ -163,6 +178,8 @@ class ObservationConfig:
             grid = tuple(self.sphere_grid)
             if len(grid) != 2:
                 raise ValueError("sphere_grid must be (n_theta, n_phi)")
+            if not all(_is_integral_value(value) for value in grid):
+                raise ValueError("sphere_grid counts must be integers")
             n_theta, n_phi = (int(grid[0]), int(grid[1]))
             if n_theta < 2:
                 raise ValueError("sphere_grid n_theta must be at least 2")
@@ -325,24 +342,41 @@ class SolveConfig:
     def __post_init__(self) -> None:
         if self.freq_spacing not in {"log", "linear"}:
             raise ValueError("freq_spacing must be 'log' or 'linear'")
-        if self.freq_count < 1:
+        if not _is_integral_value(self.freq_count) or self.freq_count < 1:
             raise ValueError("freq_count must be at least 1")
-        if self.freq_min_hz <= 0:
-            raise ValueError("freq_min_hz must be positive")
+        self.freq_count = int(self.freq_count)
+        if not (math.isfinite(self.freq_min_hz) and self.freq_min_hz > 0):
+            raise ValueError("freq_min_hz must be finite and positive")
+        if not math.isfinite(self.freq_max_hz):
+            raise ValueError("freq_max_hz must be finite")
         if self.freq_max_hz < self.freq_min_hz:
             raise ValueError("freq_max_hz must be >= freq_min_hz")
-        if self.mesh_scale <= 0:
-            raise ValueError("mesh_scale must be positive")
-        if self.air_density <= 0:
-            raise ValueError("air_density must be positive")
-        if self.dense_solve_rcond_warning_threshold < 0:
-            raise ValueError("dense_solve_rcond_warning_threshold must be non-negative")
-        if self.mesh_elements_per_wavelength_min <= 0:
-            raise ValueError("mesh_elements_per_wavelength_min must be positive")
+        if not (math.isfinite(self.mesh_scale) and self.mesh_scale > 0):
+            raise ValueError("mesh_scale must be finite and positive")
+        if not math.isfinite(self.mesh_merge_tol):
+            raise ValueError("mesh_merge_tol must be finite")
+        if not (math.isfinite(self.air_density) and self.air_density > 0):
+            raise ValueError("air_density must be finite and positive")
+        if not (
+            math.isfinite(self.dense_solve_rcond_warning_threshold)
+            and self.dense_solve_rcond_warning_threshold >= 0
+        ):
+            raise ValueError(
+                "dense_solve_rcond_warning_threshold must be finite and non-negative"
+            )
+        if not (
+            math.isfinite(self.mesh_elements_per_wavelength_min)
+            and self.mesh_elements_per_wavelength_min > 0
+        ):
+            raise ValueError(
+                "mesh_elements_per_wavelength_min must be finite and positive"
+            )
         if self.formulation not in {BIEFormulation.STANDARD, BIEFormulation.COMPLEX_K}:
             raise ValueError("formulation must be 'standard' or 'complex_k'")
-        if self.complex_k_shift < 0:
-            raise ValueError("complex_k_shift must be non-negative")
+        if not (
+            math.isfinite(self.complex_k_shift) and self.complex_k_shift >= 0
+        ):
+            raise ValueError("complex_k_shift must be finite and non-negative")
         if self.velocity_mode not in {VelocityMode.VELOCITY, VelocityMode.ACCELERATION}:
             raise ValueError("velocity_mode must be 'velocity' or 'acceleration'")
         if self.source_motion not in {SourceMotion.NORMAL, SourceMotion.AXIAL}:
@@ -419,20 +453,18 @@ class SolveConfig:
             )
         if self.dense_solve_dtype not in {"float32", "float64"}:
             raise ValueError("dense_solve_dtype must be 'float32' or 'float64'")
-        if (
-            self.metal_native_threads_per_group is not None
-            and self.metal_native_threads_per_group <= 0
-        ):
-            raise ValueError("metal_native_threads_per_group must be positive")
         for name in (
+            "metal_native_threads_per_group",
             "metal_native_matrix_threads_per_group",
             "metal_native_rhs_threads_per_group",
             "metal_native_duffy_threads_per_group",
             "metal_native_field_threads_per_group",
         ):
             value = getattr(self, name)
-            if value is not None and value <= 0:
-                raise ValueError(f"{name} must be positive")
+            if value is not None:
+                if not _is_integral_value(value) or value <= 0:
+                    raise ValueError(f"{name} must be a positive integer")
+                setattr(self, name, int(value))
 
 
 def _validate_source_profile(profile: SourceProfile) -> None:
