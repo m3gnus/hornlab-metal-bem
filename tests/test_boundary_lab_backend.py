@@ -84,6 +84,91 @@ def test_boundary_lab_config_accepts_explicit_frequencies_and_overrides():
     assert config.metal_native_threads_per_group == 64
 
 
+@pytest.mark.parametrize(
+    "frequencies",
+    [
+        [],
+        [[1000.0, 2000.0]],
+        [0.0],
+        [np.nan],
+        True,
+        [1000.0, True],
+        [1000.0 + 1.0j],
+    ],
+)
+def test_boundary_lab_config_rejects_invalid_explicit_frequencies(frequencies):
+    with pytest.raises(BoundaryLabSolverError, match="frequencies_hz"):
+        solve_config_from_boundary_lab({"frequencies_hz": frequencies})
+
+
+def test_boundary_lab_config_accepts_numpy_scalar_frequency():
+    _, frequencies = solve_config_from_boundary_lab(
+        {"frequencies_hz": np.int64(1000)}
+    )
+
+    np.testing.assert_array_equal(frequencies, [1000.0])
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"source_tag": True},
+        {"source_tag": 2.5},
+        {"velocity_sources": {2.5: 1.0}},
+        {"radiators": ({"tag": False},)},
+        {"radiators": ({"tag": 7.5},)},
+    ],
+)
+def test_boundary_lab_config_rejects_non_integral_source_tags(config):
+    with pytest.raises(BoundaryLabSolverError, match="tag"):
+        solve_config_from_boundary_lab(config)
+
+
+@pytest.mark.parametrize("radiators", [{"tag": 7}, "radiator"])
+def test_boundary_lab_config_rejects_non_sequence_radiators(radiators):
+    with pytest.raises(BoundaryLabSolverError, match="radiators must be a sequence"):
+        solve_config_from_boundary_lab({"radiators": radiators})
+
+
+@pytest.mark.parametrize("offset_db", [np.nan, np.inf, 1.0e308])
+def test_boundary_lab_config_rejects_invalid_radiator_velocity_offset(offset_db):
+    with pytest.raises(BoundaryLabSolverError, match="velocity_offset_db"):
+        solve_config_from_boundary_lab(
+            {"radiators": ({"tag": 7, "velocity_offset_db": offset_db},)}
+        )
+
+
+@pytest.mark.parametrize(
+    ("config", "match"),
+    [
+        ({"angle_count": True}, "angle_count"),
+        ({"angle_count": 2.5}, "angle_count"),
+        ({"step_size": np.inf}, "step_size"),
+        (
+            {"min_angle": 90.0, "max_angle": -90.0},
+            "maximum observation angle",
+        ),
+        (
+            {
+                "spherical_sampling_enabled": True,
+                "spherical_sampling_points": 0,
+            },
+            "spherical_sampling_points",
+        ),
+        (
+            {
+                "spherical_sampling_enabled": True,
+                "spherical_sampling_points": 2.5,
+            },
+            "spherical_sampling_points",
+        ),
+    ],
+)
+def test_boundary_lab_config_rejects_invalid_observation_grid(config, match):
+    with pytest.raises(BoundaryLabSolverError, match=match):
+        solve_config_from_boundary_lab(config)
+
+
 def test_boundary_lab_backend_exposes_stable_id_and_session():
     backend = create_backend(freq_count=3)
     session = backend.create_session({"freq_min_hz": 900.0})

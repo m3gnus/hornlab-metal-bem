@@ -119,8 +119,9 @@ then approaches max(GPU assembly, CPU solve) instead of their sum.
 
 `create_backend(**default_overrides)` returns a `BoundaryLabBackend` with
 capabilities that match the local native backend: streaming, cancellation,
-impedance, and symmetry are supported; spherical sampling, Burton-Miller,
-remote assets, flat target normalization, and parallel workers are not exposed.
+impedance, symmetry, spherical sampling, flat target normalization, and channel
+resynthesis are supported; Burton-Miller, remote assets, and parallel workers
+are not exposed.
 
 `BoundaryLabSession` accepts either a Boundary Lab `SolveRequest`-like object or
 a raw `SimulationConfig`-like object. The adapter deliberately accepts dicts and

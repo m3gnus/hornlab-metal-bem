@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from numbers import Integral
 import queue
 import platform
@@ -310,6 +311,7 @@ def solve_config_from_boundary_lab(
         default=None,
     )
     frequencies_hz = _coerce_frequencies(frequencies)
+    radiators = _coerce_radiators(simulation_config)
 
     # Derive the observation arc directly from the Boundary Lab angle grid so
     # the solved angles always match the metadata.polar_angle_deg the adapter
@@ -382,8 +384,14 @@ def solve_config_from_boundary_lab(
             "frequency_spacing",
             default="log",
         ),
-        "velocity_sources": _coerce_velocity_sources(simulation_config),
-        "velocity_source_callback": _coerce_velocity_source_callback(simulation_config),
+        "velocity_sources": _coerce_velocity_sources(
+            simulation_config,
+            radiators=radiators,
+        ),
+        "velocity_source_callback": _coerce_velocity_source_callback(
+            simulation_config,
+            radiators=radiators,
+        ),
         "velocity_mode": VelocityMode.VELOCITY,
         # Boundary Lab's Burton-Miller toggle requests fictitious-eigenvalue
         # robustness. The Metal core has no Burton-Miller operator, but its
@@ -446,13 +454,125 @@ def _first(source: Any | None, *names: str, default: Any) -> Any:
 def _coerce_frequencies(value: Any) -> np.ndarray | None:
     if value is None:
         return None
-    if isinstance(value, (int, float)):
-        return np.asarray([float(value)], dtype=np.float64)
-    if isinstance(value, np.ndarray):
-        return np.asarray(value, dtype=np.float64)
-    if isinstance(value, Iterable) and not isinstance(value, (str, bytes, dict)):
-        return np.asarray(list(value), dtype=np.float64)
-    raise BoundaryLabSolverError("frequencies_hz must be a number or sequence")
+    if isinstance(value, (bool, np.bool_)):
+        raise BoundaryLabSolverError(
+            "frequencies_hz must be a positive number or one-dimensional sequence"
+        )
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        raw = np.asarray([value])
+    elif isinstance(value, np.ndarray):
+        raw = value
+    elif isinstance(value, Iterable) and not isinstance(value, (str, bytes, dict)):
+        values = list(value)
+        if any(isinstance(item, (bool, np.bool_)) for item in values):
+            raise BoundaryLabSolverError(
+                "frequencies_hz values must be real numbers"
+            )
+        raw = np.asarray(values)
+    else:
+        raise BoundaryLabSolverError(
+            "frequencies_hz must be a positive number or one-dimensional sequence"
+        )
+    if any(
+        isinstance(item, (bool, np.bool_))
+        for item in np.asarray(raw, dtype=object).flat
+    ):
+        raise BoundaryLabSolverError("frequencies_hz values must be real numbers")
+    if np.iscomplexobj(raw):
+        raise BoundaryLabSolverError("frequencies_hz values must be real")
+    try:
+        frequencies = np.asarray(raw, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise BoundaryLabSolverError(
+            "frequencies_hz values must be real numbers"
+        ) from exc
+    if frequencies.ndim == 0:
+        frequencies = frequencies.reshape(1)
+    if frequencies.ndim != 1 or frequencies.size == 0:
+        raise BoundaryLabSolverError(
+            "frequencies_hz must be a non-empty one-dimensional sequence"
+        )
+    if not np.all(np.isfinite(frequencies)) or np.any(frequencies <= 0.0):
+        raise BoundaryLabSolverError(
+            "frequencies_hz values must be finite and positive"
+        )
+    return frequencies
+
+
+def _coerce_exact_int(value: Any, field_name: str, *, minimum: int) -> int:
+    if isinstance(value, (bool, np.bool_)):
+        raise BoundaryLabSolverError(
+            f"{field_name} must be an integer >= {minimum}"
+        )
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise BoundaryLabSolverError(
+            f"{field_name} must be an integer >= {minimum}"
+        ) from exc
+    if isinstance(value, str):
+        try:
+            exact = float(value)
+        except ValueError as exc:
+            raise BoundaryLabSolverError(
+                f"{field_name} must be an integer >= {minimum}"
+            ) from exc
+        is_exact = math.isfinite(exact) and exact == normalized
+    else:
+        try:
+            is_exact = bool(value == normalized)
+        except Exception:
+            is_exact = False
+    if not is_exact or normalized < minimum:
+        raise BoundaryLabSolverError(
+            f"{field_name} must be an integer >= {minimum}"
+        )
+    return normalized
+
+
+def _coerce_finite_float(value: Any, field_name: str) -> float:
+    if isinstance(value, (bool, np.bool_)):
+        raise BoundaryLabSolverError(f"{field_name} must be a finite number")
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise BoundaryLabSolverError(
+            f"{field_name} must be a finite number"
+        ) from exc
+    if not math.isfinite(normalized):
+        raise BoundaryLabSolverError(f"{field_name} must be a finite number")
+    return normalized
+
+
+def _coerce_radiators(source: Any | None) -> tuple[Any, ...]:
+    value = _first(source, "radiators", default=None)
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes, dict)) or not isinstance(value, Iterable):
+        raise BoundaryLabSolverError("radiators must be a sequence")
+    return tuple(value)
+
+
+def _coerce_source_tag(value: Any, field_name: str) -> int:
+    return _coerce_exact_int(value, field_name, minimum=0)
+
+
+def _radiator_velocity_scale(radiator: Any, index: int) -> float:
+    offset_db = _coerce_finite_float(
+        _first(radiator, "velocity_offset_db", default=0.0),
+        f"radiators[{index}].velocity_offset_db",
+    )
+    try:
+        scale = 10.0 ** (offset_db / 20.0)
+    except OverflowError as exc:
+        raise BoundaryLabSolverError(
+            f"radiators[{index}].velocity_offset_db is too large"
+        ) from exc
+    if not math.isfinite(scale):
+        raise BoundaryLabSolverError(
+            f"radiators[{index}].velocity_offset_db is too large"
+        )
+    return scale
 
 
 def _coerce_boundary_aperture_tag(source: Any | None) -> int | None:
@@ -481,19 +601,42 @@ def _coerce_boundary_aperture_tag(source: Any | None) -> int | None:
     return normalized[0][1]
 
 
-def _coerce_velocity_sources(source: Any | None) -> dict[int, float]:
+def _coerce_velocity_sources(
+    source: Any | None,
+    *,
+    radiators: tuple[Any, ...] | None = None,
+) -> dict[int, float]:
     value = _first(source, "velocity_sources", default=None)
     if value is not None:
-        return {int(k): float(v) for k, v in dict(value).items()}
-    radiators = tuple(_first(source, "radiators", default=()) or ())
+        try:
+            items = dict(value).items()
+        except (TypeError, ValueError) as exc:
+            raise BoundaryLabSolverError(
+                "velocity_sources must map tags to finite weights"
+            ) from exc
+        return {
+            _coerce_source_tag(tag, "velocity_sources tag"): _coerce_finite_float(
+                weight,
+                "velocity_sources weight",
+            )
+            for tag, weight in items
+        }
+    radiators = _coerce_radiators(source) if radiators is None else radiators
     if radiators:
         return {
-            int(_first(radiator, "tag", default=2)): 1.0
-            for radiator in radiators
+            _coerce_source_tag(
+                _first(radiator, "tag", default=2),
+                f"radiators[{index}].tag",
+            ): 1.0
+            for index, radiator in enumerate(radiators)
         }
-    source_tag = int(_first(source, "source_tag", "driver_tag", default=2))
-    source_weight = float(
-        _first(source, "source_weight", "velocity_weight", default=1.0)
+    source_tag = _coerce_source_tag(
+        _first(source, "source_tag", "driver_tag", default=2),
+        "source_tag",
+    )
+    source_weight = _coerce_finite_float(
+        _first(source, "source_weight", "velocity_weight", default=1.0),
+        "source_weight",
     )
     return {source_tag: source_weight}
 
@@ -506,7 +649,7 @@ def _channel_basis_sources(source: Any | None) -> tuple[np.ndarray, list[dict[in
     Radiator ``velocity_offset_db`` is part of the source basis because it is a
     per-radiator scale, not a post-solve channel control.
     """
-    radiators = tuple(_first(source, "radiators", default=()) or ())
+    radiators = _coerce_radiators(source)
     if not radiators:
         return np.asarray(["main"]), [
             {int(tag): complex(value) for tag, value in _coerce_velocity_sources(source).items()}
@@ -516,11 +659,14 @@ def _channel_basis_sources(source: Any | None) -> tuple[np.ndarray, list[dict[in
     sources: list[dict[int, complex]] = []
     for name in names:
         values: dict[int, complex] = {}
-        for radiator in radiators:
+        for index, radiator in enumerate(radiators):
             if str(_first(radiator, "channel", default="main")) != name:
                 continue
-            tag = int(_first(radiator, "tag", default=2))
-            velocity_offset = 10.0 ** (float(_first(radiator, "velocity_offset_db", default=0.0)) / 20.0)
+            tag = _coerce_source_tag(
+                _first(radiator, "tag", default=2),
+                f"radiators[{index}].tag",
+            )
+            velocity_offset = _radiator_velocity_scale(radiator, index)
             values[tag] = values.get(tag, 0.0 + 0.0j) + complex(velocity_offset)
         if not values:
             raise BoundaryLabSolverError(f"Channel {name!r} has no driven radiators.")
@@ -528,27 +674,40 @@ def _channel_basis_sources(source: Any | None) -> tuple[np.ndarray, list[dict[in
     return np.asarray(names), sources
 
 
-def _coerce_velocity_source_callback(source: Any | None) -> Callable[[float], dict[int, complex]] | None:
+def _coerce_velocity_source_callback(
+    source: Any | None,
+    *,
+    radiators: tuple[Any, ...] | None = None,
+) -> Callable[[float], dict[int, complex]] | None:
     if _first(source, "velocity_sources", default=None) is not None:
         return None
-    radiators = tuple(_first(source, "radiators", default=()) or ())
+    radiators = _coerce_radiators(source) if radiators is None else radiators
     if not radiators:
         return None
     channels = _channel_configs_by_name(source)
+    radiator_values = tuple(
+        (
+            radiator,
+            _coerce_source_tag(
+                _first(radiator, "tag", default=2),
+                f"radiators[{index}].tag",
+            ),
+            str(_first(radiator, "channel", default="main")),
+            _radiator_velocity_scale(radiator, index),
+        )
+        for index, radiator in enumerate(radiators)
+    )
 
     def callback(frequency_hz: float) -> dict[int, complex]:
         drives: dict[int, complex] = {}
-        for radiator in radiators:
-            tag = int(_first(radiator, "tag", default=2))
-            channel = channels.get(str(_first(radiator, "channel", default="main")))
+        for radiator, tag, channel_name, velocity_scale in radiator_values:
+            channel = channels.get(channel_name)
             drive = (
                 _channel_drive(channel, frequency_hz)
                 if channel is not None
                 else _radiator_drive(radiator, frequency_hz)
             )
-            drive *= 10.0 ** (
-                float(_first(radiator, "velocity_offset_db", default=0.0)) / 20.0
-            )
+            drive *= velocity_scale
             drives[tag] = drives.get(tag, 0.0 + 0.0j) + drive
         return drives
 
@@ -566,7 +725,7 @@ def _boundary_lab_channel_configs_by_name(source: Any | None) -> dict[str, Any]:
         return channels
 
     resolved: dict[str, Any] = {}
-    for radiator in tuple(_first(source, "radiators", default=()) or ()):
+    for radiator in _coerce_radiators(source):
         name = str(_first(radiator, "channel", default="main"))
         resolved[name] = radiator
     return resolved
@@ -678,14 +837,28 @@ def _butterworth_response(crossover_type: str, order: int, cutoff_hz: float, fre
 
 def _boundary_lab_angles(source: Any | None) -> np.ndarray:
     explicit_count = _first(source, "angle_count", "n_angles", default=None)
-    angle_min = float(_first(source, "angle_min_deg", "min_angle_deg", "min_angle", default=0.0))
-    angle_max = float(_first(source, "angle_max_deg", "max_angle_deg", "max_angle", default=180.0))
+    angle_min = _coerce_finite_float(
+        _first(source, "angle_min_deg", "min_angle_deg", "min_angle", default=0.0),
+        "minimum observation angle",
+    )
+    angle_max = _coerce_finite_float(
+        _first(source, "angle_max_deg", "max_angle_deg", "max_angle", default=180.0),
+        "maximum observation angle",
+    )
     if explicit_count is not None:
-        return np.linspace(angle_min, angle_max, int(explicit_count), dtype=np.float64)
+        count = _coerce_exact_int(explicit_count, "angle_count", minimum=1)
+        return np.linspace(angle_min, angle_max, count, dtype=np.float64)
 
-    step = float(_first(source, "step_size", "polar_angle_step_deg", default=5.0))
-    if step <= 0:
-        raise BoundaryLabSolverError("step_size must be positive.")
+    step = _coerce_finite_float(
+        _first(source, "step_size", "polar_angle_step_deg", default=5.0),
+        "step_size",
+    )
+    if step <= 0.0:
+        raise BoundaryLabSolverError("step_size must be positive")
+    if angle_max < angle_min:
+        raise BoundaryLabSolverError(
+            "maximum observation angle must be >= minimum observation angle"
+        )
     return np.clip(
         np.arange(angle_min, angle_max + 0.5 * step, step, dtype=np.float64),
         angle_min,
@@ -706,15 +879,30 @@ def _boundary_lab_sphere(
     """
     if not bool(_first(source, "spherical_sampling_enabled", default=False)):
         return None
-    count = int(
-        _first(source, "spherical_sampling_points", "balloon_sampling_points", default=6000)
+    count = _coerce_exact_int(
+        _first(
+            source,
+            "spherical_sampling_points",
+            "balloon_sampling_points",
+            default=6000,
+        ),
+        "spherical_sampling_points",
+        minimum=1,
     )
-    if count <= 0:
-        return None
-    distance = float(
-        _first(source, "distance", "distance_m", "observation_distance_m", default=2.0)
+    distance = _coerce_finite_float(
+        _first(
+            source,
+            "distance",
+            "distance_m",
+            "observation_distance_m",
+            default=2.0,
+        ),
+        "observation distance",
     )
-    axial_offset = float(_first(source, "axial_offset", "axial_offset_m", default=0.0))
+    axial_offset = _coerce_finite_float(
+        _first(source, "axial_offset", "axial_offset_m", default=0.0),
+        "axial_offset",
+    )
 
     indices = np.arange(count, dtype=float)
     golden_angle = np.pi * (3.0 - np.sqrt(5.0))
@@ -733,9 +921,18 @@ def _boundary_lab_sphere(
 
 
 def _radiator_names(source: Any | None) -> tuple[str, ...]:
-    radiators = tuple(_first(source, "radiators", default=()) or ())
+    radiators = _coerce_radiators(source)
     if radiators:
-        return tuple(str(_first(radiator, "name", default=f"tag_{_first(radiator, 'tag', default=2)}")) for radiator in radiators)
+        names = []
+        for index, radiator in enumerate(radiators):
+            tag = _coerce_source_tag(
+                _first(radiator, "tag", default=2),
+                f"radiators[{index}].tag",
+            )
+            names.append(
+                str(_first(radiator, "name", default=f"tag_{tag}"))
+            )
+        return tuple(names)
     return ("throat",)
 
 
