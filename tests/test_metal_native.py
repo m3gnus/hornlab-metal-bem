@@ -853,6 +853,85 @@ def test_dense_solve_field_result_requires_robin_ack(tmp_path):
         )
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+def test_mixed_real_and_complex_k_batch_checks_ack_per_case(
+    monkeypatch,
+    tmp_path,
+    streaming,
+):
+    session = MetalNativeStandardSession(
+        SimpleNamespace(work_dir=tmp_path, session_id="session"),
+        SimpleNamespace(
+            dp0_dof_count=1,
+            p1_dof_count=1,
+            aperture_tag=None,
+        ),
+        owns_work_dir=False,
+        runtime_config=None,
+    )
+
+    def case_results(payload):
+        cases = []
+        for case in payload["cases"]:
+            case_result = {
+                **_minimal_dense_solve_field_case(),
+                "frequency_hz": case["frequency_hz"],
+                "observation_pressure_real_f32": case["outputs"][
+                    "observation_pressure_real_f32"
+                ]["path"],
+                "observation_pressure_imag_f32": case["outputs"][
+                    "observation_pressure_imag_f32"
+                ]["path"],
+            }
+            if case["k_imag_f32"] != 0.0:
+                case_result["complex_k"] = True
+            cases.append(case_result)
+        return cases
+
+    def fake_run(op, *, payload_path, result_path):
+        assert op == "assemble_solve_evaluate_standard_neumann_batch"
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        cases = case_results(payload)
+        result_path.write_text(json.dumps({"cases": cases}), encoding="utf-8")
+
+    def fake_run_streaming(op, *, payload_path, result_path, poll):
+        assert op == "assemble_solve_evaluate_standard_neumann_batch"
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        cases = case_results(payload)
+        case_dir = tmp_path / payload["case_results_dir"]
+        case_dir.mkdir(parents=True)
+        for index, case in enumerate(cases):
+            (case_dir / f"case-{index:04d}.json").write_text(
+                json.dumps(case),
+                encoding="utf-8",
+            )
+        result_path.write_text(json.dumps({"cases": cases}), encoding="utf-8")
+        return not poll()
+
+    monkeypatch.setattr(session, "_run_native_helper", fake_run)
+    monkeypatch.setattr(session, "_run_native_helper_streaming", fake_run_streaming)
+
+    callback_indices = []
+
+    def record_callback(index, _solved):
+        callback_indices.append(index)
+
+    solved = session.assemble_solve_evaluate_standard_neumann_batch(
+        np.array([100.0, 200.0]),
+        np.array([1.0, 2.0], dtype=np.float32),
+        np.ones((2, 1), dtype=np.complex64),
+        np.array([[0.0, 0.0, 1.0]], dtype=np.float32),
+        k_imag_f32=np.array([0.0, 0.01], dtype=np.float32),
+        write_surface_pressure=False,
+        on_case_result=record_callback if streaming else None,
+    )
+
+    assert len(solved) == 2
+    assert solved[0].diagnostics.get("complex_k") is not True
+    assert solved[1].diagnostics["complex_k"] is True
+    assert callback_indices == ([0, 1] if streaming else [])
+
+
 def test_native_discovery_reports_missing_helper_assets(monkeypatch, tmp_path):
     monkeypatch.setattr(native.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(native.platform, "machine", lambda: "arm64")
