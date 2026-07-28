@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from hornlab_metal_bem.config import (
     AnnularProfile,
@@ -302,6 +303,30 @@ class TestSingleCallbackEvaluation:
         assert rows.shape == (len(frequencies), 2)
         assert np.all(rows[:, 0] != 0.0)  # tag 2 driven every case
         assert np.all(rows[:, 1] == 0.0)  # tag 5 carried by static Robin
+
+    def test_velocity_callback_rejects_invalid_results(self):
+        from hornlab_metal_bem.bie import _build_driver_neumann_coeffs
+
+        dp0_space = SimpleNamespace(global_dof_count=1)
+        physical_tags = np.array([2], dtype=np.int32)
+        for callback_result in (
+            [(2, 1.0)],
+            {2.5: 1.0},
+            {2: float("nan")},
+            {2: "invalid"},
+        ):
+            config = SolveConfig(
+                velocity_sources={2: 1.0},
+                velocity_source_callback=lambda f, result=callback_result: result,
+            )
+            with pytest.raises(ValueError, match="velocity_source_callback"):
+                _build_driver_neumann_coeffs(
+                    dp0_space,
+                    physical_tags,
+                    2 * np.pi * 1000.0,
+                    config,
+                    np.complex64,
+                )
 
 
 # ---------------------------------------------------------------------------

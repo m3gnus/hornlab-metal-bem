@@ -24,6 +24,7 @@ from .config import (
     BIEFormulation,
     NATIVE_SYMMETRY_PLANES,
     SolveConfig,
+    _validated_impedance_sources,
 )
 from .mesh import LoadedMesh, make_pure_function_spaces
 from .observation import ObservationFrame, build_observation_points, build_sphere_grid_points
@@ -206,31 +207,19 @@ def _impedance_sources_for_frequencies(
     for freq in frequencies:
         f = float(freq)
         merged = dict(static)
-        callback_betas = config.impedance_source_callback(f)
+        callback_betas = _validated_impedance_sources(
+            config.impedance_source_callback(f),
+            field_name=f"impedance_source_callback({f:.3f}) result",
+        )
         for tag, beta in callback_betas.items():
-            tag_int = int(tag)
-            if tag_int not in mesh_tags:
+            if tag not in mesh_tags:
                 logger.warning(
                     "impedance_source_callback returned tag %d not in mesh; "
                     "skipping",
-                    tag_int,
+                    tag,
                 )
                 continue
-            beta_value = complex(beta)
-            if not (
-                math.isfinite(beta_value.real) and math.isfinite(beta_value.imag)
-            ):
-                raise ValueError(
-                    f"impedance_source_callback({f:.3f}) returned non-finite "
-                    f"beta for tag {tag_int}"
-                )
-            if beta_value.real < 0.0:
-                raise ValueError(
-                    f"impedance_source_callback({f:.3f}) returned "
-                    f"Re(beta)={beta_value.real:.4g} < 0 for tag {tag_int}; "
-                    "admittance must be passive (Re(beta) >= 0)"
-                )
-            merged[tag_int] = beta_value
+            merged[tag] = beta
         per_case.append(merged)
     return per_case
 

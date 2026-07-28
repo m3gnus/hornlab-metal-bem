@@ -14,6 +14,7 @@ from .config import (
     SourceMotion,
     TaperProfile,
     VelocityMode,
+    _validated_velocity_sources,
 )
 from .observation import _project_to_symmetry_subspace
 
@@ -341,10 +342,16 @@ def _build_driver_neumann_coeffs(
     coeffs = np.zeros(dp0_space.global_dof_count, dtype=dtype)
     air_density = config.air_density
     frequency_hz = float(omega) / (2.0 * np.pi) if omega > 0 else 0.0
-    velocity_sources = (
+    callback_sources = config.velocity_source_callback is not None
+    velocity_sources = _validated_velocity_sources(
         config.velocity_source_callback(frequency_hz)
-        if config.velocity_source_callback is not None
-        else config.velocity_sources
+        if callback_sources
+        else config.velocity_sources,
+        field_name=(
+            f"velocity_source_callback({frequency_hz:.3f}) result"
+            if callback_sources
+            else "velocity_sources"
+        ),
     )
     # Skip prescribing a velocity BC on any tag carrying a Robin (impedance)
     # BC, otherwise the tag would receive a double boundary condition. The

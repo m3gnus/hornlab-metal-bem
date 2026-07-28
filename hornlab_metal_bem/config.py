@@ -111,6 +111,67 @@ def _is_integral_value(value: object) -> bool:
         return False
 
 
+def _validate_boundary_tag(tag: object, field_name: str) -> int:
+    """Validate and normalize one physical-boundary tag."""
+    if isinstance(tag, bool) or not isinstance(tag, Integral) or int(tag) < 0:
+        raise ValueError(f"{field_name} tags must be non-negative integers")
+    return int(tag)
+
+
+def _validated_velocity_sources(
+    sources: object,
+    *,
+    field_name: str = "velocity_sources",
+) -> dict[int, object]:
+    """Return a tag-normalized velocity mapping after validating its weights."""
+    if not isinstance(sources, dict):
+        raise ValueError(f"{field_name} must be a dict mapping tags to weights")
+    validated: dict[int, object] = {}
+    for tag, weight in sources.items():
+        tag_int = _validate_boundary_tag(tag, field_name)
+        try:
+            weight_value = complex(weight)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"{field_name} weights must be finite complex numbers"
+            ) from exc
+        if not (
+            math.isfinite(weight_value.real) and math.isfinite(weight_value.imag)
+        ):
+            raise ValueError(f"{field_name} weights must be finite complex numbers")
+        validated[tag_int] = weight
+    return validated
+
+
+def _validated_impedance_sources(
+    sources: object,
+    *,
+    field_name: str = "impedance_sources",
+) -> dict[int, complex]:
+    """Return a normalized, finite, passive boundary-admittance mapping."""
+    if not isinstance(sources, dict):
+        raise ValueError(f"{field_name} must be a dict mapping tags to admittances")
+    validated: dict[int, complex] = {}
+    for tag, beta in sources.items():
+        tag_int = _validate_boundary_tag(tag, field_name)
+        try:
+            beta_value = complex(beta)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"{field_name} values must be finite complex numbers"
+            ) from exc
+        if not (
+            math.isfinite(beta_value.real) and math.isfinite(beta_value.imag)
+        ):
+            raise ValueError(f"{field_name} values must be finite complex numbers")
+        if beta_value.real < 0.0:
+            raise ValueError(
+                f"{field_name} admittance must be passive (Re(beta) >= 0)"
+            )
+        validated[tag_int] = beta_value
+    return validated
+
+
 @dataclass
 class ObservationConfig:
     planes: list[str] = field(default_factory=lambda: ["horizontal", "vertical"])
@@ -381,27 +442,24 @@ class SolveConfig:
             raise ValueError("velocity_mode must be 'velocity' or 'acceleration'")
         if self.source_motion not in {SourceMotion.NORMAL, SourceMotion.AXIAL}:
             raise ValueError("source_motion must be 'normal' or 'axial'")
+        _validated_velocity_sources(self.velocity_sources)
+        if (
+            self.velocity_source_callback is not None
+            and not callable(self.velocity_source_callback)
+        ):
+            raise ValueError("velocity_source_callback must be callable or None")
         if self.source_velocity_profiles is not None:
             if not isinstance(self.source_velocity_profiles, dict):
                 raise ValueError("source_velocity_profiles must be a dict or None")
             for tag, profile in self.source_velocity_profiles.items():
-                tag_int = int(tag)
-                if tag_int < 0:
-                    raise ValueError(
-                        "source_velocity_profiles tags must be non-negative integers"
-                    )
+                _validate_boundary_tag(tag, "source_velocity_profiles")
                 _validate_source_profile(profile)
-        for tag, beta in self.impedance_sources.items():
-            if int(tag) < 0:
-                raise ValueError("impedance_sources tags must be non-negative integers")
-            beta_value = complex(beta)
-            if not math.isfinite(beta_value.real) or not math.isfinite(beta_value.imag):
-                raise ValueError("impedance_sources values must be finite complex numbers")
-            if beta_value.real < 0.0:
-                raise ValueError(
-                    "impedance_sources admittance must be passive "
-                    "(Re(beta) >= 0)"
-                )
+        _validated_impedance_sources(self.impedance_sources)
+        if (
+            self.impedance_source_callback is not None
+            and not callable(self.impedance_source_callback)
+        ):
+            raise ValueError("impedance_source_callback must be callable or None")
         if self.chief_points is not None:
             import numpy as _np
 

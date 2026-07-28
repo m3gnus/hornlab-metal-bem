@@ -120,9 +120,29 @@ def test_solve_config_accepts_source_velocity_profiles():
 
 
 @pytest.mark.parametrize(
+    "sources",
+    [
+        None,
+        [(2, 1.0)],
+        {True: 1.0},
+        {2.5: 1.0},
+        {-1: 1.0},
+        {2: "invalid"},
+        {2: float("nan")},
+        {2: complex(1.0, float("inf"))},
+    ],
+)
+def test_solve_config_rejects_invalid_velocity_sources(sources):
+    with pytest.raises(ValueError, match="velocity_sources"):
+        SolveConfig(velocity_sources=sources)
+
+
+@pytest.mark.parametrize(
     ("profiles", "match"),
     [
         ({-1: TaperProfile()}, "source_velocity_profiles tags"),
+        ({True: TaperProfile()}, "source_velocity_profiles tags"),
+        ({2.5: TaperProfile()}, "source_velocity_profiles tags"),
         ({2: "raised_cosine"}, "SourceProfile"),
         ({2: TaperProfile(kind="hann")}, "TaperProfile.kind"),
         ({2: TaperProfile(start=-0.1)}, "TaperProfile.start"),
@@ -155,6 +175,18 @@ def test_solve_config_accepts_experimental_complex_k_and_robin():
 
 def test_solve_config_impedance_source_callback_defaults_none():
     assert SolveConfig().impedance_source_callback is None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"velocity_source_callback": 1},
+        {"impedance_source_callback": {}},
+    ],
+)
+def test_solve_config_rejects_noncallable_boundary_callbacks(kwargs):
+    with pytest.raises(ValueError, match="callback"):
+        SolveConfig(**kwargs)
 
 
 def test_impedance_source_callback_per_frequency_overrides_static():
@@ -238,9 +270,35 @@ def test_impedance_source_callback_rejects_nonfinite_beta():
         impedance_sources={8: 0.0 + 0.0j},
         impedance_source_callback=lambda f: {8: complex(float("nan"), 0.0)},
     )
-    with pytest.raises(ValueError, match="non-finite"):
+    with pytest.raises(ValueError, match="finite"):
         _impedance_sources_for_frequencies(
             tags, np.array([500.0], dtype=np.float64), cfg
+        )
+
+
+@pytest.mark.parametrize(
+    "callback_result",
+    [
+        [(8, 0.05)],
+        {True: 0.05},
+        {8.5: 0.05},
+        {-1: 0.05},
+        {8: "invalid"},
+    ],
+)
+def test_impedance_source_callback_rejects_invalid_result(callback_result):
+    import numpy as np
+
+    from hornlab_metal_bem.sweep import _impedance_sources_for_frequencies
+
+    cfg = SolveConfig(
+        impedance_source_callback=lambda f: callback_result,
+    )
+    with pytest.raises(ValueError, match="impedance_source_callback"):
+        _impedance_sources_for_frequencies(
+            np.array([2, 8], dtype=np.int32),
+            np.array([500.0], dtype=np.float64),
+            cfg,
         )
 
 
@@ -267,6 +325,9 @@ def test_impedance_source_callback_skips_unknown_mesh_tag():
         ({"formulation": "burton_miller"}, "formulation"),
         ({"complex_k_shift": -0.1}, "complex_k_shift"),
         ({"impedance_sources": {-1: 0.05 + 0.0j}}, "impedance_sources"),
+        ({"impedance_sources": {True: 0.05 + 0.0j}}, "impedance_sources"),
+        ({"impedance_sources": {8.5: 0.05 + 0.0j}}, "impedance_sources"),
+        ({"impedance_sources": {8: "invalid"}}, "impedance_sources"),
         ({"impedance_sources": {8: complex(float("nan"), 0.0)}}, "impedance_sources"),
     ],
 )
