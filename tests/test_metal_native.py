@@ -875,6 +875,50 @@ def _minimal_dense_solve_field_case() -> dict[str, object]:
     }
 
 
+def test_dense_solve_field_result_materializes_extra_sources(tmp_path):
+    fake_self = SimpleNamespace(info=SimpleNamespace(work_dir=tmp_path))
+    case = {
+        **_minimal_dense_solve_field_case(),
+        "extra_source_results": [
+            {
+                "source_index": 1,
+                "pressure_real_f32": "outputs/source-pressure-re.bin",
+                "pressure_imag_f32": "outputs/source-pressure-im.bin",
+                "pressure_shape": [2],
+                "observation_pressure_real_f32": "outputs/source-field-re.bin",
+                "observation_pressure_imag_f32": "outputs/source-field-im.bin",
+                "field_shape": [3],
+                "field_seconds": 0.04,
+                "field_row_index": 4,
+                "field_batch_shape": [6, 3],
+                "impedance": [1.25, -0.5],
+                "surface_pressure_avg": {"2": [0.75, 0.25]},
+            }
+        ],
+    }
+
+    result = MetalNativeStandardSession._dense_solve_field_result(
+        fake_self,
+        case,
+        {},
+    )
+
+    assert len(result.extra_sources) == 1
+    extra = result.extra_sources[0]
+    assert extra.source_index == 1
+    assert extra.pressure_real_f32 == tmp_path / "outputs/source-pressure-re.bin"
+    assert extra.pressure_imag_f32 == tmp_path / "outputs/source-pressure-im.bin"
+    assert extra.pressure_shape == (2,)
+    assert extra.field_real_f32 == tmp_path / "outputs/source-field-re.bin"
+    assert extra.field_imag_f32 == tmp_path / "outputs/source-field-im.bin"
+    assert extra.field_shape == (3,)
+    assert extra.field_s == 0.04
+    assert extra.field_row_index == 4
+    assert extra.field_batch_shape == (6, 3)
+    assert extra.impedance == 1.25 - 0.5j
+    assert extra.surface_pressure_avg == {2: 0.75 + 0.25j}
+
+
 def test_dense_solve_field_result_requires_complex_k_ack(tmp_path):
     fake_self = SimpleNamespace(info=SimpleNamespace(work_dir=tmp_path))
 

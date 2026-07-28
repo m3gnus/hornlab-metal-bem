@@ -569,26 +569,22 @@ class MetalNativeStandardSession:
             expected_count=int(frequencies.size),
             op="assemble_standard_neumann_batch",
         )
-        systems = []
-        for case_result in case_results:
-            systems.append(
-                DenseAssemblyResult(
-                    session_id=str(case_result["session_id"]),
-                    frequency_hz=float(case_result["frequency_hz"]),
-                    matrix_real_f32=self.info.work_dir
-                    / case_result["matrix_real_f32"],
-                    matrix_imag_f32=self.info.work_dir
-                    / case_result["matrix_imag_f32"],
-                    rhs_real_f32=self.info.work_dir / case_result["rhs_real_f32"],
-                    rhs_imag_f32=self.info.work_dir / case_result["rhs_imag_f32"],
-                    matrix_shape=tuple(
-                        int(v) for v in case_result["matrix_shape"]
-                    ),
-                    rhs_shape=tuple(int(v) for v in case_result["rhs_shape"]),
-                    matrix_layout=str(case_result["matrix_layout"]),
-                )
+        return [
+            DenseAssemblyResult(
+                session_id=str(case_result["session_id"]),
+                frequency_hz=float(case_result["frequency_hz"]),
+                matrix_real_f32=self.info.work_dir
+                / case_result["matrix_real_f32"],
+                matrix_imag_f32=self.info.work_dir
+                / case_result["matrix_imag_f32"],
+                rhs_real_f32=self.info.work_dir / case_result["rhs_real_f32"],
+                rhs_imag_f32=self.info.work_dir / case_result["rhs_imag_f32"],
+                matrix_shape=tuple(int(v) for v in case_result["matrix_shape"]),
+                rhs_shape=tuple(int(v) for v in case_result["rhs_shape"]),
+                matrix_layout=str(case_result["matrix_layout"]),
             )
-        return systems
+            for case_result in case_results
+        ]
 
     def assemble_solve_standard_neumann_batch(
         self,
@@ -681,23 +677,21 @@ class MetalNativeStandardSession:
             expected_count=int(frequencies.size),
             op="assemble_solve_standard_neumann_batch",
         )
-        solved = []
-        for case_result in case_results:
-            solved.append(
-                DenseSolveResult(
-                    session_id=str(case_result["session_id"]),
-                    frequency_hz=float(case_result["frequency_hz"]),
-                    pressure_real_f32=self.info.work_dir
-                    / case_result["pressure_real_f32"],
-                    pressure_imag_f32=self.info.work_dir
-                    / case_result["pressure_imag_f32"],
-                    shape=tuple(int(v) for v in case_result["shape"]),
-                    assembly_s=float(case_result["assembly_seconds"]),
-                    dense_solve_s=float(case_result["dense_solve_seconds"]),
-                    lapack_info=int(case_result["lapack_info"]),
-                )
+        return [
+            DenseSolveResult(
+                session_id=str(case_result["session_id"]),
+                frequency_hz=float(case_result["frequency_hz"]),
+                pressure_real_f32=self.info.work_dir
+                / case_result["pressure_real_f32"],
+                pressure_imag_f32=self.info.work_dir
+                / case_result["pressure_imag_f32"],
+                shape=tuple(int(v) for v in case_result["shape"]),
+                assembly_s=float(case_result["assembly_seconds"]),
+                dense_solve_s=float(case_result["dense_solve_seconds"]),
+                lapack_info=int(case_result["lapack_info"]),
             )
-        return solved
+            for case_result in case_results
+        ]
 
     def assemble_solve_evaluate_standard_neumann_batch(
         self,
@@ -1116,8 +1110,9 @@ class MetalNativeStandardSession:
         expect_multi_source: bool = False,
         expect_coupled_ib: bool = False,
     ) -> Any:
-        from .session import DenseSolveFieldResult
+        from .session import DenseSolveFieldResult, ExtraSourceSolveResult
 
+        work_dir = self.info.work_dir
         pressure_real = case_result.get("pressure_real_f32")
         pressure_imag = case_result.get("pressure_imag_f32")
         diagnostics = _native_case_diagnostics(
@@ -1177,7 +1172,38 @@ class MetalNativeStandardSession:
                 "HORNLAB_METAL_BEM_NATIVE."
             )
         extra_sources = tuple(
-            self._extra_source_solve_result(raw)
+            ExtraSourceSolveResult(
+                source_index=int(raw["source_index"]),
+                pressure_real_f32=(
+                    work_dir / str(raw["pressure_real_f32"])
+                    if raw.get("pressure_real_f32") is not None
+                    else None
+                ),
+                pressure_imag_f32=(
+                    work_dir / str(raw["pressure_imag_f32"])
+                    if raw.get("pressure_imag_f32") is not None
+                    else None
+                ),
+                pressure_shape=tuple(int(v) for v in raw["pressure_shape"]),
+                field_real_f32=work_dir / raw["observation_pressure_real_f32"],
+                field_imag_f32=work_dir / raw["observation_pressure_imag_f32"],
+                field_shape=tuple(int(v) for v in raw["field_shape"]),
+                field_s=float(raw.get("field_seconds", 0.0)),
+                field_row_index=(
+                    int(raw["field_row_index"])
+                    if raw.get("field_row_index") is not None
+                    else None
+                ),
+                field_batch_shape=(
+                    tuple(int(v) for v in raw["field_batch_shape"])
+                    if raw.get("field_batch_shape") is not None
+                    else None
+                ),
+                impedance=_complex_from_manifest(raw.get("impedance")),
+                surface_pressure_avg=_complex_map_from_manifest(
+                    raw.get("surface_pressure_avg")
+                ),
+            )
             for raw in case_result.get("extra_source_results") or ()
         )
         return DenseSolveFieldResult(
@@ -1185,19 +1211,19 @@ class MetalNativeStandardSession:
             batch_id=str(case_result["batch_id"]),
             frequency_hz=float(case_result["frequency_hz"]),
             pressure_real_f32=(
-                self.info.work_dir / str(pressure_real)
+                work_dir / str(pressure_real)
                 if pressure_real is not None
                 else None
             ),
             pressure_imag_f32=(
-                self.info.work_dir / str(pressure_imag)
+                work_dir / str(pressure_imag)
                 if pressure_imag is not None
                 else None
             ),
             pressure_shape=tuple(int(v) for v in case_result["pressure_shape"]),
-            field_real_f32=self.info.work_dir
+            field_real_f32=work_dir
             / case_result["observation_pressure_real_f32"],
-            field_imag_f32=self.info.work_dir
+            field_imag_f32=work_dir
             / case_result["observation_pressure_imag_f32"],
             field_shape=tuple(int(v) for v in case_result["field_shape"]),
             assembly_s=float(case_result["assembly_seconds"]),
@@ -1220,46 +1246,6 @@ class MetalNativeStandardSession:
             ),
             diagnostics=diagnostics,
             extra_sources=extra_sources,
-        )
-
-    def _extra_source_solve_result(self, raw: dict[str, Any]) -> Any:
-        from .session import ExtraSourceSolveResult
-
-        pressure_real = raw.get("pressure_real_f32")
-        pressure_imag = raw.get("pressure_imag_f32")
-        return ExtraSourceSolveResult(
-            source_index=int(raw["source_index"]),
-            pressure_real_f32=(
-                self.info.work_dir / str(pressure_real)
-                if pressure_real is not None
-                else None
-            ),
-            pressure_imag_f32=(
-                self.info.work_dir / str(pressure_imag)
-                if pressure_imag is not None
-                else None
-            ),
-            pressure_shape=tuple(int(v) for v in raw["pressure_shape"]),
-            field_real_f32=self.info.work_dir
-            / raw["observation_pressure_real_f32"],
-            field_imag_f32=self.info.work_dir
-            / raw["observation_pressure_imag_f32"],
-            field_shape=tuple(int(v) for v in raw["field_shape"]),
-            field_s=float(raw.get("field_seconds", 0.0)),
-            field_row_index=(
-                int(raw["field_row_index"])
-                if raw.get("field_row_index") is not None
-                else None
-            ),
-            field_batch_shape=(
-                tuple(int(v) for v in raw["field_batch_shape"])
-                if raw.get("field_batch_shape") is not None
-                else None
-            ),
-            impedance=_complex_from_manifest(raw.get("impedance")),
-            surface_pressure_avg=_complex_map_from_manifest(
-                raw.get("surface_pressure_avg")
-            ),
         )
 
     def _stream_assemble_solve_evaluate(
@@ -1571,21 +1557,19 @@ class MetalNativeStandardSession:
             expected_count=int(frequencies.size),
             op="evaluate_standard_exterior_batch",
         )
-        fields = []
-        for case_result in case_results:
-            fields.append(
-                FieldResult(
-                    session_id=str(case_result["session_id"]),
-                    batch_id=str(case_result["batch_id"]),
-                    frequency_hz=float(case_result["frequency_hz"]),
-                    pressure_real_f32=self.info.work_dir
-                    / case_result["pressure_real_f32"],
-                    pressure_imag_f32=self.info.work_dir
-                    / case_result["pressure_imag_f32"],
-                    shape=tuple(int(v) for v in case_result["shape"]),
-                )
+        return [
+            FieldResult(
+                session_id=str(case_result["session_id"]),
+                batch_id=str(case_result["batch_id"]),
+                frequency_hz=float(case_result["frequency_hz"]),
+                pressure_real_f32=self.info.work_dir
+                / case_result["pressure_real_f32"],
+                pressure_imag_f32=self.info.work_dir
+                / case_result["pressure_imag_f32"],
+                shape=tuple(int(v) for v in case_result["shape"]),
             )
-        return fields
+            for case_result in case_results
+        ]
 
     def close(self) -> None:
         if self._closed:
