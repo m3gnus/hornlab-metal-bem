@@ -18,6 +18,7 @@ from .bie import (
     _build_driver_neumann_coeffs,
     _build_source_face_scale,
     _compute_impedance,
+    _face_indices_for_tags,
     compute_surface_pressure_avg,
 )
 from .config import (
@@ -25,6 +26,7 @@ from .config import (
     NATIVE_SYMMETRY_PLANES,
     SolveConfig,
     _validated_impedance_sources,
+    _validated_velocity_sources,
 )
 from .mesh import LoadedMesh, make_pure_function_spaces
 from .observation import ObservationFrame, build_observation_points, build_sphere_grid_points
@@ -254,6 +256,18 @@ def _build_neumann_rows(
         axial_face_scale = source_face_scale
 
     per_case_list = isinstance(impedance_sources, list)
+    resolved_velocity_sources = None
+    if config.velocity_source_callback is None:
+        resolved_velocity_sources = _validated_velocity_sources(
+            config.velocity_sources
+        )
+        possible_source_tags = resolved_velocity_sources
+    else:
+        possible_source_tags = np.unique(physical_tags)
+    face_indices_by_tag = _face_indices_for_tags(
+        physical_tags,
+        possible_source_tags,
+    )
     rows = []
     for idx, freq in enumerate(frequencies):
         case_sources = (
@@ -269,6 +283,8 @@ def _build_neumann_rows(
                 np.complex64,
                 impedance_tags=impedance_tags,
                 source_face_scale=axial_face_scale,
+                face_indices_by_tag=face_indices_by_tag,
+                resolved_velocity_sources=resolved_velocity_sources,
             )
         )
     return np.stack(rows, axis=0)

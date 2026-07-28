@@ -88,18 +88,6 @@ def _build_axial_face_scale(
     return scale if any_source else None
 
 
-def _source_profile_for_tag(config: SolveConfig, tag: int):
-    profile_map = {
-        int(profile_tag): profile
-        for profile_tag, profile in (config.source_velocity_profiles or {}).items()
-    }
-    if tag in profile_map:
-        return profile_map[tag]
-    if config.source_motion == SourceMotion.AXIAL:
-        return AxialProfile()
-    return NormalProfile()
-
-
 def _normalize_profile_axis(axis: NDArray[np.float64]) -> NDArray[np.float64] | None:
     axis = np.asarray(axis, dtype=np.float64).reshape(-1)
     if axis.shape[0] != 3:
@@ -113,25 +101,22 @@ def _normalize_profile_axis(axis: NDArray[np.float64]) -> NDArray[np.float64] | 
 def _tag_axial_projection(
     raw_normals: NDArray[np.float64],
     magnitudes: NDArray[np.float64],
-    face_indices: NDArray[np.int64],
     axis: NDArray[np.float64],
 ) -> NDArray[np.float64]:
-    tag_mags = magnitudes[face_indices]
-    safe_mags = np.where(tag_mags > 1e-15, tag_mags, 1.0)
-    unit_normals = raw_normals[face_indices] / safe_mags[:, None]
+    safe_mags = np.where(magnitudes > 1e-15, magnitudes, 1.0)
+    unit_normals = raw_normals / safe_mags[:, None]
     proj = unit_normals @ axis
-    if float(np.dot(proj, tag_mags)) < 0.0:
+    if float(np.dot(proj, magnitudes)) < 0.0:
         proj = -proj
     return proj
 
 
 def _normalized_tag_radius(
     centroids: NDArray[np.float64],
-    face_indices: NDArray[np.int64],
     axis: NDArray[np.float64],
     source_center: NDArray[np.float64],
 ) -> NDArray[np.float64]:
-    deltas = centroids[face_indices] - source_center[None, :]
+    deltas = centroids - source_center[None, :]
     axial = np.outer(deltas @ axis, axis)
     radial = np.linalg.norm(deltas - axial, axis=1)
     radial_max = float(np.max(radial)) if radial.size else 0.0
@@ -151,6 +136,17 @@ def _taper_values(t: NDArray[np.float64], profile: TaperProfile) -> NDArray[np.f
             values[transition] = 0.5 * (1.0 + np.cos(np.pi * x))
     values[t >= 1.0] = 0.0
     return values
+
+
+def _face_indices_for_tags(
+    physical_tags: NDArray[np.int32],
+    tags,
+) -> dict[int, NDArray[np.intp]]:
+    """Resolve each requested physical tag to its face indices once."""
+    return {
+        tag: np.flatnonzero(physical_tags == tag)
+        for tag in sorted({int(tag) for tag in tags})
+    }
 
 
 def _build_source_face_scale(
@@ -175,8 +171,13 @@ def _build_source_face_scale(
     if not source_tags:
         return None
 
+    fallback_profile = (
+        AxialProfile()
+        if config.source_motion == SourceMotion.AXIAL
+        else NormalProfile()
+    )
     effective_profiles = {
-        tag: _source_profile_for_tag(config, tag) for tag in source_tags
+        tag: profile_map.get(tag, fallback_profile) for tag in source_tags
     }
     if all(isinstance(profile, NormalProfile) for profile in effective_profiles.values()):
         return None
@@ -198,71 +199,23 @@ def _build_source_face_scale(
     if center.shape[0] != 3:
         raise ValueError("source_center must have shape (3,)")
 
-    vertices = np.asarray(grid.vertices.T, dtype=np.float64)
     elements = np.asarray(grid.elements.T, dtype=np.int32)
     n_faces = elements.shape[0]
-
-    p0 = vertices[elements[:, 0]]
-    p1 = vertices[elements[:, 1]]
-    p2 = vertices[elements[:, 2]]
-    raw = np.cross(p1 - p0, p2 - p0)
-    mags = np.linalg.norm(raw, axis=1)
-    safe_mags = np.where(mags > 1e-15, mags, 1.0)
-    unit_normals = raw / safe_mags[:, None]
-    centroids = (p0 + p1 + p2) / 3.0
+    face_indices_by_tag = _face_indices_for_tags(physical_tags, source_tags)
+    vertices = None
 
     scale = np.zeros(n_faces, dtype=np.complex128)
     any_source = False
     saw_complex = False
 
     for tag in source_tags:
-        idx = np.where(physical_tags == tag)[0]
+        idx = face_indices_by_tag[tag]
         if idx.size == 0:
             continue
         profile = effective_profiles[tag]
         any_source = True
-        # ``source_center`` belongs to the tag used for frame inference, while
-        # configured source tags can be spatially separate. Derive an
-        # area-weighted center independently for every tag so identical
-        # translated drivers receive identical radial profiles. The supplied
-        # center remains the fallback for a degenerate tag.
-        tag_center = center
-        tag_areas = mags[idx]
-        area_sum = float(np.sum(tag_areas))
-        if np.isfinite(area_sum) and area_sum > 1.0e-15:
-            tag_center = np.average(centroids[idx], weights=tag_areas, axis=0)
-        # A mirror-reduced source tag contains only one half/quadrant of the
-        # physical driver. Its geometric centroid is consequently off-axis,
-        # whereas radial profiles are defined on the mirrored full driver.
-        # Keep the per-tag translated-driver contract for full meshes, but
-        # project the reduced tag center back onto its symmetry subspace.
-        tag_center = _project_to_symmetry_subspace(
-            tag_center,
-            config.native_symmetry_plane,
-        )
         if isinstance(profile, NormalProfile):
             values = np.ones(idx.size, dtype=np.float64)
-        elif isinstance(profile, AxialProfile):
-            values = (
-                np.ones(idx.size, dtype=np.float64)
-                if axis_unit is None
-                else _tag_axial_projection(raw, mags, idx, axis_unit)
-            )
-        elif isinstance(profile, TaperProfile):
-            assert axis_unit is not None
-            axial = _tag_axial_projection(raw, mags, idx, axis_unit)
-            values = axial * _taper_values(
-                _normalized_tag_radius(centroids, idx, axis_unit, tag_center),
-                profile,
-            )
-        elif isinstance(profile, AnnularProfile):
-            assert axis_unit is not None
-            axial = _tag_axial_projection(raw, mags, idx, axis_unit)
-            t = _normalized_tag_radius(centroids, idx, axis_unit, tag_center)
-            annulus = (
-                (t >= profile.r_inner) & (t <= profile.r_outer)
-            ).astype(np.float64)
-            values = axial * annulus
         elif isinstance(profile, PerFaceProfile):
             values = np.asarray(profile.weights, dtype=np.complex128)
             if values.ndim != 1 or values.shape[0] != idx.size:
@@ -273,29 +226,83 @@ def _build_source_face_scale(
             if not np.all(np.isfinite(values)):
                 raise ValueError("PerFaceProfile.weights must be finite")
             saw_complex = saw_complex or bool(np.any(values.imag != 0.0))
-        elif isinstance(profile, CallableProfile):
-            assert axis_unit is not None
-            values = np.asarray(
-                profile.callback(
-                    centroids[idx],
-                    unit_normals[idx],
-                    axis_unit.copy(),
-                    np.asarray(tag_center, dtype=np.float64).copy(),
-                ),
-                dtype=np.complex128,
-            )
-            if values.ndim != 1 or values.shape[0] != idx.size:
-                raise ValueError(
-                    "CallableProfile.callback must return one weight per "
-                    f"face for tag {tag}"
+        else:
+            if vertices is None:
+                vertices = np.asarray(grid.vertices.T, dtype=np.float64)
+            tag_elements = elements[idx]
+            p0 = vertices[tag_elements[:, 0]]
+            p1 = vertices[tag_elements[:, 1]]
+            p2 = vertices[tag_elements[:, 2]]
+            raw = np.cross(p1 - p0, p2 - p0)
+            mags = np.linalg.norm(raw, axis=1)
+
+            if isinstance(profile, AxialProfile):
+                values = (
+                    np.ones(idx.size, dtype=np.float64)
+                    if axis_unit is None
+                    else _tag_axial_projection(raw, mags, axis_unit)
                 )
-            if not np.all(np.isfinite(values)):
-                raise ValueError("CallableProfile.callback returned non-finite weights")
-            saw_complex = saw_complex or bool(np.any(values.imag != 0.0))
-        else:  # pragma: no cover - SolveConfig validation rejects this.
-            raise ValueError(
-                "source_velocity_profiles values must be SourceProfile instances"
+                scale[idx] = values
+                continue
+
+            assert axis_unit is not None
+            centroids = (p0 + p1 + p2) / 3.0
+            # ``source_center`` belongs to the tag used for frame inference,
+            # while configured source tags can be spatially separate. Derive
+            # an area-weighted center independently for every tag so identical
+            # translated drivers receive identical radial profiles. The
+            # supplied center remains the fallback for a degenerate tag.
+            tag_center = center
+            area_sum = float(np.sum(mags))
+            if np.isfinite(area_sum) and area_sum > 1.0e-15:
+                tag_center = np.average(centroids, weights=mags, axis=0)
+            # A mirror-reduced source tag contains only one half/quadrant of the
+            # physical driver. Its geometric centroid is consequently off-axis,
+            # whereas radial profiles are defined on the mirrored full driver.
+            tag_center = _project_to_symmetry_subspace(
+                tag_center,
+                config.native_symmetry_plane,
             )
+
+            if isinstance(profile, TaperProfile):
+                axial = _tag_axial_projection(raw, mags, axis_unit)
+                values = axial * _taper_values(
+                    _normalized_tag_radius(centroids, axis_unit, tag_center),
+                    profile,
+                )
+            elif isinstance(profile, AnnularProfile):
+                axial = _tag_axial_projection(raw, mags, axis_unit)
+                t = _normalized_tag_radius(centroids, axis_unit, tag_center)
+                annulus = (
+                    (t >= profile.r_inner) & (t <= profile.r_outer)
+                ).astype(np.float64)
+                values = axial * annulus
+            elif isinstance(profile, CallableProfile):
+                safe_mags = np.where(mags > 1e-15, mags, 1.0)
+                unit_normals = raw / safe_mags[:, None]
+                values = np.asarray(
+                    profile.callback(
+                        centroids,
+                        unit_normals,
+                        axis_unit.copy(),
+                        np.asarray(tag_center, dtype=np.float64).copy(),
+                    ),
+                    dtype=np.complex128,
+                )
+                if values.ndim != 1 or values.shape[0] != idx.size:
+                    raise ValueError(
+                        "CallableProfile.callback must return one weight per "
+                        f"face for tag {tag}"
+                    )
+                if not np.all(np.isfinite(values)):
+                    raise ValueError(
+                        "CallableProfile.callback returned non-finite weights"
+                    )
+                saw_complex = saw_complex or bool(np.any(values.imag != 0.0))
+            else:  # pragma: no cover - SolveConfig validation rejects this.
+                raise ValueError(
+                    "source_velocity_profiles values must be SourceProfile instances"
+                )
         scale[idx] = values
 
     if not any_source:
@@ -314,6 +321,8 @@ def _build_driver_neumann_coeffs(
     impedance_tags: set[int] | None = None,
     axial_face_scale: NDArray | None = None,
     source_face_scale: NDArray | None = None,
+    face_indices_by_tag: dict[int, NDArray[np.intp]] | None = None,
+    resolved_velocity_sources: dict[int, object] | None = None,
 ) -> NDArray:
     """Build DP0 Neumann coefficients for velocity source tags.
 
@@ -333,6 +342,10 @@ def _build_driver_neumann_coeffs(
     (default / config.source_motion == "normal") every source face gets the same
     normal velocity -- the historical uniform-normal (breathing cap) BC, bit for
     bit unchanged.
+
+    Sweep callers may pass ``face_indices_by_tag`` and already validated
+    ``resolved_velocity_sources`` so the geometry-only tag lookup and static
+    source normalization are reused across every frequency row.
     """
     if source_face_scale is not None:
         if axial_face_scale is not None:
@@ -342,17 +355,20 @@ def _build_driver_neumann_coeffs(
     coeffs = np.zeros(dp0_space.global_dof_count, dtype=dtype)
     air_density = config.air_density
     frequency_hz = float(omega) / (2.0 * np.pi) if omega > 0 else 0.0
-    callback_sources = config.velocity_source_callback is not None
-    velocity_sources = _validated_velocity_sources(
-        config.velocity_source_callback(frequency_hz)
-        if callback_sources
-        else config.velocity_sources,
-        field_name=(
-            f"velocity_source_callback({frequency_hz:.3f}) result"
+    if resolved_velocity_sources is None:
+        callback_sources = config.velocity_source_callback is not None
+        velocity_sources = _validated_velocity_sources(
+            config.velocity_source_callback(frequency_hz)
             if callback_sources
-            else "velocity_sources"
-        ),
-    )
+            else config.velocity_sources,
+            field_name=(
+                f"velocity_source_callback({frequency_hz:.3f}) result"
+                if callback_sources
+                else "velocity_sources"
+            ),
+        )
+    else:
+        velocity_sources = resolved_velocity_sources
     # Skip prescribing a velocity BC on any tag carrying a Robin (impedance)
     # BC, otherwise the tag would receive a double boundary condition. The
     # resolved tag set is supplied by the caller (single callback evaluation per
@@ -370,10 +386,12 @@ def _build_driver_neumann_coeffs(
     for tag, weight in velocity_sources.items():
         if tag in impedance_tag_set:
             continue
-        mask = physical_tags == tag
-        if not np.any(mask):
+        if face_indices_by_tag is None:
+            idx = np.flatnonzero(physical_tags == tag)
+        else:
+            idx = face_indices_by_tag.get(tag)
+        if idx is None or idx.size == 0:
             continue
-        idx = np.where(mask)[0]
         if axial_face_scale is None:
             # Uniform normal velocity (breathing cap). Unchanged historical path.
             v_n = weight

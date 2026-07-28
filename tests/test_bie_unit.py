@@ -810,6 +810,34 @@ class TestSourceFaceScaleProfiles:
         np.testing.assert_allclose(seen["axis"], self.AXIS)
         np.testing.assert_allclose(seen["source_center"], [0.5, 0.0, 0.0])
 
+    def test_per_face_profile_does_not_read_unused_vertices(self):
+        from hornlab_metal_bem.bie import _build_source_face_scale
+
+        class PerFaceOnlyGrid:
+            elements = SimpleNamespace(
+                T=np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int32)
+            )
+
+            @property
+            def vertices(self):
+                raise AssertionError("per-face profiles do not need mesh geometry")
+
+        weights = np.array([0.75 + 0.25j, 0.25 - 0.5j])
+        config = SolveConfig(
+            velocity_sources={2: 1.0},
+            source_velocity_profiles={2: PerFaceProfile(weights)},
+        )
+
+        scale = _build_source_face_scale(
+            PerFaceOnlyGrid(),
+            np.array([2, 2], dtype=np.int32),
+            config,
+            self.AXIS,
+            self.CENTER,
+        )
+
+        np.testing.assert_array_equal(scale, weights)
+
 
 # ---------------------------------------------------------------------------
 # Axial source motion applied through _build_driver_neumann_coeffs
@@ -943,3 +971,32 @@ class TestNeumannRowsAxial:
             dp0_space, physical_tags, frequencies, config, {},
         )
         np.testing.assert_allclose(rows[0, 0], rows[0, 1], rtol=1e-12)
+
+    def test_source_face_indices_and_static_weights_are_reused(self, monkeypatch):
+        import hornlab_metal_bem.sweep as sweep
+
+        dp0_space = SimpleNamespace(global_dof_count=4)
+        physical_tags = np.array([2, 1, 3, 2], dtype=np.int32)
+        frequencies = np.array([500.0, 1000.0, 2000.0], dtype=np.float64)
+        config = SolveConfig(velocity_sources={2: 1.0, 3: 0.5})
+        seen_indices = []
+        seen_sources = []
+
+        def fake_builder(*args, **kwargs):
+            seen_indices.append(kwargs["face_indices_by_tag"])
+            seen_sources.append(kwargs["resolved_velocity_sources"])
+            return np.zeros(dp0_space.global_dof_count, dtype=np.complex64)
+
+        monkeypatch.setattr(sweep, "_build_driver_neumann_coeffs", fake_builder)
+        sweep._build_neumann_rows(
+            dp0_space,
+            physical_tags,
+            frequencies,
+            config,
+            {},
+        )
+
+        assert all(indices is seen_indices[0] for indices in seen_indices)
+        assert all(sources is seen_sources[0] for sources in seen_sources)
+        np.testing.assert_array_equal(seen_indices[0][2], [0, 3])
+        np.testing.assert_array_equal(seen_indices[0][3], [2])
