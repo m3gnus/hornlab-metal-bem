@@ -63,6 +63,41 @@ def test_read_complex_f32_constructs_requested_dtype_exactly(tmp_path):
         )
 
 
+def test_read_complex_f32_preserves_stored_negative_real_zero(tmp_path):
+    """The reader keeps the real bytes the helper wrote.
+
+    ``real + 1j * imag`` used to flip a stored real ``-0.0`` to ``+0.0``
+    whenever the paired imaginary part was ``>= +0.0``, because the complex
+    multiply contributed a ``+0.0`` real term. The split reconstruction keeps
+    the sign, so the two forms are NOT interchangeable for signed zero; pin the
+    reconstruction's own contract instead of the old expression's.
+    """
+    real_values = np.asarray([-0.0, -0.0, -0.0], dtype="<f4")
+    imag_values = np.asarray([0.0, -0.0, 1.5], dtype="<f4")
+    real_path = tmp_path / "real.bin"
+    imag_path = tmp_path / "imag.bin"
+    real_values.tofile(real_path)
+    imag_values.tofile(imag_path)
+
+    for dtype in (np.complex64, np.complex128):
+        actual = sweep._read_complex_f32(real_path, imag_path, (3,), dtype=dtype)
+        # Real component keeps the stored negative zero for every pairing.
+        np.testing.assert_array_equal(
+            np.signbit(actual.real), np.asarray([True, True, True])
+        )
+        # Imaginary negative zero is still normalized to +0.0.
+        np.testing.assert_array_equal(
+            np.signbit(actual.imag), np.asarray([False, False, False])
+        )
+
+    legacy = np.ascontiguousarray(
+        real_values + 1j * imag_values, dtype=np.complex64
+    )
+    assert not np.signbit(legacy.real[0])
+    assert np.signbit(legacy.real[1])
+    assert not np.signbit(legacy.real[2])
+
+
 def test_discover_runtime_smoke_cached_reuses_validated_helper(monkeypatch, tmp_path):
     helper = tmp_path / "HornlabMetalBemNative"
     helper.write_text("#!/bin/sh\n", encoding="utf-8")

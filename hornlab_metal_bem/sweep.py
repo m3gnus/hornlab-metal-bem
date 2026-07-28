@@ -103,8 +103,13 @@ def _read_complex_f32(
     values = np.empty(shape, dtype=dtype)
     values.real = _read_f32_exact(real_path, count).reshape(shape)
     imag = _read_f32_exact(imag_path, count).reshape(shape)
-    # Match ``real + 1j * imag`` handling of signed imaginary zero in-place,
-    # without materializing the complex multiply and addition temporaries.
+    # ``real + 1j * imag`` normalized a negative imaginary zero to +0.0 as a
+    # side effect of the complex multiply; reproduce that in-place without
+    # materializing the multiply and addition temporaries. The real component
+    # is NOT bit-identical to that expression: the old form also flipped a
+    # stored real -0.0 to +0.0 whenever the paired imaginary part was >= +0.0
+    # (and turned a non-finite imaginary part into a NaN real part). Here the
+    # real bytes the helper wrote are preserved exactly.
     np.add(imag, np.float32(0.0), out=imag)
     values.imag = imag
     return values
