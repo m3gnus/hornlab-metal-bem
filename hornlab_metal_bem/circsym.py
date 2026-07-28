@@ -1474,26 +1474,6 @@ typedef struct {
     int64_t ns;
     int64_t nl;
     int64_t np;
-    const double *R;
-    const double *gw;
-    const double *hw;
-    double kr;
-    double ki;
-    double *out_s;
-    double *out_h;
-} FarTask;
-
-typedef struct {
-    const FarTask *task;
-    int64_t start;
-    int64_t stop;
-} FarThreadTask;
-
-typedef struct {
-    int64_t nt;
-    int64_t ns;
-    int64_t nl;
-    int64_t np;
     const double *target_rho;
     const double *target_z;
     const double *source_rho;
@@ -1546,67 +1526,6 @@ static inline void cmul(
 ) {
     *out_re = ar * br - ai * bi;
     *out_im = ar * bi + ai * br;
-}
-
-static void eval_far_range(const FarTask *task, int64_t start, int64_t stop) {
-    const int64_t ns = task->ns;
-    const int64_t nl = task->nl;
-    const int64_t np = task->np;
-    const double *R = task->R;
-    const double *gw = task->gw;
-    const double *hw = task->hw;
-    const double kr = task->kr;
-    const double ki = task->ki;
-    double *out_s = task->out_s;
-    double *out_h = task->out_h;
-
-    for (int64_t i = start; i < stop; ++i) {
-        for (int64_t j = 0; j < ns; ++j) {
-            double s_re = 0.0;
-            double s_im = 0.0;
-            double h_re = 0.0;
-            double h_im = 0.0;
-            int64_t idx = ((i * ns + j) * nl) * np;
-            for (int64_t u = 0; u < nl; ++u) {
-                for (int64_t p = 0; p < np; ++p, ++idx) {
-                    const double r = R[idx];
-                    const double g_weight = gw[idx];
-                    const double h_weight = hw[idx];
-                    if (g_weight == 0.0 && h_weight == 0.0) {
-                        continue;
-                    }
-                    const double kr_r = kr * r;
-                    const double ki_r = ki * r;
-                    const double decay = exp(-ki_r);
-                    const double phase_re = decay * cos(kr_r);
-                    const double phase_im = decay * sin(kr_r);
-
-                    s_re += (phase_re - 1.0) * g_weight;
-                    s_im += phase_im * g_weight;
-
-                    const double factor_re = -ki_r - 1.0;
-                    const double factor_im = kr_r;
-                    const double expr_re =
-                        phase_re * factor_re - phase_im * factor_im + 1.0;
-                    const double expr_im =
-                        phase_re * factor_im + phase_im * factor_re;
-                    h_re += expr_re * h_weight;
-                    h_im += expr_im * h_weight;
-                }
-            }
-            const int64_t out_idx = 2 * (i * ns + j);
-            out_s[out_idx] = s_re;
-            out_s[out_idx + 1] = s_im;
-            out_h[out_idx] = h_re;
-            out_h[out_idx + 1] = h_im;
-        }
-    }
-}
-
-static void *eval_far_worker(void *raw) {
-    const FarThreadTask *thread_task = (const FarThreadTask *)raw;
-    eval_far_range(thread_task->task, thread_task->start, thread_task->stop);
-    return NULL;
 }
 
 static void eval_far_onthefly_range(
@@ -1821,84 +1740,6 @@ static void *eval_near_worker(void *raw) {
     return NULL;
 }
 
-int circsym_eval_far_remainder(
-    int64_t nt,
-    int64_t ns,
-    int64_t nl,
-    int64_t np,
-    const double *R,
-    const double *gw,
-    const double *hw,
-    double kr,
-    double ki,
-    double *out_s,
-    double *out_h,
-    int32_t requested_threads
-) {
-    if (nt < 0 || ns < 0 || nl < 0 || np < 0 ||
-        R == NULL || gw == NULL || hw == NULL ||
-        out_s == NULL || out_h == NULL) {
-        return -1;
-    }
-    FarTask task;
-    task.nt = nt;
-    task.ns = ns;
-    task.nl = nl;
-    task.np = np;
-    task.R = R;
-    task.gw = gw;
-    task.hw = hw;
-    task.kr = kr;
-    task.ki = ki;
-    task.out_s = out_s;
-    task.out_h = out_h;
-
-    int32_t threads = requested_threads;
-    if (threads < 1) {
-        threads = 1;
-    }
-    if ((int64_t)threads > nt) {
-        threads = (int32_t)nt;
-    }
-    if (threads <= 1 || nt <= 1) {
-        eval_far_range(&task, 0, nt);
-        return 0;
-    }
-
-    pthread_t *handles = (pthread_t *)malloc((size_t)threads * sizeof(pthread_t));
-    FarThreadTask *thread_tasks =
-        (FarThreadTask *)malloc((size_t)threads * sizeof(FarThreadTask));
-    if (handles == NULL || thread_tasks == NULL) {
-        free(handles);
-        free(thread_tasks);
-        eval_far_range(&task, 0, nt);
-        return 0;
-    }
-
-    int32_t created = 0;
-    for (int32_t t = 0; t < threads; ++t) {
-        const int64_t start = (nt * (int64_t)t) / (int64_t)threads;
-        const int64_t stop = (nt * (int64_t)(t + 1)) / (int64_t)threads;
-        thread_tasks[t].task = &task;
-        thread_tasks[t].start = start;
-        thread_tasks[t].stop = stop;
-        if (pthread_create(&handles[t], NULL, eval_far_worker, &thread_tasks[t]) != 0) {
-            break;
-        }
-        created += 1;
-    }
-
-    for (int32_t t = 0; t < created; ++t) {
-        pthread_join(handles[t], NULL);
-    }
-    if (created != threads) {
-        eval_far_range(&task, 0, nt);
-    }
-    free(handles);
-    free(thread_tasks);
-    return 0;
-}
-
 int circsym_eval_far_remainder_onthefly(
     int64_t nt,
     int64_t ns,
@@ -2081,24 +1922,8 @@ int circsym_eval_near_remainder(
 class _CircsymRemainderCKernel:
     def __init__(self, library_path: str) -> None:
         self.library = ctypes.CDLL(library_path)
-        self.eval_far = self.library.circsym_eval_far_remainder
         self.eval_near = self.library.circsym_eval_near_remainder
         double_ptr = ctypes.POINTER(ctypes.c_double)
-        self.eval_far.argtypes = [
-            ctypes.c_int64,
-            ctypes.c_int64,
-            ctypes.c_int64,
-            ctypes.c_int64,
-            double_ptr,
-            double_ptr,
-            double_ptr,
-            ctypes.c_double,
-            ctypes.c_double,
-            double_ptr,
-            double_ptr,
-            ctypes.c_int32,
-        ]
-        self.eval_far.restype = ctypes.c_int
         self.eval_far_onthefly = self.library.circsym_eval_far_remainder_onthefly
         self.eval_far_onthefly.argtypes = [
             ctypes.c_int64,
@@ -2173,47 +1998,6 @@ def _load_circsym_remainder_c_kernel() -> _CircsymRemainderCKernel | None:
     except Exception as exc:
         logger.debug("CircSym C remainder kernel load failed: %s", exc)
         return None
-
-
-def _evaluate_far_remainder_compiled(
-    kernel: _CircsymRemainderCKernel,
-    part: _FarRemainderGeometry,
-    k: complex,
-    *,
-    workers: int,
-) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
-    R = part.R if part.R.flags.c_contiguous else np.ascontiguousarray(part.R)
-    g_weight = (
-        part.g_weight
-        if part.g_weight.flags.c_contiguous
-        else np.ascontiguousarray(part.g_weight)
-    )
-    h_weight = (
-        part.h_weight
-        if part.h_weight.flags.c_contiguous
-        else np.ascontiguousarray(part.h_weight)
-    )
-    target_count, source_count, line_count, psi_count = R.shape
-    s_out = np.empty((target_count, source_count), dtype=np.complex128)
-    h_out = np.empty_like(s_out)
-    double_ptr = ctypes.POINTER(ctypes.c_double)
-    status = kernel.eval_far(
-        ctypes.c_int64(target_count),
-        ctypes.c_int64(source_count),
-        ctypes.c_int64(line_count),
-        ctypes.c_int64(psi_count),
-        R.ctypes.data_as(double_ptr),
-        g_weight.ctypes.data_as(double_ptr),
-        h_weight.ctypes.data_as(double_ptr),
-        ctypes.c_double(float(complex(k).real)),
-        ctypes.c_double(float(complex(k).imag)),
-        s_out.ctypes.data_as(double_ptr),
-        h_out.ctypes.data_as(double_ptr),
-        ctypes.c_int32(max(1, int(workers))),
-    )
-    if int(status) != 0:
-        return _evaluate_far_remainder_block(part, k, 0, target_count)
-    return s_out, h_out
 
 
 def _evaluate_far_remainder_onthefly_compiled(
@@ -2979,146 +2763,6 @@ def _assemble_coupled_ib_rayleigh_aperture_matrix(
             target_index=int(indices[row_local]),
         )[0]
     return s_block
-
-
-def _assemble_boundary_row(
-    row_index: int,
-    *,
-    meridian: MeridianMesh,
-    geom: SimpleNamespace,
-    k: complex,
-    baffle_z: float | None,
-    n_psi: int,
-) -> tuple[int, NDArray[np.complex128], NDArray[np.complex128]]:
-    n = meridian.segment_count
-    target = geom.midpoints[int(row_index)]
-    s_row = np.empty(n, dtype=np.complex128)
-    h_row = np.empty(n, dtype=np.complex128)
-    far_mask = _ordinary_far_source_mask(target, geom, target_index=int(row_index))
-    far_indices = np.nonzero(far_mask)[0]
-    if far_indices.size:
-        s_row[far_indices], h_row[far_indices] = _integrate_ordinary_segment_kernels_batched(
-            target_rho=float(target[0]),
-            target_z=float(target[1]),
-            meridian=meridian,
-            geom=geom,
-            source_indices=far_indices,
-            k=k,
-            baffle_z=baffle_z,
-            n_psi=n_psi,
-        )
-    near_indices = np.nonzero(~far_mask)[0]
-    for j in near_indices:
-        s_row[j], h_row[j] = _integrate_segment_kernel(
-            target_rho=float(target[0]),
-            target_z=float(target[1]),
-            meridian=meridian,
-            geom=geom,
-            source_index=int(j),
-            k=k,
-            baffle_z=baffle_z,
-            n_psi=n_psi,
-            target_index=int(row_index),
-        )
-    return int(row_index), s_row, h_row
-
-
-def _ordinary_far_source_mask(
-    target: NDArray[np.float64],
-    geom: SimpleNamespace,
-    *,
-    target_index: int | None,
-) -> NDArray[np.bool_]:
-    target_arr = np.asarray(target, dtype=np.float64)
-    denom = np.maximum(geom.lengths * geom.lengths, 1.0e-30)
-    u_star = np.sum((target_arr[None, :] - geom.p0) * geom.delta, axis=1) / denom
-    u_clamped = np.clip(u_star, 0.0, 1.0)
-    closest = geom.p0 + u_clamped[:, None] * geom.delta
-    distance = np.linalg.norm(target_arr[None, :] - closest, axis=1)
-    far = distance > 1.25 * geom.lengths
-    if target_index is not None:
-        far[int(target_index)] = False
-    return far
-
-
-def _integrate_ordinary_segment_kernels_batched(
-    *,
-    target_rho: float,
-    target_z: float,
-    meridian: MeridianMesh,
-    geom: SimpleNamespace,
-    source_indices: NDArray[np.int64] | NDArray[np.int32],
-    k: complex,
-    baffle_z: float | None,
-    n_psi: int,
-) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
-    indices = np.asarray(source_indices, dtype=np.int64)
-    if indices.size == 0:
-        return (
-            np.empty(0, dtype=np.complex128),
-            np.empty(0, dtype=np.complex128),
-        )
-
-    u, w = _ordinary_interval(0.0, 1.0)
-    p0 = geom.p0[indices]
-    delta = geom.delta[indices]
-    lengths = geom.lengths[indices]
-    source = p0[:, None, :] + u[None, :, None] * delta[:, None, :]
-    rho_s = source[:, :, 0]
-    z_s = source[:, :, 1]
-    measure = rho_s * lengths[:, None] * w[None, :]
-    normal = meridian.normals[indices]
-    normal_rho = normal[:, 0:1]
-    normal_z = normal[:, 1:2]
-
-    g_static, h_static = _ring_static_kernel_m0_batched(
-        target_rho,
-        target_z,
-        rho_s,
-        z_s,
-        normal_rho,
-        normal_z,
-    )
-    g_rem, h_rem = _ring_remainder_kernel_m0_batched(
-        target_rho,
-        target_z,
-        rho_s,
-        z_s,
-        normal_rho,
-        normal_z,
-        k,
-        n_psi=n_psi,
-    )
-    g = g_static + g_rem
-    h = h_static + h_rem
-
-    if baffle_z is not None:
-        z_img = 2.0 * float(baffle_z) - z_s
-        g_static_i, h_static_i = _ring_static_kernel_m0_batched(
-            target_rho,
-            target_z,
-            rho_s,
-            z_img,
-            normal_rho,
-            -normal_z,
-        )
-        g_rem_i, h_rem_i = _ring_remainder_kernel_m0_batched(
-            target_rho,
-            target_z,
-            rho_s,
-            z_img,
-            normal_rho,
-            -normal_z,
-            k,
-            n_psi=n_psi,
-        )
-        g = g + g_static_i + g_rem_i
-        h = h + h_static_i + h_rem_i
-
-    return (
-        np.asarray(np.sum(g * measure, axis=1), dtype=np.complex128),
-        np.asarray(np.sum(h * measure, axis=1), dtype=np.complex128),
-    )
 
 
 def _integrate_ordinary_segment_kernels_targets_batched(
@@ -4015,45 +3659,6 @@ def _ring_static_kernel_m0(
     return np.asarray(G, dtype=np.complex128), np.asarray(H, dtype=np.complex128)
 
 
-def _ring_static_kernel_m0_batched(
-    target_rho: float,
-    target_z: float,
-    source_rho: NDArray[np.float64],
-    source_z: NDArray[np.float64],
-    normal_rho: NDArray[np.float64],
-    normal_z: NDArray[np.float64],
-) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
-    rt = float(target_rho)
-    zt = float(target_z)
-    rs = np.asarray(source_rho, dtype=np.float64)
-    zs = np.asarray(source_z, dtype=np.float64)
-    n_rho = np.asarray(normal_rho, dtype=np.float64)
-    n_z = np.asarray(normal_z, dtype=np.float64)
-    D = (rt + rs) ** 2 + (zt - zs) ** 2
-    sqrtD = np.sqrt(D)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        m = np.where(D > 0.0, 4.0 * rt * rs / D, 0.0)
-    m = np.clip(m, 0.0, 1.0 - 1e-15)
-    K = ellipk(m)
-    E = ellipe(m)
-    G = K / (np.pi * sqrtD)
-
-    dKdm = _ellipk_derivative(m, K, E)
-    dD_dr = 2.0 * (rt + rs)
-    dD_dz = 2.0 * (zs - zt)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        dm_dr = 4.0 * rt / D - (4.0 * rt * rs / (D * D)) * dD_dr
-        dm_dz = -(4.0 * rt * rs / (D * D)) * dD_dz
-        dF_dr = (
-            dKdm * dm_dr / sqrtD - 0.5 * K * dD_dr / (D * sqrtD)
-        ) / np.pi
-        dF_dz = (
-            dKdm * dm_dz / sqrtD - 0.5 * K * dD_dz / (D * sqrtD)
-        ) / np.pi
-    H = n_rho * dF_dr + n_z * dF_dz
-    return np.asarray(G, dtype=np.complex128), np.asarray(H, dtype=np.complex128)
-
-
 def _ring_static_kernel_m0_targets_batched(
     target_rho: NDArray[np.float64],
     target_z: NDArray[np.float64],
@@ -4163,56 +3768,6 @@ def _ring_remainder_kernel_m0(
     if np.ndim(source_rho) == 0:
         return G[0], H[0]
     return G, H
-
-
-def _ring_remainder_kernel_m0_batched(
-    target_rho: float,
-    target_z: float,
-    source_rho: NDArray[np.float64],
-    source_z: NDArray[np.float64],
-    normal_rho: NDArray[np.float64],
-    normal_z: NDArray[np.float64],
-    k: complex,
-    *,
-    n_psi: int,
-) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
-    rs = np.asarray(source_rho, dtype=np.float64)
-    zs = np.asarray(source_z, dtype=np.float64)
-    psi, weights = _leggauss_psi(int(n_psi))
-    cos_psi = np.cos(psi)[None, None, :]
-    rt = float(target_rho)
-    zt = float(target_z)
-    n_rho = np.asarray(normal_rho, dtype=np.float64)[:, :, None]
-    n_z = np.asarray(normal_z, dtype=np.float64)[:, :, None]
-
-    rs3 = rs[:, :, None]
-    dz = zs[:, :, None] - zt
-    R2 = rt * rt + rs3 * rs3 - 2.0 * rt * rs3 * cos_psi + dz * dz
-    R = np.sqrt(np.maximum(R2, 0.0))
-    q = complex(k) * R
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rem_g = np.expm1(1j * q) / (4.0 * np.pi * R)
-    rem_g = np.where(R > 1e-13, rem_g, 1j * complex(k) / (4.0 * np.pi))
-
-    num = (rs3 - rt * cos_psi) * n_rho + dz * n_z
-    expr = np.exp(1j * q) * (1j * q - 1.0) + 1.0
-    small = np.abs(q) < 1e-5
-    if np.any(small):
-        qs = q[small]
-        expr = expr.astype(np.complex128, copy=True)
-        expr[small] = (
-            -0.5 * qs * qs
-            - (1j / 3.0) * qs ** 3
-            + 0.125 * qs ** 4
-            + (1j / 30.0) * qs ** 5
-        )
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rem_h = expr * num / (4.0 * np.pi * R ** 3)
-    rem_h = np.where(R > 1e-13, rem_h, 0.0 + 0.0j)
-
-    G = 2.0 * np.sum(rem_g * weights[None, None, :], axis=2)
-    H = 2.0 * np.sum(rem_h * weights[None, None, :], axis=2)
-    return np.asarray(G, dtype=np.complex128), np.asarray(H, dtype=np.complex128)
 
 
 def _ring_remainder_kernel_m0_targets_batched(
