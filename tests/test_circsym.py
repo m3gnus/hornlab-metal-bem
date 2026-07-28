@@ -12,9 +12,12 @@ from hornlab_metal_bem.circsym import (
     _assemble_boundary_matrices,
     _build_far_remainder_compact_geometry,
     _build_far_remainder_geometry_parts,
+    _build_driver_neumann_segments,
+    _build_source_segment_scale,
     _evaluate_far_remainder_block,
     _evaluate_far_remainder_onthefly_compiled,
     _evaluate_points_pressure,
+    _infer_circsym_frame,
     _is_flat_baffled_sheet,
     _integrate_segment_kernel,
     _load_circsym_remainder_c_kernel,
@@ -24,9 +27,12 @@ from hornlab_metal_bem.circsym import (
     ring_kernel_m0,
 )
 from hornlab_metal_bem.config import (
+    AnnularProfile,
     ObservationConfig,
+    PerFaceProfile,
     SolveConfig,
     SourceMotion,
+    TaperProfile,
     VelocityMode,
 )
 
@@ -149,6 +155,64 @@ def test_meridian_from_polyline_derives_outward_normals_and_validates_baffle():
     assert SolveConfig(circsym_baffle_z=0.0).circsym_baffle_z == 0.0
     with pytest.raises(ValueError, match="circsym_baffle_z"):
         SolveConfig(circsym_baffle_z=float("nan"))
+
+
+def test_circsym_radial_source_profiles_scale_piston_segments():
+    meridian = _piston_meridian(radius=0.1, segments=4)
+    profiles = [
+        (
+            TaperProfile(kind="linear", start=0.5),
+            [1.0, 1.0, 0.75, 0.25],
+        ),
+        (AnnularProfile(0.25, 0.75), [0.0, 1.0, 1.0, 0.0]),
+    ]
+
+    for profile, expected in profiles:
+        config = SolveConfig(
+            velocity_sources={2: 1.0},
+            source_velocity_profiles={2: profile},
+        )
+        scale = _build_source_segment_scale(
+            meridian,
+            config,
+            _infer_circsym_frame(meridian, config),
+        )
+        np.testing.assert_allclose(scale, expected, atol=1e-15)
+
+
+def test_circsym_complex_per_face_profile_feeds_neumann_rhs():
+    meridian = _piston_meridian(radius=0.1, segments=4)
+    weights = np.array(
+        [1.0 + 0.25j, 0.75 - 0.5j, 0.5 + 0.0j, 0.25 + 0.75j],
+        dtype=np.complex128,
+    )
+    config = SolveConfig(
+        velocity_sources={2: 0.5},
+        velocity_mode=VelocityMode.VELOCITY,
+        source_velocity_profiles={2: PerFaceProfile(weights)},
+    )
+    frequency = 1000.0
+    omega = 2.0 * np.pi * frequency
+    scale = _build_source_segment_scale(
+        meridian,
+        config,
+        _infer_circsym_frame(meridian, config),
+    )
+
+    q_driver = _build_driver_neumann_segments(
+        meridian,
+        omega,
+        frequency,
+        config,
+        impedance_tags=set(),
+        source_scale=scale,
+    )
+
+    np.testing.assert_allclose(
+        q_driver,
+        1j * config.air_density * omega * 0.5 * weights,
+        rtol=1e-15,
+    )
 
 
 def test_ring_kernels_match_dense_azimuth_quadrature_off_diagonal_and_near():

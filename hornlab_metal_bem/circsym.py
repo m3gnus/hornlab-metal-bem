@@ -28,6 +28,7 @@ from scipy import linalg
 from scipy.special import ellipe, ellipk
 
 from ._constants import SPEED_OF_SOUND
+from .bie import _taper_values
 from .config import (
     AnnularProfile,
     AxialProfile,
@@ -936,24 +937,21 @@ def _build_source_segment_scale(
     meridian: MeridianMesh,
     config: SolveConfig,
     frame: ObservationFrame,
-) -> NDArray[np.complex128] | None:
+) -> NDArray[np.complex128] | NDArray[np.float64] | None:
     profile_map = {
         int(profile_tag): profile
         for profile_tag, profile in (config.source_velocity_profiles or {}).items()
     }
     source_tags = sorted({int(tag) for tag in config.velocity_sources} | set(profile_map))
-    if not source_tags:
-        return None
-    effective_profiles = {
-        tag: profile_map.get(
-            tag,
-            AxialProfile()
-            if config.source_motion == SourceMotion.AXIAL
-            else NormalProfile(),
-        )
+    fallback_profile = (
+        AxialProfile()
+        if config.source_motion == SourceMotion.AXIAL
+        else NormalProfile()
+    )
+    if all(
+        isinstance(profile_map.get(tag, fallback_profile), NormalProfile)
         for tag in source_tags
-    }
-    if all(isinstance(profile, NormalProfile) for profile in effective_profiles.values()):
+    ):
         return None
 
     geom = meridian.segment_geometry()
@@ -975,14 +973,13 @@ def _build_source_segment_scale(
     center = np.asarray(frame.source_center, dtype=np.float64)
     scale = np.zeros(meridian.segment_count, dtype=np.complex128)
     any_source = False
-    saw_complex = False
 
     for tag in source_tags:
         idx = np.where(meridian.physical_tags == tag)[0]
         if idx.size == 0:
             continue
         any_source = True
-        profile = effective_profiles[tag]
+        profile = profile_map.get(tag, fallback_profile)
         if isinstance(profile, NormalProfile):
             values = np.ones(idx.size, dtype=np.float64)
         elif isinstance(profile, AxialProfile):
@@ -1008,7 +1005,6 @@ def _build_source_segment_scale(
                 )
             if not np.all(np.isfinite(values)):
                 raise ValueError("PerFaceProfile.weights must be finite")
-            saw_complex = saw_complex or bool(np.any(values.imag != 0.0))
         elif isinstance(profile, CallableProfile):
             values = np.asarray(
                 profile.callback(
@@ -1026,7 +1022,6 @@ def _build_source_segment_scale(
                 )
             if not np.all(np.isfinite(values)):
                 raise ValueError("CallableProfile.callback returned non-finite weights")
-            saw_complex = saw_complex or bool(np.any(values.imag != 0.0))
         else:  # pragma: no cover - SolveConfig validation rejects this.
             raise ValueError(
                 "source_velocity_profiles values must be SourceProfile instances"
@@ -1035,9 +1030,9 @@ def _build_source_segment_scale(
 
     if not any_source:
         return None
-    if saw_complex:
+    if np.any(scale.imag != 0.0):
         return scale
-    return scale.real.astype(np.float64, copy=False)
+    return scale.real
 
 
 def _tag_axial_projection_2d(
@@ -1063,19 +1058,6 @@ def _normalized_tag_radius_2d(
     if not np.isfinite(rho_max) or rho_max <= 1e-15:
         return np.zeros(indices.size, dtype=np.float64)
     return np.clip(geom.rho_mid[indices] / rho_max, 0.0, 1.0)
-
-
-def _taper_values(t: NDArray[np.float64], profile: TaperProfile) -> NDArray[np.float64]:
-    values = np.ones_like(t, dtype=np.float64)
-    transition = t > profile.start
-    if np.any(transition):
-        x = np.clip((t[transition] - profile.start) / (1.0 - profile.start), 0.0, 1.0)
-        if profile.kind == "linear":
-            values[transition] = 1.0 - x
-        else:
-            values[transition] = 0.5 * (1.0 + np.cos(np.pi * x))
-    values[t >= 1.0] = 0.0
-    return values
 
 
 def _build_driver_neumann_segments(
