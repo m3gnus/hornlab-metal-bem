@@ -3307,6 +3307,34 @@ def _evaluate_points_pressure(
     if geom is None:
         geom = meridian.segment_geometry()
     target_rho, target_z = _points_target_rho_z(pts)
+    rayleigh_sheet = _is_flat_baffled_sheet(meridian, baffle_z, geom=geom)
+    if rayleigh_sheet:
+        # The image kernel extends the half-space solution symmetrically across
+        # the baffle. That continuation is not a physical rear field: retain it
+        # only on the side selected by the sheet's outward normal.
+        out = np.zeros(pts.shape[0], dtype=np.complex128)
+        active = _baffled_sheet_active_targets(
+            meridian,
+            target_z,
+            float(baffle_z),
+            geom=geom,
+        )
+        if not np.any(active):
+            return out
+        source_indices = np.arange(meridian.segment_count, dtype=np.int64)
+        s_mat, _ = _integrate_field_segment_kernels_batched(
+            target_rho=target_rho[active],
+            target_z=target_z[active],
+            meridian=meridian,
+            geom=geom,
+            source_indices=source_indices,
+            k=k,
+            baffle_z=baffle_z,
+            n_psi=n_psi,
+        )
+        out[active] = -(s_mat @ q_total)
+        return out
+
     source_indices = np.arange(meridian.segment_count, dtype=np.int64)
     s_mat, h_mat = _integrate_field_segment_kernels_batched(
         target_rho=target_rho,
@@ -3318,13 +3346,6 @@ def _evaluate_points_pressure(
         baffle_z=baffle_z,
         n_psi=n_psi,
     )
-    rayleigh_sheet = _is_flat_baffled_sheet(meridian, baffle_z, geom=geom)
-    if rayleigh_sheet:
-        # A coplanar baffled disk is an open Rayleigh radiator. The direct
-        # closed-surface representation's double-layer pressure term is not
-        # part of the textbook piston field, so use the half-space single-layer
-        # integral for this narrow geometry.
-        return np.asarray(-(s_mat @ q_total), dtype=np.complex128)
     return np.asarray(h_mat @ pressure - s_mat @ q_total, dtype=np.complex128)
 
 
@@ -3634,10 +3655,24 @@ def _is_flat_baffled_sheet(
         return False
     z_close = np.allclose(geom.midpoints[active, 1], float(baffle_z), atol=1e-10)
     normals = meridian.normals[active]
-    normal_close = np.all(np.abs(normals[:, 0]) <= 1e-10) and np.all(
-        np.abs(np.abs(normals[:, 1]) - 1.0) <= 1e-10
+    normal_close = np.all(np.abs(normals[:, 0]) <= 1e-10) and (
+        np.all(np.abs(normals[:, 1] - 1.0) <= 1e-10)
+        or np.all(np.abs(normals[:, 1] + 1.0) <= 1e-10)
     )
     return bool(z_close and normal_close)
+
+
+def _baffled_sheet_active_targets(
+    meridian: MeridianMesh,
+    target_z: NDArray[np.float64],
+    baffle_z: float,
+    *,
+    geom: SimpleNamespace,
+) -> NDArray[np.bool_]:
+    active_segments = geom.area_weights > 1e-30
+    normal_z = float(meridian.normals[np.flatnonzero(active_segments)[0], 1])
+    offset = np.asarray(target_z, dtype=np.float64) - float(baffle_z)
+    return normal_z * offset >= -1e-12
 
 
 def _boundary_free_terms(

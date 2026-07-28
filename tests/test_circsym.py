@@ -475,6 +475,44 @@ def test_vectorized_field_evaluation_matches_scalar_baffled_sheet_rayleigh_branc
     np.testing.assert_allclose(vectorized, scalar, rtol=1e-10, atol=1e-12)
 
 
+def test_baffled_sheet_field_is_limited_to_normal_half_space():
+    meridian = _piston_meridian(radius=0.1, segments=16)
+    pressure = np.zeros(meridian.segment_count, dtype=np.complex128)
+    q_total = np.ones(meridian.segment_count, dtype=np.complex128)
+    points = np.array(
+        [[0.0, 0.0, 2.0], [0.0, 0.0, -2.0]],
+        dtype=np.float64,
+    )
+
+    positive_normal = _evaluate_points_pressure(
+        meridian,
+        pressure,
+        q_total,
+        points,
+        47.0 + 0.0j,
+        0.0,
+        n_psi=96,
+    )
+    assert abs(positive_normal[0]) > 0.0
+    assert positive_normal[1] == 0.0
+
+    reversed_meridian = MeridianMesh.from_polyline(
+        meridian.nodes[::-1],
+        tags=2,
+    )
+    negative_normal = _evaluate_points_pressure(
+        reversed_meridian,
+        pressure,
+        q_total,
+        points,
+        47.0 + 0.0j,
+        0.0,
+        n_psi=96,
+    )
+    assert negative_normal[0] == 0.0
+    np.testing.assert_allclose(negative_normal[1], positive_normal[0])
+
+
 def test_pulsating_sphere_recovers_analytic_impedance_and_uniform_directivity():
     radius = 0.1
     ka = np.array([0.5, 1.5, 3.0], dtype=np.float64)
@@ -575,6 +613,9 @@ def test_baffled_flat_piston_matches_airy_directivity_and_first_null():
         _piston_meridian(radius=radius, segments=30),
         [_freq_for_ka(value, radius) for value in ka_values],
         config,
+    )
+    assert np.all(
+        result.pressure_complex[:, :, result.observation_angles_deg > 90.0] == 0.0
     )
 
     theta = np.deg2rad(result.observation_angles_deg)
