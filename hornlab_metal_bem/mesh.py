@@ -199,6 +199,12 @@ def load_mesh(
         triangles,
         native_symmetry_plane=native_symmetry_plane,
     )
+    _warn_if_inverted_open_shell(
+        verts,
+        triangles,
+        phys_tags,
+        coupled_ib_aperture_tag=coupled_ib_aperture_tag,
+    )
 
     grid = make_pure_grid(verts, triangles)
 
@@ -367,6 +373,115 @@ def _warn_if_reduced_symmetry_mesh(
         f"native_symmetry_plane={suspected!r} in SolveConfig to solve the "
         "free-space mirrored geometry. If the rim is a real open boundary, "
         "ignore this warning.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
+def open_shell_bore_alignment(
+    vertices_nx3: NDArray[np.float64],
+    triangles_nx3: NDArray[np.int32],
+    phys_tags: NDArray[np.int32],
+    *,
+    wall_tag: int = 1,
+    source_tag: int = 2,
+    band_fraction: float = 0.2,
+) -> float | None:
+    """Return the near-throat wall area fraction whose normal faces the bore.
+
+    A bare zero-thickness shell has no interior, so the signed-volume indicator
+    cannot judge its winding -- and about any fixed material point it reports
+    the opposite sign for rollback profiles, whose wall curls back past the
+    mouth plane. The throat collar is the part that is well defined: there the
+    wall is a flaring tube around the source cap, so a normal facing the
+    acoustic domain is exactly one with a negative radial component about the
+    cap's own axis. Both references are taken from the mesh, so the measure is
+    invariant under translation, rotation and vertical offsets.
+
+    Returns ``None`` when the mesh has no wall/source pair or no measurable
+    collar -- an open sheet with the source on its free rim, for instance.
+    """
+    tags = np.asarray(phys_tags, dtype=np.int32)
+    tris = np.asarray(triangles_nx3, dtype=np.int64)
+    verts = np.asarray(vertices_nx3, dtype=np.float64)
+    wall_mask = tags == int(wall_tag)
+    source_mask = tags == int(source_tag)
+    if not np.any(wall_mask) or not np.any(source_mask):
+        return None
+
+    s0, s1, s2 = (verts[tris[source_mask, i]] for i in range(3))
+    source_area_vectors = np.cross(s1 - s0, s2 - s0)
+    source_areas = 0.5 * np.linalg.norm(source_area_vectors, axis=1)
+    if not np.any(source_areas > 0.0):
+        return None
+    cap_centroid = np.average((s0 + s1 + s2) / 3.0, weights=source_areas, axis=0)
+    axis = source_area_vectors.sum(axis=0)
+    axis_length = float(np.linalg.norm(axis))
+    if axis_length <= 1.0e-12:
+        return None
+    axis = axis / axis_length
+
+    w0, w1, w2 = (verts[tris[wall_mask, i]] for i in range(3))
+    wall_area_vectors = np.cross(w1 - w0, w2 - w0)
+    wall_areas = 0.5 * np.linalg.norm(wall_area_vectors, axis=1)
+    offsets = (w0 + w1 + w2) / 3.0 - cap_centroid
+    axial = offsets @ axis
+    radial = offsets - np.outer(axial, axis)
+    radial_lengths = np.linalg.norm(radial, axis=1)
+
+    span = float(axial.max() - axial.min())
+    if span <= 0.0:
+        return None
+    band = axial <= axial.min() + float(band_fraction) * span
+    band &= (radial_lengths > 1.0e-12) & (wall_areas > 0.0)
+    if not np.any(band):
+        return None
+
+    inward = -radial[band] / radial_lengths[band, None]
+    facing_bore = np.sum(wall_area_vectors[band] * inward, axis=1) > 0.0
+    banded_areas = wall_areas[band]
+    return float(np.sum(banded_areas[facing_bore]) / np.sum(banded_areas))
+
+
+def _warn_if_inverted_open_shell(
+    vertices_nx3: NDArray[np.float64],
+    triangles_nx3: NDArray[np.int32],
+    phys_tags: NDArray[np.int32],
+    *,
+    coupled_ib_aperture_tag: int | None,
+    tolerance: float = 0.9,
+) -> None:
+    """Warn when an open shell's wall and source cap disagree on the bore side.
+
+    ``_validate_outward_normals`` deliberately declines to judge a non-closed
+    mesh, which leaves the one case where the winding is both unconstrained and
+    acoustically decisive: a bare shell whose wall points away from the bore
+    solves as an almost transparent sheet, and its throat impedance is wrong by
+    a factor of several. This is a warning rather than an error because an open
+    mesh is a supported configuration and this measure cannot judge every one
+    of them; the mesher owns the contract, and this only catches meshes that
+    predate or bypass it.
+    """
+    if coupled_ib_aperture_tag is not None:
+        return
+    if _is_closed_two_manifold(triangles_nx3):
+        return
+    # A mirror-reduced closed body is open only on its cut planes, and carries
+    # outer walls whose normals correctly face away from the bore. Only a mesh
+    # with a genuinely free rim is a candidate bare shell.
+    if detect_reduced_symmetry_plane(vertices_nx3, triangles_nx3) is not None:
+        return
+
+    alignment = open_shell_bore_alignment(vertices_nx3, triangles_nx3, phys_tags)
+    if alignment is None or alignment >= float(tolerance):
+        return
+    warnings.warn(
+        "Open mesh wall normals disagree with the source cap about which side "
+        f"is the acoustic domain: only {alignment:.3f} of the near-throat wall "
+        "area faces the bore. A bare shell wound this way radiates close to a "
+        "free monopole and its throat impedance is wrong by a large factor. "
+        "Regenerate the mesh with a current hornlab-waveguide-mesher, which "
+        "pins bare-shell winding from the builder parameterisation.",
         RuntimeWarning,
         stacklevel=3,
     )
