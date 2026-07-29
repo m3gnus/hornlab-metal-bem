@@ -884,6 +884,18 @@ def test_closed_meridian_validation_rejects_off_axis_topological_endpoints():
         _validate_closed_or_baffled_meridian(meridian, None)
 
 
+def test_legacy_baffle_image_rejects_mixed_orientation_coplanar_meridian():
+    # An out-and-back disk doubles impedance and level while remaining invisible
+    # in a normalized polar plot, so its mixed normals must not pass admission.
+    meridian = MeridianMesh.from_polyline(
+        np.array([[0.0, 0.0], [0.1, 0.0], [0.0, 0.0]], dtype=np.float64),
+        tags=2,
+    )
+
+    with pytest.raises(ValueError, match="only supported for a coplanar flat"):
+        _validate_closed_or_baffled_meridian(meridian, 0.0)
+
+
 def test_legacy_baffle_image_rejects_recessed_or_nonplanar_meridian():
     meridian = MeridianMesh.from_polyline(
         np.array(
