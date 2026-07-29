@@ -215,6 +215,27 @@ def test_circsym_complex_per_face_profile_feeds_neumann_rhs():
     )
 
 
+def test_circsym_velocity_callback_rejects_undeclared_tags():
+    meridian = _piston_meridian(radius=0.1, segments=4)
+    config = SolveConfig(
+        velocity_sources={2: 1.0},
+        velocity_source_callback=lambda _frequency_hz: {2: 1.0, 5: 1.0},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"returned tags \[5\].*not declared in velocity_sources",
+    ):
+        _build_driver_neumann_segments(
+            meridian,
+            2.0 * np.pi * 1000.0,
+            1000.0,
+            config,
+            impedance_tags=set(),
+            source_scale=None,
+        )
+
+
 def test_ring_kernels_match_dense_azimuth_quadrature_off_diagonal_and_near():
     k = 23.0 + 0.15j
     normal = np.array([0.6, -0.8], dtype=np.float64)

@@ -101,7 +101,13 @@ Common fields:
 
 - `freq_min_hz`, `freq_max_hz`, `freq_count`, `freq_spacing`
 - `velocity_sources`, mapping physical tag to source weight
-- `velocity_source_callback`, for frequency-dependent complex source weights
+- `velocity_source_callback`, for frequency-dependent complex source weights.
+  Its returned tags must be a subset of `velocity_sources`; declare every
+  potentially driven tag there up front (a zero static weight is fine).
+  Omitting a declared tag leaves it undriven at that frequency. Unlike
+  `impedance_source_callback`, it cannot introduce tags because velocity tags
+  establish the source geometry, observation frame, native session, pressure
+  averages, and impedance reference before the frequency loop.
 - `velocity_mode`, either `VelocityMode.ACCELERATION` or `VelocityMode.VELOCITY`
 - `source_motion`, either `SourceMotion.NORMAL` (default; uniform normal
   velocity, a breathing cap) or `SourceMotion.AXIAL` (rigid piston along the

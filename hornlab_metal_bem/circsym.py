@@ -40,7 +40,7 @@ from .config import (
     SourceMotion,
     TaperProfile,
     VelocityMode,
-    _validated_velocity_sources,
+    _resolve_velocity_sources,
 )
 from .observation import ObservationFrame, build_observation_points
 from .result import MeshInfo, SolveResult
@@ -1070,17 +1070,7 @@ def _build_driver_neumann_segments(
     source_scale: NDArray[np.complex128] | NDArray[np.float64] | None,
 ) -> NDArray[np.complex128]:
     coeffs = np.zeros(meridian.segment_count, dtype=np.complex128)
-    callback_sources = config.velocity_source_callback is not None
-    velocity_sources = _validated_velocity_sources(
-        config.velocity_source_callback(float(frequency_hz))
-        if callback_sources
-        else config.velocity_sources,
-        field_name=(
-            f"velocity_source_callback({frequency_hz:.3f}) result"
-            if callback_sources
-            else "velocity_sources"
-        ),
-    )
+    velocity_sources = _resolve_velocity_sources(config, frequency_hz)
     for raw_tag, raw_weight in velocity_sources.items():
         tag = int(raw_tag)
         if tag in impedance_tags:

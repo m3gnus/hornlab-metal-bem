@@ -143,6 +143,34 @@ def _validated_velocity_sources(
     return validated
 
 
+def _resolve_velocity_sources(
+    config: SolveConfig,
+    frequency_hz: float,
+) -> dict[int, object]:
+    """Resolve one frequency's velocity weights within the declared tag set."""
+    declared = _validated_velocity_sources(config.velocity_sources)
+    if config.velocity_source_callback is None:
+        return declared
+
+    frequency_hz = float(frequency_hz)
+    field_name = f"velocity_source_callback({frequency_hz:.3f}) result"
+    resolved = _validated_velocity_sources(
+        config.velocity_source_callback(frequency_hz),
+        field_name=field_name,
+    )
+    extra_tags = sorted(set(resolved) - set(declared))
+    if extra_tags:
+        raise ValueError(
+            f"{field_name} returned tags {extra_tags} that are not declared in "
+            "velocity_sources; declare every drivable tag up front (a zero "
+            "weight is fine) so frame inference, source velocity profiles, "
+            "native session validation, surface pressure averages, and "
+            "impedance source selection stay coherent. Returning a subset is "
+            "allowed."
+        )
+    return resolved
+
+
 def _validated_impedance_sources(
     sources: object,
     *,
@@ -279,6 +307,13 @@ class SolveConfig:
     velocity_sources: dict[int, float] = field(
         default_factory=lambda: {2: 1.0}
     )
+    # Frequency-dependent source weights for tags declared in velocity_sources.
+    # The callback may omit declared tags (leaving them undriven at that
+    # frequency), but may not introduce tags: source geometry, observation
+    # frame inference, native session validation, pressure averages, and the
+    # impedance reference are established from the static declaration before
+    # the frequency loop. Unlike this callback, impedance_source_callback may
+    # extend its static mapping because Robin tags do not define that geometry.
     velocity_source_callback: Callable[[float], dict[int, complex]] | None = None
     # Experimental Robin boundary condition. Maps physical tag to normalized
     # surface admittance beta = rho*c/Zs; beta=0 is rigid, beta=1 air-matched.

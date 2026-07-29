@@ -328,6 +328,43 @@ class TestSingleCallbackEvaluation:
                     np.complex64,
                 )
 
+    def test_velocity_callback_rejects_undeclared_tags(self):
+        from hornlab_metal_bem.bie import _build_driver_neumann_coeffs
+
+        config = SolveConfig(
+            velocity_sources={2: 1.0},
+            velocity_source_callback=lambda _frequency_hz: {2: 1.0, 5: 1.0},
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"returned tags \[5\].*not declared in velocity_sources",
+        ):
+            _build_driver_neumann_coeffs(
+                SimpleNamespace(global_dof_count=2),
+                np.array([2, 5], dtype=np.int32),
+                2 * np.pi * 1000.0,
+                config,
+                np.complex64,
+            )
+
+    def test_velocity_callback_subset_leaves_omitted_tag_undriven(self):
+        from hornlab_metal_bem.bie import _build_driver_neumann_coeffs
+
+        config = SolveConfig(
+            velocity_sources={2: 1.0, 5: 1.0},
+            velocity_source_callback=lambda _frequency_hz: {2: 1.0},
+        )
+        coeffs = _build_driver_neumann_coeffs(
+            SimpleNamespace(global_dof_count=2),
+            np.array([2, 5], dtype=np.int32),
+            2 * np.pi * 1000.0,
+            config,
+            np.complex64,
+        )
+
+        assert coeffs[0] != 0.0
+        assert coeffs[1] == 0.0
+
 
 # ---------------------------------------------------------------------------
 # compute_surface_pressure_avg
@@ -888,6 +925,47 @@ class TestAxialNeumannCoeffs:
             axial_face_scale=np.ones(3, dtype=np.float64),
         )
         np.testing.assert_allclose(axial, normal, rtol=1e-12)
+
+    def test_declared_callback_tags_match_static_axial_drive(self):
+        from hornlab_metal_bem.bie import (
+            _build_driver_neumann_coeffs,
+            _build_source_face_scale,
+        )
+
+        grid = _two_face_cap_grid(0.0)
+        tags = np.array([2, 5], dtype=np.int32)
+        static_config = SolveConfig(
+            velocity_sources={2: 1.0, 5: 1.0},
+            source_motion=SourceMotion.AXIAL,
+        )
+        callback_config = SolveConfig(
+            velocity_sources={2: 0.0, 5: 0.0},
+            velocity_source_callback=lambda _frequency_hz: {2: 1.0, 5: 1.0},
+            source_motion=SourceMotion.AXIAL,
+        )
+
+        def coefficients(config):
+            scale = _build_source_face_scale(
+                grid,
+                tags,
+                config,
+                np.array([0.0, 0.0, 1.0]),
+                np.zeros(3),
+            )
+            return _build_driver_neumann_coeffs(
+                SimpleNamespace(global_dof_count=2),
+                tags,
+                2 * np.pi * 1000.0,
+                config,
+                np.complex128,
+                source_face_scale=scale,
+            )
+
+        np.testing.assert_allclose(
+            coefficients(callback_config),
+            coefficients(static_config),
+            rtol=1e-12,
+        )
 
     def test_axial_acceleration_mode_divides_per_face(self):
         from hornlab_metal_bem.bie import _build_driver_neumann_coeffs
