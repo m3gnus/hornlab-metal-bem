@@ -263,6 +263,19 @@ def test_spherical_sampling_builds_sphere_points_and_metadata():
     assert metadata.sphere_metadata["theta_polar_rad"].shape == (32,)
 
 
+def test_spherical_sampling_rejects_more_than_100000_points():
+    with pytest.raises(
+        BoundaryLabSolverError,
+        match=r"spherical_sampling_points.*100000",
+    ):
+        solve_config_from_boundary_lab(
+            {
+                "spherical_sampling_enabled": True,
+                "spherical_sampling_points": 100_001,
+            }
+        )
+
+
 def test_spherical_sampling_disabled_leaves_no_sphere():
     solve_config, _ = solve_config_from_boundary_lab({"mesh_file": "m.msh"})
     assert solve_config.observation.sphere_points is None

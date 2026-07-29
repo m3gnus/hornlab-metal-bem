@@ -11,7 +11,13 @@ from typing import Any, Callable, Iterable, Iterator
 import numpy as np
 from scipy import signal
 
-from .config import BIEFormulation, ObservationConfig, SolveConfig, VelocityMode
+from .config import (
+    BIEFormulation,
+    ObservationConfig,
+    SolveConfig,
+    VelocityMode,
+    _MAX_SPHERE_POINTS,
+)
 
 REFERENCE_PRESSURE_PA = 20e-6
 
@@ -889,6 +895,11 @@ def _boundary_lab_sphere(
         "spherical_sampling_points",
         minimum=1,
     )
+    if count > _MAX_SPHERE_POINTS:
+        raise BoundaryLabSolverError(
+            "spherical_sampling_points must be <= "
+            f"{_MAX_SPHERE_POINTS}"
+        )
     distance = _coerce_finite_float(
         _first(
             source,

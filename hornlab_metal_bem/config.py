@@ -99,6 +99,7 @@ MetalNativeAssemblyMode = Literal["corrected", "optimized", "reference", "parity
 # config validation, native routing, and geometry validation so the lists
 # cannot drift apart.
 NATIVE_SYMMETRY_PLANES: tuple[str, ...] = ("yz", "xz", "xy", "yz+xz")
+_MAX_SPHERE_POINTS = 100_000
 
 
 def _is_integral_value(value: object) -> bool:
@@ -256,6 +257,10 @@ class ObservationConfig:
                 raise ValueError("sphere_points must have shape (M, 3)")
             if pts.shape[0] == 0:
                 raise ValueError("sphere_points must be non-empty when set")
+            if pts.shape[0] > _MAX_SPHERE_POINTS:
+                raise ValueError(
+                    f"sphere_points is too dense (> {_MAX_SPHERE_POINTS} points)"
+                )
             if not _np.all(_np.isfinite(pts)):
                 raise ValueError("sphere_points must be finite")
         if self.sphere_grid is not None:
@@ -274,8 +279,11 @@ class ObservationConfig:
                 raise ValueError("sphere_grid n_theta must be at least 2")
             if n_phi < 3:
                 raise ValueError("sphere_grid n_phi must be at least 3")
-            if n_theta * n_phi > 100_000:
-                raise ValueError("sphere_grid is too dense (n_theta*n_phi > 100000)")
+            if n_theta * n_phi > _MAX_SPHERE_POINTS:
+                raise ValueError(
+                    "sphere_grid is too dense "
+                    f"(n_theta*n_phi > {_MAX_SPHERE_POINTS})"
+                )
             self.sphere_grid = (n_theta, n_phi)
         if not (0.0 < float(self.sphere_theta_max_deg) <= 180.0):
             raise ValueError("sphere_theta_max_deg must be in (0, 180]")

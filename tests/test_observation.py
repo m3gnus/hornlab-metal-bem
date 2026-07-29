@@ -30,6 +30,14 @@ def test_observation_config_rejects_bad_sphere_points(bad):
         ObservationConfig(sphere_points=bad)
 
 
+def test_observation_config_caps_sphere_points_at_100000():
+    accepted = ObservationConfig(sphere_points=np.zeros((100_000, 3)))
+    assert accepted.sphere_points.shape == (100_000, 3)
+
+    with pytest.raises(ValueError, match=r"sphere_points.*100000"):
+        ObservationConfig(sphere_points=np.zeros((100_001, 3)))
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
