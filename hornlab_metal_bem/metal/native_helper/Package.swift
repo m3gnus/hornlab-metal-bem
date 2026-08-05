@@ -16,9 +16,6 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "HornlabMetalBemNative",
-            resources: [
-                .process("Resources")
-            ],
             linkerSettings: [
                 .linkedFramework("Accelerate")
             ]

@@ -4508,26 +4508,26 @@ struct AssemblyLibraryLoad {
     let cacheHit: Bool
 }
 
-func bundledAssemblyMetallibURL() -> URL? {
-    #if SWIFT_PACKAGE
-    return Bundle.module.url(forResource: "regular_assembly", withExtension: "metallib")
-    #else
-    return nil
-    #endif
-}
-
 func assemblyMetallibCandidateURLs() -> [URL] {
     var candidates: [URL] = []
     if let explicitPath = ProcessInfo.processInfo.environment["HORNLAB_METAL_BEM_METALLIB"],
        !explicitPath.isEmpty {
         candidates.append(URL(fileURLWithPath: explicitPath))
     }
-    if let bundleURL = bundledAssemblyMetallibURL() {
-        candidates.append(bundleURL)
-    }
     let executableDir = URL(fileURLWithPath: CommandLine.arguments[0])
         .deletingLastPathComponent()
     candidates.append(executableDir.appendingPathComponent("regular_assembly.metallib"))
+    // Wheels install the helper under native_helper/.build/release and ship
+    // an optional precompiled library under native_helper/Sources. Resolve it
+    // relative to the executable so the path remains valid after pip removes
+    // its temporary build tree. Do not use Bundle.module here: SwiftPM's
+    // generated accessor traps instead of returning nil when a wheel ships a
+    // standalone helper without its build-tree resource bundle.
+    candidates.append(
+        executableDir
+            .appendingPathComponent("../../Sources/HornlabMetalBemNative/Resources/regular_assembly.metallib")
+            .standardizedFileURL
+    )
     candidates.append(
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -10087,6 +10087,9 @@ func evaluateStandardExteriorBatch(
 
 func smoke() throws {
     let device = try MetalWarmup.shared.device()
+    // Exercise assembly-library discovery as part of readiness. This catches
+    // broken packaged-resource assumptions before a real solve is submitted.
+    _ = assemblyMetallibCandidateURLs()
     print("hornlab-metal-bem native Metal helper smoke ok: \(device.name)")
 }
 
