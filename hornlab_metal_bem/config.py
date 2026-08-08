@@ -381,8 +381,8 @@ class SolveConfig:
     observation: ObservationConfig = field(default_factory=ObservationConfig)
 
     # Frame override: skip infer_frame() when set.
-    # Use this for enclosed geometries where the heuristic may get the
-    # axis wrong, or when the caller has a known frame (e.g. WG bridge).
+    # Use this when external source winding is not authoritative, several
+    # sources need a shared frame, or the caller has a known frame (e.g. WG).
     frame_override: object | None = None  # ObservationFrame, kept as object to avoid circular import
 
     # Native Metal controls

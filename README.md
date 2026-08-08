@@ -84,8 +84,10 @@ reject explicit conflicts. A bare numeric tag `12` is not sufficient by itself:
 external meshes may use that number for unrelated boundaries, so automatic
 coupled-IB routing requires the physical name (or an explicit `aperture_tag`).
 
-The solver infers the observation frame from the source-tag element normals and
-the mesh mouth. For enclosed or unusual geometry, pass `frame_override`.
+The solver treats usable source-tag element normals as the authoritative forward
+direction and locates the mesh mouth along that axis. For external meshes whose
+source winding is not authoritative, unusual multi-source geometry, or an exact
+caller-owned reference frame, pass `frame_override`.
 
 `native_symmetry_plane` means a mirror-reduced half/quarter mesh: the inferred
 frame axis and origin are projected onto the requested symmetry plane(s) so

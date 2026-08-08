@@ -286,10 +286,15 @@ class TestStandardObservationPoints:
 
 
 # ---------------------------------------------------------------------------
-# infer_frame — enclosed geometry detection
+# infer_frame — source-normal direction and enclosed geometry
 # ---------------------------------------------------------------------------
 
-def _build_simple_horn_mesh(source_z: float, mouth_z: float):
+def _build_simple_horn_mesh(
+    source_z: float,
+    mouth_z: float,
+    *,
+    source_normal_z: float = 1.0,
+):
     """Build a minimal triangulated mesh with source elements at source_z
     and body elements spanning to mouth_z.
 
@@ -327,6 +332,8 @@ def _build_simple_horn_mesh(source_z: float, mouth_z: float):
         [0, 1, 2],
         [0, 2, 3],
     ])
+    if source_normal_z < 0.0:
+        src_elems = src_elems[:, [0, 2, 1]]
     # Body triangles (connecting mid to mouth)
     body_elems = np.array([
         [4, 5, 9],
@@ -342,6 +349,41 @@ def _build_simple_horn_mesh(source_z: float, mouth_z: float):
     return vertices.T, elements.T, tags
 
 
+def _build_horn_in_enclosure_mesh(rear_depth: float):
+    """Build a +Z source cap inside a box whose front is 70 mm away."""
+    source = np.array([
+        [-0.01, -0.01, 0.0],
+        [0.01, -0.01, 0.0],
+        [0.01, 0.01, 0.0],
+        [-0.01, 0.01, 0.0],
+    ])
+    rear = np.array([
+        [-0.1, -0.1, -rear_depth],
+        [0.1, -0.1, -rear_depth],
+        [0.1, 0.1, -rear_depth],
+        [-0.1, 0.1, -rear_depth],
+    ])
+    front = np.array([
+        [-0.1, -0.1, 0.07],
+        [0.1, -0.1, 0.07],
+        [0.1, 0.1, 0.07],
+        [-0.1, 0.1, 0.07],
+    ])
+    vertices = np.vstack([source, rear, front])
+    source_elems = np.array([[0, 1, 2], [0, 2, 3]])
+    enclosure_elems = np.array([
+        [4, 6, 5], [4, 7, 6],
+        [8, 9, 10], [8, 10, 11],
+        [4, 5, 9], [4, 9, 8],
+        [5, 6, 10], [5, 10, 9],
+        [6, 7, 11], [6, 11, 10],
+        [7, 4, 8], [7, 8, 11],
+    ])
+    elements = np.vstack([source_elems, enclosure_elems])
+    tags = np.array([2, 2] + [1] * len(enclosure_elems), dtype=np.int32)
+    return vertices.T, elements.T, tags
+
+
 class TestInferFrameEnclosed:
 
     def test_source_at_min_uses_normal_direction(self):
@@ -354,21 +396,58 @@ class TestInferFrameEnclosed:
         # axis should point from source toward mouth (+z direction)
         assert frame.axis[2] > 0.9
 
-    def test_source_at_max_flips_axis(self):
-        """Source near max of projection span — axis should be flipped."""
-        verts, elems, tags = _build_simple_horn_mesh(source_z=0.3, mouth_z=0.0)
+    def test_negative_source_winding_points_toward_negative_z(self):
+        """A canonical -Z source normal defines a horn that fires toward -Z."""
+        verts, elems, tags = _build_simple_horn_mesh(
+            source_z=0.3,
+            mouth_z=0.0,
+            source_normal_z=-1.0,
+        )
         grid = _mock_grid(verts, elems)
 
         frame = infer_frame(grid, tags, source_tag=2, origin_at="mouth")
 
-        # Source is at z=0.3 (max), mouth at z=0.0 (min). Axis should
-        # point from source toward mouth = -z direction.
         assert frame.axis[2] < -0.9
+        assert frame.origin[2] == pytest.approx(0.0)
+
+    @pytest.mark.parametrize("rear_depth", [0.16, 0.21, 0.28])
+    def test_enclosure_depth_does_not_override_source_winding(self, rear_depth):
+        """Shallow, threshold, and deep boxes retain the same +Z frame."""
+        verts, elems, tags = _build_horn_in_enclosure_mesh(rear_depth)
+        grid = _mock_grid(verts, elems)
+
+        frame = infer_frame(grid, tags, source_tag=2, origin_at="mouth")
+
+        np.testing.assert_allclose(frame.axis, [0.0, 0.0, 1.0], atol=1e-12)
+        np.testing.assert_allclose(frame.origin, [0.0, 0.0, 0.07], atol=1e-12)
+
+    def test_deep_symmetric_enclosure_sphere_grid_theta_zero_stays_in_front(self):
+        verts, elems, tags = _build_horn_in_enclosure_mesh(0.28)
+        grid = _mock_grid(verts, elems)
+        frame = infer_frame(
+            grid,
+            tags,
+            source_tag=2,
+            origin_at="mouth",
+            symmetry_plane="yz+xz",
+        )
+        config = ObservationConfig(
+            distance_m=2.0,
+            sphere_grid=(3, 4),
+        )
+
+        points, theta_deg, _phi_deg = build_sphere_grid_points(frame, config)
+
+        np.testing.assert_allclose(frame.axis, [0.0, 0.0, 1.0], atol=1e-12)
+        np.testing.assert_allclose(frame.origin, [0.0, 0.0, 0.07], atol=1e-12)
+        on_axis = points[theta_deg == 0.0]
+        expected = frame.origin + config.distance_m * frame.axis
+        np.testing.assert_allclose(on_axis, np.tile(expected, (4, 1)), atol=1e-12)
+        assert np.all(on_axis[:, 2] > 0.07)
 
     def test_enclosed_geometry_trusts_source_normal(self):
         """Source at midpoint of span (enclosed) — trusts source normal."""
         # Source at z=0.15 with mesh spanning 0.0 to 0.3
-        # Source sits at 50% of span, both source_from_min and source_from_max > 0.25
         src_verts = np.array([
             [-0.01, -0.01, 0.15],
             [0.01, -0.01, 0.15],
@@ -404,7 +483,7 @@ class TestInferFrameEnclosed:
         grid = _mock_grid(vertices.T, elements.T)
         frame = infer_frame(grid, tags, source_tag=2, origin_at="mouth")
 
-        # Enclosed: should trust source normal (+z)
+        # A tagged source normal is authoritative regardless of its position.
         assert frame.axis[2] > 0.9
 
     def test_no_source_tag_raises(self):
@@ -414,6 +493,41 @@ class TestInferFrameEnclosed:
 
         with pytest.raises(ValueError, match="No elements with tag 99"):
             infer_frame(grid, tags_no_source, source_tag=99)
+
+
+# ---------------------------------------------------------------------------
+# infer_frame — no-usable-source-normal fallback
+# ---------------------------------------------------------------------------
+
+class TestInferFrameFallback:
+
+    def test_pca_fallback_retains_legacy_extent_axis_and_mouth(self):
+        """A degenerate source reaches PCA; extents orient it toward -Z."""
+        rear = np.array([
+            [-0.1, -0.1, -3.0],
+            [0.1, -0.1, -3.0],
+            [0.1, 0.1, -3.0],
+            [-0.1, 0.1, -3.0],
+        ])
+        angles = np.linspace(0.0, 2.0 * np.pi, 12, endpoint=False)
+        front = np.column_stack([
+            0.1 * np.cos(angles),
+            0.1 * np.sin(angles),
+            np.ones_like(angles),
+        ])
+        vertices = np.vstack([rear, front])
+        elements = np.array([
+            [0, 0, 0],  # Tagged but degenerate: no usable source normal.
+            [0, 1, 2],
+        ])
+        tags = np.array([2, 1], dtype=np.int32)
+        grid = _mock_grid(vertices.T, elements.T)
+
+        frame = infer_frame(grid, tags, source_tag=2, origin_at="mouth")
+
+        np.testing.assert_allclose(frame.axis, [0.0, 0.0, -1.0], atol=1e-12)
+        np.testing.assert_allclose(frame.mouth_center, [0.0, 0.0, -3.0], atol=1e-12)
+        np.testing.assert_allclose(frame.origin, frame.mouth_center, atol=1e-12)
 
 
 # ---------------------------------------------------------------------------
@@ -499,8 +613,8 @@ class TestInferFrameAreaWeighting:
         grid = _mock_grid(vertices.T, elements.T)
         frame = infer_frame(grid, tags, source_tag=2, origin_at="mouth")
 
-        # The enclosed-geometry branch trusts the source normal; the tiny
-        # reversed face must not flip it away from +z.
+        # The tagged source normal is authoritative; the tiny reversed face
+        # must not flip its sign away from +z.
         assert frame.axis[2] > 0.99
 
 

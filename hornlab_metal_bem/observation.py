@@ -82,8 +82,10 @@ def infer_frame(
 ) -> ObservationFrame:
     """Infer radiation reference frame from mesh geometry.
 
-    Uses source-element normals to determine the forward axis, then
-    identifies the mouth as the mesh extreme along that axis.
+    Treats a usable source-element normal as the authoritative forward axis,
+    then identifies the mouth as the mesh extreme along that axis. Only the
+    PCA fallback, where source winding is unavailable, uses mesh extents to
+    resolve the otherwise arbitrary axis sign.
 
     Args:
         grid: BEM grid object with ``.vertices`` (3, N) and ``.elements``
@@ -162,42 +164,35 @@ def infer_frame(
 
     if symmetry_plane is not None:
         # Full-model axes are mirror-invariant; reduced normals/PCA can be
-        # quadrant-biased, so constrain the axis before extent heuristics.
+        # quadrant-biased, so constrain the axis before resolving its sign.
         projected_normal = _project_to_symmetry_subspace(avg_normal, symmetry_plane)
         projected_norm = float(np.linalg.norm(projected_normal))
         if projected_norm > 1e-12:
             avg_normal = projected_normal / projected_norm
 
-    # Determine forward axis: should point away from source toward mouth.
-    # Project all vertices along avg_normal; mouth is at the extreme.
-    projections = vertices @ avg_normal
-    source_proj = source_center @ avg_normal
-    max_proj = projections.max()
-    min_proj = projections.min()
-
-    span = max_proj - min_proj
-    if span < 1e-12:
+    if source_from_tags:
+        # Canonical meshes define the source-cap winding semantically: its
+        # normal points from the throat toward the mouth. Mesh extents cannot
+        # safely second-guess that contract once a cabinet surrounds the horn.
         axis = avg_normal.copy()
     else:
-        source_from_min = abs(source_proj - min_proj) / span
-        source_from_max = abs(source_proj - max_proj) / span
-
-        if source_from_tags and min(source_from_min, source_from_max) > 0.25:
-            # Source is near the midpoint (enclosed geometry where horn
-            # throat sits inside a larger enclosure). Trust the source
-            # element normal direction rather than the extent heuristic.
-            axis = avg_normal.copy()
-            logger.info(
-                "Enclosed geometry detected (source at %.0f%% of span), "
-                "using source normal for axis",
-                100 * source_from_min,
-            )
-        elif source_from_min < source_from_max:
-            # Source near min projection: normal already points forward
+        # PCA eigenvectors have an arbitrary sign. Preserve the legacy extent
+        # resolution only for this no-usable-source-normal fallback.
+        projections = vertices @ avg_normal
+        source_proj = source_center @ avg_normal
+        max_proj = projections.max()
+        min_proj = projections.min()
+        span = max_proj - min_proj
+        if span < 1e-12:
             axis = avg_normal.copy()
         else:
-            # Source near max projection: flip to point forward
-            axis = -avg_normal
+            source_from_min = abs(source_proj - min_proj) / span
+            source_from_max = abs(source_proj - max_proj) / span
+            axis = (
+                avg_normal.copy()
+                if source_from_min < source_from_max
+                else -avg_normal
+            )
 
     # Mouth centre: vertices near the max projection along axis
     proj_along_axis = vertices @ axis
