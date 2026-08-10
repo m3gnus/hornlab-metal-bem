@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hornlab-metal-bem"
-version = "0.1.0"
+version = "1.0.0"
 description = "Apple Metal accelerated acoustic BEM solver for waveguide and loudspeaker meshes"
 requires-python = ">=3.10"
 license = { text = "AGPL-3.0-or-later" }
