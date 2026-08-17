@@ -19,6 +19,7 @@ from .config import (
     VelocityMode,
 )
 from .circsym import MeridianMesh
+from .field_traces import evaluate_exterior_from_traces
 from .mesh import LoadedMesh, MeshError, load_mesh
 from .observation import ObservationFrame, infer_frame
 from .result import MeshInfo, SolveResult
@@ -30,6 +31,7 @@ __all__ = [
     "solve_circsym",
     "solve_circsym_frequencies",
     "solve_multi_source",
+    "evaluate_exterior_from_traces",
     "load_mesh",
     "MeridianMesh",
     "SolveConfig",

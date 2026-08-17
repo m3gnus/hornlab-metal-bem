@@ -410,6 +410,10 @@ class SolveConfig:
     # the caller pinned HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY.
     dense_solve_dtype: Literal["float32", "float64"] = "float32"
     return_surface_pressure: bool = False
+    # Retain the complete P1 pressure and total DP0 Neumann traces needed to
+    # re-evaluate the exterior field after the solve. This implies surface
+    # pressure output and additionally reconstructs Robin contributions.
+    return_surface_traces: bool = False
     metal_native_threads_per_group: int | None = None
     metal_native_matrix_threads_per_group: int | None = None
     metal_native_rhs_threads_per_group: int | None = None

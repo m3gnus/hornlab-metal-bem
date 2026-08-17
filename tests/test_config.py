@@ -466,6 +466,11 @@ def test_solve_config_accepts_surface_pressure_output_flag():
     assert SolveConfig(return_surface_pressure=True).return_surface_pressure is True
 
 
+def test_solve_config_accepts_surface_trace_output_flag():
+    assert SolveConfig().return_surface_traces is False
+    assert SolveConfig(return_surface_traces=True).return_surface_traces is True
+
+
 def test_solve_config_accepts_native_threadgroup_override():
     assert (
         SolveConfig(metal_native_threads_per_group=64)
