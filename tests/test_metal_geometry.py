@@ -8,6 +8,7 @@ import pytest
 from hornlab_metal_bem.metal.geometry import (
     MetalGeometryError,
     _build_metal_geometry_buffers_with_max_edge,
+    _plane_snap_tolerance,
     build_metal_geometry_buffers,
     validate_native_infinite_baffle_aperture,
 )
@@ -232,15 +233,19 @@ def test_build_metal_geometry_buffers_rejects_dp0_count_mismatch():
         )
 
 
-def test_build_metal_geometry_buffers_snaps_near_zero_coordinates():
-    # Near-plane CAD vertices must land exactly on 0.0 so they cannot fall
-    # between Python plane validation (1e-7) and the native helper's 1e-6
-    # image-pair coordinate keys; coordinates beyond the tolerance survive.
+def test_build_metal_geometry_buffers_snaps_scale_relative_near_plane_vertex():
+    # A 1.5 m model is deliberately large enough that its CAD residue should
+    # not inherit the same absolute tolerance as a 25 mm throat. The 5e-7
+    # relative offset is also the value pinned by the native image-Duffy
+    # regression: after this adapter it must reach coordinateKey() as exact
+    # zero, not as two differently rounded real/image coordinates.
+    scale = 1.5
+    near_plane = 5.0e-7 * scale
     vertices = np.array(
         [
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, -5.0e-7],
-            [5.0e-7, 2.0e-6, 0.0, 1.0],
+            [0.0, scale, 0.0, 0.0],
+            [0.0, 0.0, 0.01, -near_plane],
+            [near_plane, 0.01, 0.0, 0.01],
         ],
         dtype=np.float64,
     )
@@ -251,11 +256,48 @@ def test_build_metal_geometry_buffers_snaps_near_zero_coordinates():
         _mock_dp0(),
     )
 
+    expected_tolerance = 1.0e-6 * np.linalg.norm(
+        vertices.max(axis=1) - vertices.min(axis=1)
+    )
+    assert expected_tolerance > 1.0e-6
+    assert _plane_snap_tolerance(vertices) == pytest.approx(expected_tolerance)
     assert buffers.vertices_3xn_f32[2, 0] == 0.0
     assert buffers.vertices_3xn_f32[1, 3] == 0.0
-    assert buffers.vertices_3xn_f32[2, 1] == np.float32(2.0e-6)
     # The caller's array is untouched.
-    assert vertices[2, 0] == 5.0e-7
+    assert vertices[2, 0] == near_plane
+
+
+def test_build_metal_geometry_buffers_tiny_mesh_preserves_off_plane_vertex():
+    # On a 0.1 mm fixture, 5e-7 is a meaningful geometric displacement rather
+    # than scale-sized CAD noise. A tolerance inherited from a prior large-mesh
+    # call would erase it, which is why the bounding box must be recomputed for
+    # every adapter invocation.
+    scale = 1.0e-4
+    vertices = np.array(
+        [
+            [5.0e-7, scale, 0.0, 0.0],
+            [0.0, 0.0, scale, 0.0],
+            [0.0, 0.0, 0.0, scale],
+        ],
+        dtype=np.float64,
+    )
+    buffers = build_metal_geometry_buffers(
+        _mock_grid(vertices),
+        np.array([1, 2], dtype=np.int32),
+        _mock_p1(),
+        _mock_dp0(),
+    )
+
+    assert buffers.vertices_3xn_f32[0, 0] == np.float32(5.0e-7)
+
+
+def test_plane_snap_tolerance_uses_absolute_floor_for_zero_span_input():
+    # Geometry validation later rejects zero-area triangles, but tolerance
+    # selection must still be well-defined for a degenerate bounding box so the
+    # adapter has no divide-by-scale or cached-scale special case.
+    vertices = np.full((3, 4), 5.0e-10, dtype=np.float64)
+
+    assert _plane_snap_tolerance(vertices) == 1.0e-9
 
 
 def _aperture_buffers(

@@ -24,13 +24,24 @@ class MetalGeometryError(ValueError):
     """Raised when grid/space metadata cannot satisfy the Metal data contract."""
 
 
-# Vertex coordinates this close to zero are snapped to exactly 0.0. The Swift
-# helper quantizes vertex coordinates with a 1e-6 tolerance when matching
-# mirrored image vertices for singular-pair detection, while Python symmetry
-# validation uses 1e-7; without snapping, a CAD vertex at e.g. z=5e-7 passes
-# neither as on-plane nor mirrors onto itself, so image Duffy pairs silently
-# fail to fire. Must stay aligned with coordinateKey() in the native helper.
-_PLANE_SNAP_TOLERANCE = 1.0e-6
+# A fixed absolute plane tolerance is the wrong shape for geometry spanning
+# roughly 25 mm throats through 1.5 m horns: the coordinate residue left by CAD
+# export and unit conversion scales with the model. Compute the actual tolerance
+# from every mesh presented to this adapter, after the loader has applied its
+# unit conversion, rather than caching a tolerance from some earlier mesh with a
+# different scale. The absolute floor only matters for a zero-span input.
+#
+# Swift's coordinateKey() still owns a fixed 1e-6 quantization grid for matching
+# image singularities. This snap does not make that grid looser: it replaces a
+# qualifying near-plane component with exact zero *before* Swift constructs its
+# key, so both the real vertex and its image quantize identically. For meshes no
+# larger than one unit the relative tolerance is no wider than coordinateKey's
+# grid; for a metre-scale model it may be a few micrometres, but none of those
+# snapped residues reach coordinateKey. The z=5e-7 regression case therefore
+# remains an exact on-plane vertex instead of falling between Python's plane
+# validation and Swift's image-pair matching.
+_PLANE_SNAP_ABSOLUTE_FLOOR = 1.0e-9
+_PLANE_SNAP_RELATIVE_FACTOR = 1.0e-6
 
 
 @dataclass(frozen=True)
@@ -144,8 +155,9 @@ def _build_metal_geometry_buffers(
     include_max_edge: bool,
 ) -> tuple[MetalGeometryBuffers, float | None]:
     input_vertices_f64 = _require_vertices_3xn(grid)
+    plane_snap_tolerance = _plane_snap_tolerance(input_vertices_f64)
     vertices_f64 = input_vertices_f64.copy()
-    vertices_f64[np.abs(vertices_f64) <= _PLANE_SNAP_TOLERANCE] = 0.0
+    vertices_f64[np.abs(vertices_f64) <= plane_snap_tolerance] = 0.0
     triangles_i32 = _require_triangles_3xm(grid, vertices_f64.shape[1])
     n_triangles = int(triangles_i32.shape[1])
 
@@ -168,6 +180,7 @@ def _build_metal_geometry_buffers(
         ) = _compute_areas_normals_and_max_edge(
             input_vertices_f64,
             triangles_i32,
+            plane_snap_tolerance=plane_snap_tolerance,
         )
     else:
         triangle_areas_f32, triangle_normals_3xm_f32 = _compute_areas_normals(
@@ -520,11 +533,16 @@ def _validate_open_edges_on_symmetry_planes(
         components.append(2)
         labels.append("Z=0")
 
+    # Buffers normally contain exact zeros from the adapter snap, but compute
+    # this validation tolerance from the current mesh as well. Reusing a value
+    # derived from a previous call would make validation order-dependent when a
+    # process handles a millimetre fixture and a metre-scale horn in succession.
+    plane_tolerance = _plane_snap_tolerance(coords_3xn)
     on_requested_plane = np.zeros(edges.shape[0], dtype=bool)
     for component in components:
         edge_values = coords_3xn[component, edges]
         on_requested_plane |= np.all(
-            np.abs(edge_values) <= _PLANE_SNAP_TOLERANCE,
+            np.abs(edge_values) <= plane_tolerance,
             axis=1,
         )
 
@@ -558,6 +576,17 @@ def _require_vertices_3xn(grid: Any) -> NDArray[np.float64]:
     if not np.all(np.isfinite(vertices_f64)):
         raise MetalGeometryError("grid.vertices must contain only finite values")
     return vertices_f64
+
+
+def _plane_snap_tolerance(vertices_3xn: NDArray[np.float64]) -> float:
+    """Return the current mesh's scale-relative symmetry-plane tolerance."""
+    lower = np.min(vertices_3xn, axis=1)
+    upper = np.max(vertices_3xn, axis=1)
+    bbox_diagonal = float(np.linalg.norm(upper - lower))
+    return max(
+        _PLANE_SNAP_ABSOLUTE_FLOOR,
+        _PLANE_SNAP_RELATIVE_FACTOR * bbox_diagonal,
+    )
 
 
 def _require_triangles_3xm(
@@ -667,6 +696,8 @@ def _compute_areas_normals(
 def _compute_areas_normals_and_max_edge(
     input_vertices_3xn: NDArray[np.float64],
     triangles_3xm: NDArray[np.int32],
+    *,
+    plane_snap_tolerance: float,
 ) -> tuple[NDArray[np.float32], NDArray[np.float32], float]:
     """Compute snapped geometry and the original mesh edge metric in one gather."""
     vertices_nx3 = input_vertices_3xn.T
@@ -680,7 +711,7 @@ def _compute_areas_normals_and_max_edge(
         float(np.max(np.linalg.norm(p0 - p2, axis=1))),
     )
     for points in (p0, p1, p2):
-        points[np.abs(points) <= _PLANE_SNAP_TOLERANCE] = 0.0
+        points[np.abs(points) <= plane_snap_tolerance] = 0.0
     areas, normals = _areas_normals_from_points(p0, p1, p2)
     return areas, normals, max_edge_m
 
