@@ -443,6 +443,12 @@ struct MultiDenseSolveRun {
     var dtype: String = "float32"
     var chiefResidualRels: [Double]? = nil
     var apertureNeumanns: [[Complex32]]? = nil
+    // Reciprocal 1-norm condition estimate for the small aperture radiation
+    // block used by the coupled-IB Schur elimination. This is deliberately
+    // separate from `rcond`, which describes the remaining dense boundary
+    // solve: the two matrices have different sizes and diagnose different
+    // resonance mechanisms.
+    var apertureRcond: Double? = nil
 
     /// Single-source view for the existing per-case result plumbing.
     func single(_ index: Int) -> DenseSolveRun {
@@ -641,8 +647,13 @@ struct DuffyCorrectionStats {
         if let dispatch {
             payload["metal_dispatch"] = dispatch
         }
+        // Keep the count present even when it is zero. Under native symmetry,
+        // zero is actionable evidence that the coordinate-key construction may
+        // have missed plane-adjacent geometry; omitting the key made that case
+        // indistinguishable from an older helper that never measured image
+        // pairs at all.
+        payload["image_adjacent_pairs"] = imagePairs
         if imagePairs > 0 {
-            payload["image_adjacent_pairs"] = imagePairs
             payload["image_singular_correction"] = true
         }
         return payload
@@ -7620,26 +7631,34 @@ func solveCoupledIBDenseMultiSchur(
     let start = CFAbsoluteTimeGetCurrent()
 
     // T = (2*Saa)^-1 * Pavg, stored first as the column-major RHS block
-    // required by cgesv: rows=M aperture velocities, columns=N pressure DOFs.
+    // required by zgesv: rows=M aperture velocities, columns=N pressure DOFs.
+    // The SlpProjection inputs remain float32, but this small M x M aperture
+    // system is where conditioning collapses near interior resonances. Widening
+    // only its factorization and N right-hand sides avoids paying complex128
+    // storage for the much larger N x N Schur product while recovering the
+    // accuracy lost when an ill-conditioned aperture block is factored in f32.
     var apertureMatrix = Array(
-        repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
         count: m * m
     )
     for row in 0..<m {
         for col in 0..<m {
             let value = coupling.rayleighSlp.value(row: row, col: col) * 2.0
-            apertureMatrix[col * m + row] = __CLPK_complex(r: value.re, i: value.im)
+            apertureMatrix[col * m + row] = __CLPK_doublecomplex(
+                r: Double(value.re),
+                i: Double(value.im)
+            )
         }
     }
     var apertureRhs = Array(
-        repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
         count: m * n
     )
     for (rowLocal, tri) in coupling.aperture.triangles.enumerated() {
         for local in 0..<3 {
             let pressureDof = geom.p1Dof(tri, local)
             let idx = pressureDof * m + rowLocal
-            apertureRhs[idx].r += Float(1.0 / 3.0)
+            apertureRhs[idx].r += 1.0 / 3.0
         }
     }
     var mClpk = __CLPK_integer(m)
@@ -7648,26 +7667,49 @@ func solveCoupledIBDenseMultiSchur(
     var ldb = __CLPK_integer(m)
     var info = __CLPK_integer(0)
     var aperturePivots = Array(repeating: __CLPK_integer(0), count: m)
-    cgesv_(&mClpk, &nrhs, &apertureMatrix, &lda, &aperturePivots, &apertureRhs, &ldb, &info)
+    let apertureAnorm = matrixOneNormZ(&apertureMatrix, n: m)
+    zgesv_(
+        &mClpk,
+        &nrhs,
+        &apertureMatrix,
+        &lda,
+        &aperturePivots,
+        &apertureRhs,
+        &ldb,
+        &info
+    )
     if info != 0 {
         return MultiDenseSolveRun(
             pressures: [],
-            implementation: "accelerate_lapack_cgesv_coupled_ib_schur_aperture",
+            implementation: "accelerate_lapack_zgesv_coupled_ib_schur_aperture",
             seconds: CFAbsoluteTimeGetCurrent() - start,
             lapackInfo: Int32(info),
             rcond: nil
         )
     }
+    let apertureRcond = estimateReciprocalConditionZ(
+        factored: &apertureMatrix,
+        n: m,
+        anorm: apertureAnorm
+    )
 
-    // Row-major T (M x N), Sia (N x M), and Schur matrix (N x N) for cblas_cgemm:
-    // Schur = A - Sia*T.
+    // Narrow the solved T exactly once for both float32 GEMMs below. Sia and
+    // the N x N Schur matrix intentionally stay in the established f32 path:
+    // widening that product would dominate memory, while the aperture rcond
+    // now tells us whether further precision work is warranted.
+    // Row-major T (M x N), Sia (N x M), and Schur matrix (N x N) for
+    // cblas_cgemm: Schur = A - Sia*T.
     var tRowMajor = Array(
         repeating: __CLPK_complex(r: 0.0, i: 0.0),
         count: m * n
     )
     for row in 0..<m {
         for col in 0..<n {
-            tRowMajor[row * n + col] = apertureRhs[col * m + row]
+            let value = apertureRhs[col * m + row]
+            tRowMajor[row * n + col] = __CLPK_complex(
+                r: Float(value.r),
+                i: Float(value.i)
+            )
         }
     }
     var sia = Array(
@@ -7729,7 +7771,8 @@ func solveCoupledIBDenseMultiSchur(
             refineIterations: solved.refineIterations,
             refineResidualRels: solved.refineResidualRels,
             dtype: solved.dtype,
-            chiefResidualRels: solved.chiefResidualRels
+            chiefResidualRels: solved.chiefResidualRels,
+            apertureRcond: apertureRcond
         )
     }
 
@@ -7781,7 +7824,8 @@ func solveCoupledIBDenseMultiSchur(
         refineResidualRels: solved.refineResidualRels,
         dtype: solved.dtype,
         chiefResidualRels: solved.chiefResidualRels,
-        apertureNeumanns: apertureNeumanns
+        apertureNeumanns: apertureNeumanns,
+        apertureRcond: apertureRcond
     )
 }
 
@@ -9718,6 +9762,10 @@ func assembleSolveEvaluateStandardNeumannBatch(
             caseResult["ib_field"] = "rayleigh_aperture_only"
             caseResult["ib_aperture_transform_seconds"] = apertureCoupling.transformSeconds
             caseResult["ib_aperture_slp_duffy"] = apertureCoupling.usedDuffy
+            caseResult["ib_aperture_dof_count"] = apertureCoupling.aperture.triangles.count
+            if let apertureRcond = solve.apertureRcond {
+                caseResult["ib_aperture_rcond"] = apertureRcond
+            }
             caseResult["ib_aperture_assembly_implementation"] = apertureCoupling.assemblyImplementation
             caseResult["ib_coupled_solve"] = solve.implementation.contains("_coupled_ib_schur")
                 ? "schur"

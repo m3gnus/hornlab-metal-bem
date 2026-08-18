@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import warnings
 from typing import Any
 from uuid import uuid4
 
@@ -457,6 +458,7 @@ class MetalNativeStandardSession:
             result_path=result_path,
         )
         result = read_json_manifest(result_path)
+        _warn_if_zero_image_duffy_pairs(result)
         return DenseAssemblyResult(
             session_id=str(result["session_id"]),
             frequency_hz=float(result["frequency_hz"]),
@@ -569,6 +571,8 @@ class MetalNativeStandardSession:
             expected_count=int(frequencies.size),
             op="assemble_standard_neumann_batch",
         )
+        for case_result in case_results:
+            _warn_if_zero_image_duffy_pairs(case_result)
         return [
             DenseAssemblyResult(
                 session_id=str(case_result["session_id"]),
@@ -677,6 +681,8 @@ class MetalNativeStandardSession:
             expected_count=int(frequencies.size),
             op="assemble_solve_standard_neumann_batch",
         )
+        for case_result in case_results:
+            _warn_if_zero_image_duffy_pairs(case_result)
         return [
             DenseSolveResult(
                 session_id=str(case_result["session_id"]),
@@ -1119,6 +1125,7 @@ class MetalNativeStandardSession:
             case_result,
             batch_diagnostics=batch_diagnostics,
         )
+        _warn_if_zero_image_duffy_pairs(case_result)
         if expect_complex_k and diagnostics.get("complex_k") is not True:
             raise RuntimeError(
                 "native helper acknowledged no complex-k support; the helper "
@@ -2053,6 +2060,8 @@ def _native_case_diagnostics(
         "ib_field",
         "ib_aperture_transform_seconds",
         "ib_aperture_slp_duffy",
+        "ib_aperture_dof_count",
+        "ib_aperture_rcond",
         "ib_aperture_assembly_implementation",
         "ib_coupled_solve",
         "ib_aperture_metal_dispatch",
@@ -2071,6 +2080,24 @@ def _native_case_diagnostics(
     if batch_diagnostics:
         diagnostics["batch"] = dict(batch_diagnostics)
     return diagnostics
+
+
+def _warn_if_zero_image_duffy_pairs(result: dict[str, Any]) -> None:
+    """Warn when symmetry is active but native image Duffy pairing found none."""
+    symmetry_plane = result.get("symmetry_plane")
+    duffy = result.get("duffy_corrections")
+    if (
+        symmetry_plane is not None
+        and isinstance(duffy, dict)
+        and duffy.get("image_adjacent_pairs") == 0
+    ):
+        warnings.warn(
+            "Native Duffy corrections reported zero image-adjacent pairs for "
+            f"symmetry_plane={symmetry_plane!r}; this is expected only if no "
+            "geometry touches the symmetry plane.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
 
 def _complex_from_manifest(value: Any) -> complex | None:

@@ -844,6 +844,8 @@ def test_native_diagnostics_helpers_preserve_manifest_metadata():
             "field_implementation": "field_impl",
             "lapack_info": 0,
             "duffy_corrections": {"implemented": True},
+            "ib_aperture_dof_count": 2,
+            "ib_aperture_rcond": 0.25,
             "metal_dispatch": {"matrix": {"threads_per_threadgroup": 64}},
             "pressure_real_f32": "outputs/pressure_re.bin",
         },
@@ -852,11 +854,26 @@ def test_native_diagnostics_helpers_preserve_manifest_metadata():
 
     assert case["assembly_implementation"] == "assembly_impl"
     assert case["duffy_corrections"]["implemented"] is True
+    assert case["ib_aperture_dof_count"] == 2
+    assert case["ib_aperture_rcond"] == 0.25
     assert case["batch"]["resident_context_library_seconds"] == 0.05
     assert case["batch"]["resident_context_metal_library_source"] == "metallib"
     assert case["batch"]["resident_reuse"]["geometry_buffers"] is True
     assert "pressure_real_f32" not in case
     assert "ignored_output_path" not in case["batch"]
+
+
+def test_native_warns_when_symmetry_has_no_image_duffy_pairs():
+    with pytest.warns(
+        RuntimeWarning,
+        match="expected only if no geometry touches the symmetry plane",
+    ):
+        native._warn_if_zero_image_duffy_pairs(
+            {
+                "symmetry_plane": "xy",
+                "duffy_corrections": {"image_adjacent_pairs": 0},
+            }
+        )
 
 
 def _minimal_dense_solve_field_case() -> dict[str, object]:
@@ -1995,6 +2012,7 @@ def test_native_executable_corrected_mode_applies_duffy_on_tiny_mesh(
     assert result["duffy_corrections"]["raw_triplets_if_expanded"] == 36
     assert result["duffy_corrections"]["unique_triplets"] == 16
     assert result["duffy_corrections"]["correction_seconds"] > 0.0
+    assert result["duffy_corrections"]["image_adjacent_pairs"] == 0
     assert np.all(np.isfinite(matrix))
     assert np.all(np.isfinite(rhs))
     assert np.linalg.norm(matrix) > 0.0
@@ -3992,6 +4010,9 @@ def test_native_executable_coupled_ib_gpu_schur_matches_cpu_augmented(
         "swift_native_metal_aperture_slp_blocks"
     )
     assert gpu_schur.diagnostics["ib_coupled_solve"] == "schur"
+    assert gpu_schur.diagnostics["ib_aperture_dof_count"] > 0
+    assert np.isfinite(gpu_schur.diagnostics["ib_aperture_rcond"])
+    assert 0.0 < gpu_schur.diagnostics["ib_aperture_rcond"] <= 1.0
     assert (
         gpu_schur.diagnostics["solve_implementation"]
         == "accelerate_lapack_cgesv_coupled_ib_schur"
