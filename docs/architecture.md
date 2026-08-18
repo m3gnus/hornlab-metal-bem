@@ -67,10 +67,18 @@ config=None)` share the same execution flow:
    `assemble_solve_evaluate_standard_neumann_batch()` for resident assembly,
    Accelerate dense solve, exterior field evaluation, impedance, and source
    surface-pressure reductions. When `return_surface_pressure=True`, it also
-   requests solved P1 surface-pressure output from the helper.
+   requests solved P1 surface-pressure output from the helper. The
+   `return_surface_traces=True` option uses the same output and reconstructs
+   total DP0 Neumann data in Python as `q_driver + i*k*beta*avg(p)` on Robin
+   faces.
 8. Python reads little-endian float32 real/imag result arrays, reshapes them to
    observation planes and angles, computes normalized directivity, accumulates
    timing/log metadata and native diagnostics, and returns `SolveResult`.
+
+`evaluate_exterior_from_traces()` rebuilds the same native geometry/session
+state and evaluates one retained `(pressure_p1, neumann_dp0)` pair at arbitrary
+`(N, 3)` exterior points. It selects optimized field mode through per-process
+environment overrides and gives every helper invocation a unique operation id.
 
 `SolveConfig(formulation="complex_k")` is experimental and opt-in. It follows
 the canonical bempp convention `k = k_real * (1 + i*complex_k_shift)` for

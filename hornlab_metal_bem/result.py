@@ -19,10 +19,17 @@ class MeshInfo:
 
 @dataclass
 class SolveResult:
-    """Native Metal BEM solve output.
+    r"""Native Metal BEM solve output.
 
     Array dimensions use ``F`` for frequency count, ``P`` for observation
-    plane count, and ``N`` for points or angles per plane.
+    plane count, and ``N`` for points or angles per plane. Complex values use
+    the solver's :math:`e^{-i\omega t}` phase convention.
+
+    ``surface_pressure_complex`` is the optional P1 pressure trace with shape
+    ``(F, n_p1_dofs)``. ``surface_neumann_complex`` is the optional *total*
+    DP0 outward-normal derivative ``dp/dn`` with shape ``(F, n_dp0_dofs)``;
+    its Robin faces include ``q_driver + i*k*beta*avg(p)``. Both traces use the
+    same :math:`e^{-i\omega t}` convention as ``pressure_complex``.
     """
 
     frequencies_hz: NDArray[np.float64]
@@ -51,9 +58,17 @@ class SolveResult:
     # tag -> (F,) complex array. Populated when velocity_sources has tags.
     surface_pressure_avg: dict[int, NDArray[np.complex128]] | None = None
 
-    # Optional solved P1 surface pressure, shape (F, n_p1_dofs), populated
-    # when SolveConfig.return_surface_pressure is true.
+    # Optional solved P1 surface-pressure trace, shape (F, n_p1_dofs), in the
+    # e^{-i omega t} phase convention. Populated when either
+    # SolveConfig.return_surface_pressure or return_surface_traces is true.
     surface_pressure_complex: NDArray[np.complex128] | None = None
+
+    # Optional total outward-normal pressure derivative q = dp/dn on DP0,
+    # shape (F, n_dp0_dofs), in the e^{-i omega t} phase convention. This is
+    # the complete exterior-field trace: on Robin faces it includes
+    # q_driver + i*k*beta*avg(p). Populated with surface_pressure_complex when
+    # SolveConfig.return_surface_traces is true.
+    surface_neumann_complex: NDArray[np.complex128] | None = None
 
     # Native helper per-frequency diagnostics and resident batch metadata.
     native_diagnostics: list[dict[str, Any]] = field(default_factory=list)

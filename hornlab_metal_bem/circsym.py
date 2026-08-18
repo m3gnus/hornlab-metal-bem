@@ -222,6 +222,10 @@ def run_sweep_circsym(
     """
     if not isinstance(meridian, MeridianMesh):
         raise TypeError("meridian must be a MeridianMesh")
+    if config.return_surface_traces:
+        raise ValueError(
+            "return_surface_traces is available only for full-3D native Metal solves"
+        )
     if config.circsym_aperture_tag is not None:
         # Dispatch to the coupled infinite-baffle solve whenever an aperture tag
         # is requested. run_sweep_coupled_ib validates that the tag is present and

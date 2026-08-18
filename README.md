@@ -126,6 +126,8 @@ Common fields:
 - `air_density`
 - `native_symmetry_plane`, one of `None`, `"yz"`, `"xz"`, `"xy"`, or `"yz+xz"`
 - `return_surface_pressure`, opt-in full solved P1 surface pressure output
+- `return_surface_traces`, opt-in P1 pressure plus total DP0 Neumann traces for
+  post-solve exterior-field evaluation
 - `progress_callback`
 - `on_frequency_result`, for streaming/early stop; entries include complex
   observation pressure
@@ -233,13 +235,22 @@ Key result fields:
 - `surface_pressure_avg`: source-tag keyed average surface pressure arrays
   (always populated, including CircSym coupled-IB solves)
 - `surface_pressure_complex`: optional `(F, n_p1_dofs)` solved surface pressure
-  when `return_surface_pressure=True`
+  when `return_surface_pressure=True` or `return_surface_traces=True`
+- `surface_neumann_complex`: optional `(F, n_dp0_dofs)` total `dp/dn`, including
+  the Robin correction, when `return_surface_traces=True`
 - `native_diagnostics`: per-frequency native implementation, LAPACK, Duffy,
   Metal dispatch, symmetry, and resident batch metadata
 - `timings` and `solver_log`: backend timing and diagnostic metadata
 
 `directivity_db` is not absolute SPL. Use `pressure_complex` for absolute
 complex pressure and derive SPL explicitly when needed.
+
+Retained traces use the solver's `e^{-i omega t}` phase convention. Evaluate
+one frequency at arbitrary `(N, 3)` exterior points with
+`evaluate_exterior_from_traces(mesh, frequency_hz, k_real, pressure_p1,
+neumann_dp0, points_xyz, symmetry_plane=...)`. The mesh and symmetry must match
+the solve. Coupled infinite-baffle and CircSym trace evaluation are not part of
+this full-3D Phase 0 API.
 
 ## Install For Development
 

@@ -28,6 +28,10 @@ from .config import (
     _validated_impedance_sources,
     _validated_velocity_sources,
 )
+from .field_traces import (
+    _native_field_env_overrides,
+    _total_neumann_from_surface_pressure,
+)
 from .mesh import LoadedMesh, make_pure_function_spaces
 from .observation import ObservationFrame, build_observation_points, build_sphere_grid_points
 from .result import SolveResult
@@ -126,8 +130,7 @@ def _native_env_overrides(config: SolveConfig) -> dict[str, str]:
         "HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE": config.metal_native_assembly_mode,
         "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE": config.dense_solve_dtype,
     }
-    if os.environ.get("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE") is None:
-        overrides["HORNLAB_METAL_BEM_NATIVE_FIELD_MODE"] = "optimized"
+    overrides.update(_native_field_env_overrides())
     # complex128 zgesv holds a doublecomplex column-major copy alongside the
     # float32 row-major operator, roughly tripling peak solve memory. CHIEF
     # cases route to a complex128 zgels least-squares solve regardless of
@@ -560,6 +563,39 @@ def _system_surface_pressure(system) -> NDArray[np.complex128]:
     )
 
 
+def _retained_surface_traces(
+    *,
+    surface_pressure_rows: list[NDArray[np.complex128]] | None,
+    driver_neumann_rows: NDArray[np.complex64],
+    p1_local2global: NDArray[np.int32],
+    physical_tags: NDArray[np.int32],
+    k_real: NDArray[np.float32],
+    k_imag: NDArray[np.float32],
+    impedance_sources: list[dict[int, complex]] | dict[int, complex],
+    return_surface_traces: bool,
+) -> tuple[NDArray[np.complex128] | None, NDArray[np.complex128] | None]:
+    """Stack retained pressure and reconstruct the helper's total DP0 trace."""
+    if surface_pressure_rows is None:
+        if return_surface_traces:
+            raise RuntimeError("surface trace retention requires surface pressure")
+        return None, None
+    pressure = np.stack(surface_pressure_rows, axis=0)
+    if not return_surface_traces:
+        return pressure, None
+
+    count = pressure.shape[0]
+    neumann = _total_neumann_from_surface_pressure(
+        driver_neumann_rows[:count],
+        pressure,
+        p1_local2global,
+        physical_tags,
+        k_real[:count],
+        k_imag[:count],
+        impedance_sources,
+    )
+    return pressure, neumann
+
+
 def _directivity_from_pressure(
     pressure: NDArray[np.complex128],
     on_axis_idx: int,
@@ -662,6 +698,11 @@ def run_sweep_native_metal(
     from the assembled non-Hermitian system.
     """
     should_route_native_metal(config)
+    if config.return_surface_traces and config.aperture_tag is not None:
+        raise ValueError(
+            "return_surface_traces is unavailable for coupled infinite-baffle "
+            "solves because aperture Neumann unknowns are not retained"
+        )
     frequencies = np.asarray(frequencies, dtype=np.float64)
     if frequencies.size == 0:
         raise ValueError("frequencies must contain at least one value")
@@ -731,8 +772,11 @@ def run_sweep_native_metal(
     pressure_rows: list[NDArray[np.complex128]] = []
     spl_rows: list[NDArray[np.float64]] = []
     impedance_rows: list[complex] = []
+    retain_surface_pressure = (
+        config.return_surface_pressure or config.return_surface_traces
+    )
     surface_pressure_rows: list[NDArray[np.complex128]] | None = (
-        [] if config.return_surface_pressure else None
+        [] if retain_surface_pressure else None
     )
     native_diagnostics_rows: list[dict] = []
     solver_log: list[dict] = []
@@ -783,7 +827,7 @@ def run_sweep_native_metal(
                 operation_id="assembly-solve-field-resident-batch",
                 source_tags=source_tags,
                 impedance_source_tag=impedance_source_tag,
-                write_surface_pressure=config.return_surface_pressure,
+                write_surface_pressure=retain_surface_pressure,
                 write_batched_field=True,
                 dense_solve_dtype=config.dense_solve_dtype,
                 chief_points=chief_points_3xm,
@@ -928,7 +972,7 @@ def run_sweep_native_metal(
                 operation_id="assembly-solve-field-resident-stream",
                 source_tags=source_tags,
                 impedance_source_tag=impedance_source_tag,
-                write_surface_pressure=config.return_surface_pressure,
+                write_surface_pressure=retain_surface_pressure,
                 on_case_result=_on_case_result,
                 dense_solve_dtype=config.dense_solve_dtype,
                 chief_points=chief_points_3xm,
@@ -947,6 +991,17 @@ def run_sweep_native_metal(
         "total_s": time.time() - t_total,
     }
 
+    surface_pressure_complex, surface_neumann_complex = _retained_surface_traces(
+        surface_pressure_rows=surface_pressure_rows,
+        driver_neumann_rows=neumann_rows,
+        p1_local2global=geometry_buffers.p1_local2global_i32,
+        physical_tags=mesh.physical_tags,
+        k_real=k_values,
+        k_imag=k_imag_values,
+        impedance_sources=impedance_sources_arg,
+        return_surface_traces=config.return_surface_traces,
+    )
+
     return SolveResult(
         frequencies_hz=np.array(completed_freqs, dtype=np.float64),
         pressure_complex=np.stack(pressure_rows, axis=0),
@@ -960,11 +1015,8 @@ def run_sweep_native_metal(
         timings=timings,
         solver_log=solver_log,
         surface_pressure_avg=sp_avg if sp_avg else None,
-        surface_pressure_complex=(
-            np.stack(surface_pressure_rows, axis=0)
-            if surface_pressure_rows is not None
-            else None
-        ),
+        surface_pressure_complex=surface_pressure_complex,
+        surface_neumann_complex=surface_neumann_complex,
         native_diagnostics=native_diagnostics_rows,
         sphere_pressure_complex=_sphere_pressure_from_log(solver_log, n_sphere),
         sphere_points=sphere_points_arr,
@@ -1026,6 +1078,11 @@ def run_sweep_native_metal_multi_source(
     shared multi-RHS batch.
     """
     should_route_native_metal(config)
+    if config.return_surface_traces and config.aperture_tag is not None:
+        raise ValueError(
+            "return_surface_traces is unavailable for coupled infinite-baffle "
+            "solves because aperture Neumann unknowns are not retained"
+        )
     if not sources:
         raise ValueError("sources must contain at least one velocity dict")
     if config.velocity_source_callback is not None:
@@ -1120,8 +1177,11 @@ def run_sweep_native_metal_multi_source(
     ]
     spl_rows: list[list[NDArray[np.float64]]] = [[] for _ in range(n_sources)]
     impedance_rows: list[list[complex]] = [[] for _ in range(n_sources)]
+    retain_surface_pressure = (
+        config.return_surface_pressure or config.return_surface_traces
+    )
     surface_pressure_rows: list[list[NDArray[np.complex128]] | None] = [
-        [] if config.return_surface_pressure else None for _ in range(n_sources)
+        [] if retain_surface_pressure else None for _ in range(n_sources)
     ]
     native_diagnostics_rows: list[list[dict]] = [[] for _ in range(n_sources)]
     solver_logs: list[list[dict]] = [[] for _ in range(n_sources)]
@@ -1267,7 +1327,7 @@ def run_sweep_native_metal_multi_source(
             operation_id="assembly-solve-field-resident-batch-multi-source",
             source_tags=source_tags,
             impedance_source_tag=impedance_source_tags[0],
-            write_surface_pressure=config.return_surface_pressure,
+            write_surface_pressure=retain_surface_pressure,
             write_batched_field=config.on_frequency_result is None,
             on_case_result=_on_case_result if config.on_frequency_result is not None else None,
             dense_solve_dtype=config.dense_solve_dtype,
@@ -1322,6 +1382,16 @@ def run_sweep_native_metal_multi_source(
             # (source 0 carries the shared factorization cost).
             "total_s": total_s if source_index == 0 else 0.0,
         }
+        surface_pressure_complex, surface_neumann_complex = _retained_surface_traces(
+            surface_pressure_rows=surface_pressure_rows[source_index],
+            driver_neumann_rows=per_source_neumann[source_index],
+            p1_local2global=geometry_buffers.p1_local2global_i32,
+            physical_tags=mesh.physical_tags,
+            k_real=k_values,
+            k_imag=k_imag_values,
+            impedance_sources=impedance_sources_arg,
+            return_surface_traces=config.return_surface_traces,
+        )
         results.append(
             SolveResult(
                 frequencies_hz=np.array(
@@ -1340,11 +1410,8 @@ def run_sweep_native_metal_multi_source(
                 timings=timings,
                 solver_log=solver_log,
                 surface_pressure_avg=sp_avg if sp_avg else None,
-                surface_pressure_complex=(
-                    np.stack(surface_pressure_rows[source_index], axis=0)
-                    if surface_pressure_rows[source_index] is not None
-                    else None
-                ),
+                surface_pressure_complex=surface_pressure_complex,
+                surface_neumann_complex=surface_neumann_complex,
                 native_diagnostics=native_diagnostics_rows[source_index],
                 sphere_pressure_complex=_sphere_pressure_from_log(
                     solver_log, n_sphere
