@@ -2073,6 +2073,8 @@ def _native_case_diagnostics(
         "field_output_layout",
         "duffy_corrections",
         "near_quadrature",
+        "near_quadrature_level",
+        "near_quadrature_kh",
         "metal_dispatch",
         "field_metal_dispatch",
     )

@@ -665,11 +665,17 @@ struct NearQuadratureConfig {
     let threshold: Double
 }
 
+enum NearQuadratureRequest {
+    case fixed(NearQuadratureConfig)
+    case automatic
+}
+
 struct NearQuadratureStats {
     let level: Int
     let threshold: Double
     let pairCount: Int
     let seconds: Double
+    let kh: Double
 
     func toJSON() -> [String: Any] {
         [
@@ -677,8 +683,16 @@ struct NearQuadratureStats {
             "threshold": threshold,
             "pair_count": pairCount,
             "seconds": seconds,
+            "k_h": kh,
         ]
     }
+}
+
+struct TriangleNearMetrics {
+    let centroid: (Float, Float, Float)
+    let minPoint: (Float, Float, Float)
+    let maxPoint: (Float, Float, Float)
+    let longestEdge: Float
 }
 
 struct Geometry {
@@ -698,6 +712,8 @@ struct Geometry {
     let dp0DofCount: Int
     let symmetryPlane: String?
     let apertureTag: Int?
+    let nearMetrics: [TriangleNearMetrics]
+    let nearElementSizeP90: Double
 
     func triangleVertex(_ triangle: Int, _ local: Int) -> Int {
         Int(triangles[local * nTriangles + triangle])
@@ -795,12 +811,30 @@ func readGeometry(_ sessionManifestPath: String) throws -> Geometry {
     let symmetryPlane = try parseSymmetryPlane(manifest)
     let apertureTag = try parseApertureTag(manifest)
 
+    let px = Array(vertices[0..<nVertices])
+    let py = Array(vertices[nVertices..<(2 * nVertices)])
+    let pz = Array(vertices[(2 * nVertices)..<(3 * nVertices)])
+    // A geometry instance is shared by every case in a resident batch, so the
+    // immutable triangle bounds and edge lengths belong here rather than in
+    // the frequency-dependent correction pass. Besides making h genuinely a
+    // once-per-geometry statistic, this avoids walking the vertex indices for
+    // every corrected case; mirrored bounds can be derived exactly from these
+    // real-geometry values without changing a triangle's longest edge.
+    let nearMetrics = try buildTriangleNearMetrics(
+        px: px,
+        py: py,
+        pz: pz,
+        triangles: triangles,
+        nVertices: nVertices,
+        nTriangles: nTriangles
+    )
+
     return Geometry(
         root: root,
         manifest: manifest,
-        px: Array(vertices[0..<nVertices]),
-        py: Array(vertices[nVertices..<(2 * nVertices)]),
-        pz: Array(vertices[(2 * nVertices)..<(3 * nVertices)]),
+        px: px,
+        py: py,
+        pz: pz,
         triangles: triangles,
         physicalTags: physicalTags,
         p1Local2Global: p1Local2Global,
@@ -811,7 +845,9 @@ func readGeometry(_ sessionManifestPath: String) throws -> Geometry {
         p1DofCount: try requireInt(space, "p1_dof_count"),
         dp0DofCount: try requireInt(space, "dp0_dof_count"),
         symmetryPlane: symmetryPlane,
-        apertureTag: apertureTag
+        apertureTag: apertureTag,
+        nearMetrics: nearMetrics,
+        nearElementSizeP90: triangleLongestEdgeP90(nearMetrics)
     )
 }
 
@@ -2398,13 +2434,6 @@ func buildDuffyPairPlan(_ geom: Geometry) throws -> DuffyPairPlan {
     try buildDuffyPairList(geom).plan
 }
 
-struct TriangleNearMetrics {
-    let centroid: (Float, Float, Float)
-    let minPoint: (Float, Float, Float)
-    let maxPoint: (Float, Float, Float)
-    let longestEdge: Float
-}
-
 func distanceSquared(
     _ a: (Float, Float, Float),
     _ b: (Float, Float, Float)
@@ -2415,15 +2444,23 @@ func distanceSquared(
     return dx * dx + dy * dy + dz * dz
 }
 
-func triangleNearMetrics(geom: Geometry, triangle: Int, mask: Int) throws -> TriangleNearMetrics {
+func triangleNearMetrics(
+    px: [Float],
+    py: [Float],
+    pz: [Float],
+    triangles: [Int32],
+    nVertices: Int,
+    nTriangles: Int,
+    triangle: Int
+) throws -> TriangleNearMetrics {
     var points: [(Float, Float, Float)] = []
     points.reserveCapacity(3)
     for local in 0..<3 {
-        let vertex = geom.triangleVertex(triangle, local)
-        if vertex < 0 || vertex >= geom.nVertices {
+        let vertex = Int(triangles[local * nTriangles + triangle])
+        if vertex < 0 || vertex >= nVertices {
             try fail("triangles_i32 contains out-of-range vertex \(vertex)")
         }
-        points.append(mirrorPoint(vertexPoint(geom, vertex), mask: mask))
+        points.append((px[vertex], py[vertex], pz[vertex]))
     }
 
     let centroid = (
@@ -2450,6 +2487,73 @@ func triangleNearMetrics(geom: Geometry, triangle: Int, mask: Int) throws -> Tri
         minPoint: minPoint,
         maxPoint: maxPoint,
         longestEdge: sqrt(longestEdgeSquared)
+    )
+}
+
+func buildTriangleNearMetrics(
+    px: [Float],
+    py: [Float],
+    pz: [Float],
+    triangles: [Int32],
+    nVertices: Int,
+    nTriangles: Int
+) throws -> [TriangleNearMetrics] {
+    var metrics: [TriangleNearMetrics] = []
+    metrics.reserveCapacity(nTriangles)
+    for triangle in 0..<nTriangles {
+        metrics.append(
+            try triangleNearMetrics(
+                px: px,
+                py: py,
+                pz: pz,
+                triangles: triangles,
+                nVertices: nVertices,
+                nTriangles: nTriangles,
+                triangle: triangle
+            )
+        )
+    }
+    return metrics
+}
+
+func triangleLongestEdgeP90(_ metrics: [TriangleNearMetrics]) -> Double {
+    guard !metrics.isEmpty else {
+        return 0.0
+    }
+    let lengths = metrics.map { Double($0.longestEdge) }.sorted()
+    // Linear interpolation makes the percentile move continuously when a
+    // small mesh contains only a handful of distinct element sizes. A nearest-
+    // rank choice would make the upper transition element dominate very small
+    // fixtures, while the interpolated 90th percentile retains the intended
+    // robustness and converges to the same upper-tail statistic on real meshes.
+    let position = 0.9 * Double(lengths.count - 1)
+    let lower = Int(floor(position))
+    let upper = Int(ceil(position))
+    if lower == upper {
+        return lengths[lower]
+    }
+    let fraction = position - Double(lower)
+    return lengths[lower] * (1.0 - fraction) + lengths[upper] * fraction
+}
+
+func mirroredTriangleNearMetrics(
+    _ metric: TriangleNearMetrics,
+    mask: Int
+) -> TriangleNearMetrics {
+    func mirroredBounds(_ minimum: Float, _ maximum: Float, bit: Int) -> (Float, Float) {
+        if mask & bit != 0 {
+            return (-maximum, -minimum)
+        }
+        return (minimum, maximum)
+    }
+    let xBounds = mirroredBounds(metric.minPoint.0, metric.maxPoint.0, bit: 1)
+    let yBounds = mirroredBounds(metric.minPoint.1, metric.maxPoint.1, bit: 2)
+    let zBounds = mirroredBounds(metric.minPoint.2, metric.maxPoint.2, bit: 4)
+    return TriangleNearMetrics(
+        centroid: mirrorPoint(metric.centroid, mask: mask),
+        minPoint: (xBounds.0, yBounds.0, zBounds.0),
+        maxPoint: (xBounds.1, yBounds.1, zBounds.1),
+        longestEdge: metric.longestEdge
     )
 }
 
@@ -2485,12 +2589,9 @@ func buildNearPairList(geom: Geometry, threshold: Double) throws -> NearPairList
     }
     var metricsByMask: [Int: [TriangleNearMetrics]] = [:]
     for mask in imageMasks {
-        var metrics: [TriangleNearMetrics] = []
-        metrics.reserveCapacity(geom.nTriangles)
-        for tri in 0..<geom.nTriangles {
-            metrics.append(try triangleNearMetrics(geom: geom, triangle: tri, mask: mask))
-        }
-        metricsByMask[mask] = metrics
+        metricsByMask[mask] = mask == 0
+            ? geom.nearMetrics
+            : geom.nearMetrics.map { mirroredTriangleNearMetrics($0, mask: mask) }
     }
 
     let lock = NSLock()
@@ -3086,7 +3187,8 @@ func applyNearFieldCorrectionsCPU(
     k: Float,
     kImag: Float = 0.0,
     robinBetas: [Complex32]? = nil,
-    config: NearQuadratureConfig
+    config: NearQuadratureConfig,
+    kh: Double
 ) throws -> (AssemblyArrays, [(re: [Float], im: [Float])], NearQuadratureStats) {
     if extraNeumanns.count != extraRhs.count {
         try fail("near-field corrections extraNeumanns/extraRhs count mismatch")
@@ -3173,7 +3275,8 @@ func applyNearFieldCorrectionsCPU(
         level: config.level,
         threshold: config.threshold,
         pairCount: pairList.pairs.count,
-        seconds: CFAbsoluteTimeGetCurrent() - start
+        seconds: CFAbsoluteTimeGetCurrent() - start,
+        kh: kh
     )
     return (
         AssemblyArrays(aRe: aRe, aIm: aIm, rhsRe: rhsRe, rhsIm: rhsIm),
@@ -3192,8 +3295,32 @@ func applyNearFieldCorrectionsIfEnabled(
     kImag: Float = 0.0,
     robinBetas: [Complex32]? = nil
 ) throws -> (AssemblyArrays, [(re: [Float], im: [Float])], NearQuadratureStats?) {
-    guard let config = try requestedNearQuadratureConfig() else {
+    guard let request = try requestedNearQuadratureConfig() else {
         return (arrays, extraRhs, nil)
+    }
+    let config: NearQuadratureConfig
+    let kh: Double
+    switch request {
+    case .fixed(let requested):
+        config = requested
+        kh = abs(Double(k)) * geom.nearElementSizeP90
+    case .automatic:
+        let automatic = automaticNearQuadratureConfig(geom: geom, k: k)
+        kh = automatic.kh
+        guard let requested = automatic.config else {
+            return (
+                arrays,
+                extraRhs,
+                NearQuadratureStats(
+                    level: 0,
+                    threshold: 1.5,
+                    pairCount: 0,
+                    seconds: 0.0,
+                    kh: automatic.kh
+                )
+            )
+        }
+        config = requested
     }
     let (corrected, correctedExtra, stats) = try applyNearFieldCorrectionsCPU(
         to: arrays,
@@ -3204,7 +3331,8 @@ func applyNearFieldCorrectionsIfEnabled(
         k: k,
         kImag: kImag,
         robinBetas: robinBetas,
-        config: config
+        config: config,
+        kh: kh
     )
     return (corrected, correctedExtra, stats)
 }
@@ -5029,11 +5157,15 @@ func requestedCoupledIBSolveMode() throws -> String {
     try fail("\(coupledIBSolveEnv) must be 'schur' or 'augmented'")
 }
 
-func requestedNearQuadratureConfig() throws -> NearQuadratureConfig? {
+func requestedNearQuadratureConfig() throws -> NearQuadratureRequest? {
     guard let raw = ProcessInfo.processInfo.environment[nearQuadratureEnv],
           !raw.isEmpty,
           raw != "0" else {
         return nil
+    }
+
+    if raw == "auto" {
+        return .automatic
     }
 
     func parseLevel(_ value: String) -> Int? {
@@ -5044,7 +5176,7 @@ func requestedNearQuadratureConfig() throws -> NearQuadratureConfig? {
     }
 
     if let level = parseLevel(raw) {
-        return NearQuadratureConfig(level: level, threshold: 1.5)
+        return .fixed(NearQuadratureConfig(level: level, threshold: 1.5))
     }
 
     let parts = raw.split(separator: ":", omittingEmptySubsequences: false)
@@ -5053,13 +5185,38 @@ func requestedNearQuadratureConfig() throws -> NearQuadratureConfig? {
        let threshold = Double(String(parts[1])),
        threshold.isFinite,
        threshold > 0.0 {
-        return NearQuadratureConfig(level: level, threshold: threshold)
+        return .fixed(NearQuadratureConfig(level: level, threshold: threshold))
     }
 
     try fail(
-        "\(nearQuadratureEnv) must be unset, '0', '1', '2', "
+        "\(nearQuadratureEnv) must be unset, '0', 'auto', '1', '2', "
             + "or '<level>:<positive threshold>' with level 1...2"
     )
+}
+
+func automaticNearQuadratureConfig(
+    geom: Geometry,
+    k: Float
+) -> (config: NearQuadratureConfig?, kh: Double) {
+    let kh = abs(Double(k)) * geom.nearElementSizeP90
+
+    // The regular Galerkin path uses the fixed degree-4, six-point triangle
+    // rule. For well-separated pairs that rule remains a good compromise, but
+    // geometrically close pairs sample the Helmholtz kernel over almost the
+    // same length scale as an element, and its accuracy falls as the phase
+    // variation k*h grows. The broad 90th-percentile edge length deliberately
+    // follows the upper end of the mesh distribution without letting a single
+    // unusually long transition element force every frequency into the most
+    // expensive correction. These two breakpoints retain the existing level-1
+    // correction in its useful middle range and spend level 2 only once a
+    // typical large element spans more than roughly a quarter wavelength.
+    if kh <= 0.75 {
+        return (nil, kh)
+    }
+    if kh <= 1.5 {
+        return (NearQuadratureConfig(level: 1, threshold: 1.5), kh)
+    }
+    return (NearQuadratureConfig(level: 2, threshold: 1.5), kh)
 }
 
 func assembleRegularMetalSelected(
@@ -8471,6 +8628,8 @@ func assemblyCorrectionSeconds(_ run: AssemblyRun) -> Double {
 func attachNearQuadratureReport(_ result: inout [String: Any], run: AssemblyRun) {
     if let stats = run.nearStats {
         result["near_quadrature"] = stats.toJSON()
+        result["near_quadrature_level"] = stats.level
+        result["near_quadrature_kh"] = stats.kh
     }
 }
 

@@ -196,9 +196,12 @@ Duffy delta pattern: pairs with centroid separation below
 `threshold * max(longest edge)` (grammar `level` or `level:threshold`,
 threshold default 1.5, level 1 or 2) are re-integrated with the 6-point rule
 on `4^level` congruent sub-triangles per side and the delta is applied as
-triplets. Shares the complex-k path and symmetry image handling with the
-Duffy corrections; per-case diagnostics gain a `near_quadrature` dict
-(`level`, `threshold`, `pair_count`, `seconds`). This targets near-singular
+triplets. The opt-in value `auto` chooses level 0, 1, or 2 per frequency from
+the mesh's 90th-percentile longest-edge `k*h`, while explicit levels remain
+fixed across a batch. Shares the complex-k path and symmetry image handling
+with the Duffy corrections; per-case diagnostics gain a `near_quadrature` dict
+(`level`, `threshold`, `pair_count`, `seconds`, and `k_h`) plus
+`near_quadrature_level` and `near_quadrature_kh`. This targets near-singular
 integration error in narrow chamber/port/slot geometry.
 
 In the combined assemble/solve/field batch op the per-case CPU work (Duffy

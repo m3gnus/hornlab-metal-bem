@@ -844,6 +844,8 @@ def test_native_diagnostics_helpers_preserve_manifest_metadata():
             "field_implementation": "field_impl",
             "lapack_info": 0,
             "duffy_corrections": {"implemented": True},
+            "near_quadrature_level": 2,
+            "near_quadrature_kh": 1.75,
             "ib_aperture_dof_count": 2,
             "ib_aperture_rcond": 0.25,
             "metal_dispatch": {"matrix": {"threads_per_threadgroup": 64}},
@@ -854,6 +856,8 @@ def test_native_diagnostics_helpers_preserve_manifest_metadata():
 
     assert case["assembly_implementation"] == "assembly_impl"
     assert case["duffy_corrections"]["implemented"] is True
+    assert case["near_quadrature_level"] == 2
+    assert case["near_quadrature_kh"] == pytest.approx(1.75)
     assert case["ib_aperture_dof_count"] == 2
     assert case["ib_aperture_rcond"] == 0.25
     assert case["batch"]["resident_context_library_seconds"] == 0.05
@@ -2075,6 +2079,130 @@ def test_native_near_quadrature_default_off_matches_zero_env(
     assert "near_quadrature" not in zero_result
     assert np.array_equal(unset_matrix, zero_matrix)
     assert np.array_equal(unset_rhs, zero_rhs)
+
+
+def test_native_near_quadrature_auto_low_kh_is_exactly_off(
+    monkeypatch,
+    tmp_path,
+):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", "cpu")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_REGULAR_ASSEMBLY_IMPL", "entrywise")
+    buffers = _near_quadrature_geometry_buffers()
+    neumann = np.array([1.0 + 0.0j, 0.0 + 0.0j], dtype=np.complex64)
+    k_real = 0.18318326
+
+    def run_case(name: str, env_value: str | None):
+        if env_value is None:
+            monkeypatch.delenv(
+                "HORNLAB_METAL_BEM_NATIVE_NEAR_QUADRATURE",
+                raising=False,
+            )
+        else:
+            monkeypatch.setenv(
+                "HORNLAB_METAL_BEM_NATIVE_NEAR_QUADRATURE",
+                env_value,
+            )
+        with MetalNativeStandardSession.create_session(
+            geometry_buffers=buffers,
+            work_dir=tmp_path / f"native-near-auto-low-{name}-session",
+            session_id=f"native-near-auto-low-{name}-test",
+        ) as session:
+            assembly = session.assemble_standard_neumann(
+                10.0,
+                k_real,
+                neumann,
+                operation_id=f"native-near-auto-low-{name}-assembly",
+            )
+        result = json.loads(
+            (
+                tmp_path
+                / f"native-near-auto-low-{name}-session"
+                / f"native-near-auto-low-{name}-assembly"
+                / "assembly-result.json"
+            ).read_text(encoding="utf-8")
+        )
+        matrix, rhs = _read_complex_assembly(assembly)
+        return result, matrix, rhs
+
+    base_result, base_matrix, base_rhs = run_case("base", None)
+    auto_result, auto_matrix, auto_rhs = run_case("enabled", "auto")
+
+    assert "near_quadrature" not in base_result
+    assert auto_result["near_quadrature_level"] == 0
+    assert auto_result["near_quadrature_kh"] == pytest.approx(
+        float(np.float32(k_real)) * np.sqrt(2.0),
+        rel=1e-6,
+    )
+    assert auto_result["near_quadrature"]["level"] == 0
+    assert auto_result["near_quadrature"]["pair_count"] == 0
+    assert np.array_equal(auto_matrix, base_matrix)
+    assert np.array_equal(auto_rhs, base_rhs)
+
+
+def test_native_near_quadrature_auto_varies_level_per_batch_case(
+    monkeypatch,
+    tmp_path,
+):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE", "cpu")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_REGULAR_ASSEMBLY_IMPL", "entrywise")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_NEAR_QUADRATURE", "auto")
+    frequencies = np.array([10.0, 50.0, 100.0], dtype=np.float64)
+    k_real = np.array([0.18318326, 0.9159163, 1.8318326], dtype=np.float32)
+    neumann = np.tile(
+        np.array([[1.0 + 0.0j, 0.0 + 0.0j]], dtype=np.complex64),
+        (frequencies.size, 1),
+    )
+    work_dir = tmp_path / "native-near-auto-batch-session"
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=_near_quadrature_geometry_buffers(),
+        work_dir=work_dir,
+        session_id="native-near-auto-batch-test",
+    ) as session:
+        assemblies = session.assemble_standard_neumann_batch(
+            frequencies,
+            k_real,
+            neumann,
+            operation_id="native-near-auto-batch-assembly",
+        )
+
+    result = json.loads(
+        (
+            work_dir
+            / "native-near-auto-batch-assembly"
+            / "assembly-batch-result.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert [case["near_quadrature_level"] for case in result["cases"]] == [
+        0,
+        1,
+        2,
+    ]
+    assert [case["near_quadrature_kh"] for case in result["cases"]] == pytest.approx(
+        k_real.astype(np.float64) * np.sqrt(2.0),
+        rel=1e-6,
+    )
+    assert result["cases"][1]["near_quadrature"]["pair_count"] >= 1
+    assert result["cases"][2]["near_quadrature"]["pair_count"] >= 1
+    for assembly in assemblies:
+        matrix, rhs = _read_complex_assembly(assembly)
+        assert np.all(np.isfinite(matrix))
+        assert np.all(np.isfinite(rhs))
 
 
 def test_native_near_quadrature_corrects_close_non_touching_pair(
