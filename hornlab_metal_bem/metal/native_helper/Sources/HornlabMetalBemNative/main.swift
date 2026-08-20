@@ -3507,6 +3507,7 @@ struct CircSymFieldKernelParams {
     var kImag: Float
     var baffleZ: Float
     var hasBaffle: Int32
+    var kernelMode: Int32
 }
 
 let regularAssemblyMetalSource = """
@@ -3537,6 +3538,7 @@ struct CircSymFieldParams {
     float kImag;
     float baffleZ;
     int hasBaffle;
+    int kernelMode; // 0 = full field, 1 = frequency-dependent remainder
 };
 
 constant float qx[6] = {
@@ -4383,17 +4385,48 @@ inline void accumulate_circsym_ring_point(
             continue;
         }
         float r = sqrt(r2);
-        float phase = params.k * r;
-        float attenuation = params.kImag == 0.0f ? 1.0f : exp(-params.kImag * r);
+        float qReal = params.k * r;
+        float qImag = params.kImag * r;
+        float attenuation = params.kImag == 0.0f ? 1.0f : exp(-qImag);
         float inv4PiR = 0.07957747154594767f / r;
-        float2 green = float2(cos(phase), sin(phase)) * (attenuation * inv4PiR);
+        float2 phase = float2(cos(qReal), sin(qReal)) * attenuation;
         float weight = 2.0f * psiWeights[p] * measure;
-        slp += green * weight;
-
         float numerator = (sourceRho - targetRho * cp) * normalRho + dz * normalZ;
-        float2 factor = float2(-params.kImag * r - 1.0f, params.k * r);
-        float2 derivative = c_mul(green, factor) * (numerator / r2);
-        dlp += derivative * weight;
+        float2 factor = float2(-qImag - 1.0f, qReal);
+        if (params.kernelMode == 0) {
+            float2 green = phase * inv4PiR;
+            slp += green * weight;
+            float2 derivative = c_mul(green, factor) * (numerator / r2);
+            dlp += derivative * weight;
+        } else {
+            float2 phaseMinusOne;
+            float2 derivativeExpr;
+            float2 q = float2(qReal, qImag);
+            if (length(q) < 1.0e-3f) {
+                // Stable exp(i*q)-1 and exp(i*q)*(i*q-1)+1 series.
+                float2 z = float2(-qImag, qReal);
+                float2 z2 = c_mul(z, z);
+                float2 z3 = c_mul(z2, z);
+                float2 z4 = c_mul(z3, z);
+                float2 z5 = c_mul(z4, z);
+                phaseMinusOne = z + 0.5f * z2 + z3 / 6.0f
+                    + z4 / 24.0f + z5 / 120.0f;
+
+                float2 q2 = c_mul(q, q);
+                float2 q3 = c_mul(q2, q);
+                float2 q4 = c_mul(q3, q);
+                float2 q5 = c_mul(q4, q);
+                derivativeExpr = -0.5f * q2
+                    + c_mul(float2(0.0f, -0.3333333333333333f), q3)
+                    + 0.125f * q4
+                    + c_mul(float2(0.0f, 0.0333333333333333f), q5);
+            } else {
+                phaseMinusOne = phase - float2(1.0f, 0.0f);
+                derivativeExpr = c_mul(phase, factor) + float2(1.0f, 0.0f);
+            }
+            slp += phaseMinusOne * (inv4PiR * weight);
+            dlp += derivativeExpr * (inv4PiR * numerator * weight / r2);
+        }
     }
 }
 
@@ -10590,6 +10623,15 @@ func evaluateCircSymRingKernels(
     let cosPsi = try makeBuffer(device, cosPsiValues, label: "circsym_cos_psi")
     let psiWeights = try makeBuffer(device, psiWeightsValues, label: "circsym_psi_weights")
     let baffleValue = (payload["baffle_z_f32"] as? NSNumber)?.floatValue
+    let kernelModeName = try requireString(payload, "kernel_mode")
+    let kernelMode: Int32
+    if kernelModeName == "field" {
+        kernelMode = 0
+    } else if kernelModeName == "remainder" {
+        kernelMode = 1
+    } else {
+        try fail("kernel_mode must be 'field' or 'remainder'")
+    }
     var params = CircSymFieldKernelParams(
         nTargets: Int32(nTargets),
         nSources: Int32(nSources),
@@ -10598,7 +10640,8 @@ func evaluateCircSymRingKernels(
         k: Float(try requireDouble(payload, "k_real_f32")),
         kImag: Float(try optionalDouble(payload, "k_imag_f32", default: 0.0)),
         baffleZ: baffleValue ?? 0.0,
-        hasBaffle: baffleValue == nil ? 0 : 1
+        hasBaffle: baffleValue == nil ? 0 : 1,
+        kernelMode: kernelMode
     )
 
     guard let commandBuffer = commandQueue.makeCommandBuffer() else {
@@ -10657,7 +10700,10 @@ func evaluateCircSymRingKernels(
     try writeJSON(resultPath, [
         "schema": schema,
         "op": "evaluate_circsym_ring_kernels_result",
-        "implementation": "swift_native_metal_circsym_ring_field",
+        "implementation": kernelMode == 0
+            ? "swift_native_metal_circsym_ring_field"
+            : "swift_native_metal_circsym_ring_remainder",
+        "kernel_mode": kernelModeName,
         "shape": outputShape,
         "slp_real_f32": try requireString(slpReDesc, "path"),
         "slp_imag_f32": try requireString(slpImDesc, "path"),

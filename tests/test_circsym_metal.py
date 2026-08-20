@@ -9,6 +9,7 @@ from hornlab_metal_bem import MeridianMesh, ObservationConfig, SolveConfig, Velo
 from hornlab_metal_bem.metal import (
     discover_native_runtime,
     evaluate_circsym_ring_field_kernels,
+    evaluate_circsym_ring_remainder_kernels,
 )
 
 
@@ -31,6 +32,7 @@ def _reference_ring_field(
     psi_weights: np.ndarray,
     k: complex,
     baffle_z: float | None,
+    kernel_mode: str = "field",
 ) -> tuple[np.ndarray, np.ndarray]:
     target_count = target_rho.size
     source_count, line_count = source_rho.shape
@@ -54,11 +56,15 @@ def _reference_ring_field(
                 rt * rt + rs * rs - 2.0 * rt * rs * cp + dz * dz
             )
             phase = np.exp(1j * k * radius)
-            green = phase / (4.0 * np.pi * radius)
+            if kernel_mode == "field":
+                green = phase / (4.0 * np.pi * radius)
+                derivative_factor = phase * (1j * k * radius - 1.0)
+            else:
+                green = np.expm1(1j * k * radius) / (4.0 * np.pi * radius)
+                derivative_factor = phase * (1j * k * radius - 1.0) + 1.0
             numerator = (rs - rt * cp) * nr + dz * nz
             derivative = (
-                phase
-                * (1j * k * radius - 1.0)
+                derivative_factor
                 * numerator
                 / (4.0 * np.pi * radius**3)
             )
@@ -122,7 +128,7 @@ def test_circsym_field_auto_backend_uses_work_threshold(monkeypatch):
     monkeypatch.delenv("HORNLAB_CIRCSYM_FIELD_BACKEND", raising=False)
     monkeypatch.setattr(
         circsym,
-        "_circsym_metal_field_runtime_status",
+        "_circsym_metal_runtime_status",
         lambda: status,
     )
     monkeypatch.setattr(circsym, "_circsym_metal_field_auto_failure", None)
@@ -132,6 +138,16 @@ def test_circsym_field_auto_backend_uses_work_threshold(monkeypatch):
         "metal",
         status,
     )
+
+
+def test_circsym_assembly_auto_backend_uses_work_threshold(monkeypatch):
+    status = type("Status", (), {"available": True})()
+    monkeypatch.delenv("HORNLAB_CIRCSYM_ASSEMBLY_BACKEND", raising=False)
+    monkeypatch.setattr(circsym, "_circsym_metal_runtime_status", lambda: status)
+    monkeypatch.setattr(circsym, "_circsym_metal_assembly_auto_failure", None)
+
+    assert circsym._select_circsym_assembly_backend(8, 64) == ("cpu", None)
+    assert circsym._select_circsym_assembly_backend(300, 64) == ("metal", status)
 
 
 @pytest.mark.parametrize("baffle_z", [None, -0.075])
@@ -183,6 +199,43 @@ def test_circsym_metal_ring_field_matches_complex128_cpu_reference(baffle_z):
     assert float(np.max(np.abs(metal_db - reference_db))) < 0.01
 
 
+@pytest.mark.parametrize("baffle_z", [None, -0.075])
+def test_circsym_metal_ring_remainder_matches_complex128_cpu_reference(baffle_z):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+    values = _field_fixture()
+    k = 211.0 + 0.35j
+    reference_slp, reference_dlp = _reference_ring_field(
+        **values,
+        k=k,
+        baffle_z=baffle_z,
+        kernel_mode="remainder",
+    )
+    result = evaluate_circsym_ring_remainder_kernels(
+        **values,
+        k=k,
+        baffle_z=baffle_z,
+        runtime_status=status,
+    )
+
+    slp_relative = np.linalg.norm(result.slp - reference_slp) / np.linalg.norm(
+        reference_slp
+    )
+    dlp_relative = np.linalg.norm(result.dlp - reference_dlp) / np.linalg.norm(
+        reference_dlp
+    )
+    assert slp_relative < 5.0e-5
+    assert dlp_relative < 5.0e-5
+    assert result.diagnostics["implementation"] == (
+        "swift_native_metal_circsym_ring_remainder"
+    )
+    assert result.diagnostics["kernel_mode"] == "remainder"
+
+
 def test_circsym_full_solve_adaptive_metal_field_matches_cpu(monkeypatch):
     status = discover_native_runtime(run_smoke_test=True)
     if not status.available:
@@ -190,7 +243,7 @@ def test_circsym_full_solve_adaptive_metal_field_matches_cpu(monkeypatch):
             "Swift/Metal native helper unavailable: "
             + "; ".join(status.unavailable_reasons)
         )
-    theta = np.linspace(0.0, np.pi, 57)
+    theta = np.linspace(0.0, np.pi, 301)
     radius = 0.1
     meridian = MeridianMesh.from_polyline(
         np.column_stack([radius * np.sin(theta), radius * np.cos(theta)]),
@@ -209,10 +262,13 @@ def test_circsym_full_solve_adaptive_metal_field_matches_cpu(monkeypatch):
     )
 
     monkeypatch.setenv("HORNLAB_CIRCSYM_FIELD_BACKEND", "cpu")
+    monkeypatch.setenv("HORNLAB_CIRCSYM_ASSEMBLY_BACKEND", "cpu")
     cpu = metal_bem.solve_circsym_frequencies(meridian, [4_000.0], config)
     monkeypatch.delenv("HORNLAB_CIRCSYM_FIELD_BACKEND")
-    circsym._circsym_metal_field_runtime_status.cache_clear()
+    monkeypatch.delenv("HORNLAB_CIRCSYM_ASSEMBLY_BACKEND")
+    circsym._circsym_metal_runtime_status.cache_clear()
     monkeypatch.setattr(circsym, "_circsym_metal_field_auto_failure", None)
+    monkeypatch.setattr(circsym, "_circsym_metal_assembly_auto_failure", None)
     metal = metal_bem.solve_circsym_frequencies(meridian, [4_000.0], config)
 
     pressure_relative = np.linalg.norm(
@@ -222,3 +278,5 @@ def test_circsym_full_solve_adaptive_metal_field_matches_cpu(monkeypatch):
     assert float(np.max(np.abs(metal.directivity_db - cpu.directivity_db))) < 0.01
     assert metal.native_diagnostics[0]["field_backend"] == "metal"
     assert metal.native_diagnostics[0]["field_backend_policy"] == "auto"
+    assert metal.native_diagnostics[0]["assembly_backend"] == "metal"
+    assert metal.native_diagnostics[0]["assembly_backend_policy"] == "auto"

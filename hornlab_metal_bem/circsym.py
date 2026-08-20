@@ -60,6 +60,10 @@ class CircSymCancelled(RuntimeError):
     """Raised when a CircSym intra-case continuation callback returns False."""
 
 
+class _CircSymMetalAccelerationError(RuntimeError):
+    """Marks a native acceleration failure without masking callback errors."""
+
+
 def _check_circsym_continue(
     config_or_callback: SolveConfig | Callable[[], bool | None] | None,
 ) -> None:
@@ -84,11 +88,15 @@ _FIELD_KERNEL_PARALLEL_TARGET_BLOCK = 8
 _FIELD_KERNEL_MAX_WORKERS = 8
 _CIRCSYM_METAL_FIELD_MIN_TERMS = 2_000_000
 _CIRCSYM_FIELD_BACKEND_ENV = "HORNLAB_CIRCSYM_FIELD_BACKEND"
+_CIRCSYM_METAL_ASSEMBLY_MIN_TERMS = 80_000_000
+_CIRCSYM_ASSEMBLY_BACKEND_ENV = "HORNLAB_CIRCSYM_ASSEMBLY_BACKEND"
+_CIRCSYM_METAL_ASSEMBLY_CANCEL_TERMS = 350_000_000
 _ASSEMBLY_KERNEL_BLOCK_ELEMENTS = 3_000_000
 _ASSEMBLY_KERNEL_MAX_TARGET_BLOCK = 16
 _ASSEMBLY_KERNEL_PARALLEL_TARGET_BLOCK = 5
 _CANCELLATION_PAIR_BLOCK = 16
 _circsym_metal_field_auto_failure: str | None = None
+_circsym_metal_assembly_auto_failure: str | None = None
 
 
 @dataclass
@@ -465,8 +473,18 @@ def run_sweep_circsym(
         if surface_pressure_rows is not None:
             surface_pressure_rows.append(np.asarray(pressure, dtype=np.complex128))
 
+        assembly_backend = _select_circsym_assembly_backend(
+            meridian.segment_count,
+            n_psi,
+        )[0]
         diagnostics = {
-            "assembly_implementation": "circsym_python_dp0_m0",
+            "assembly_implementation": (
+                "circsym_cpu_static_metal_remainder_dp0_m0"
+                if assembly_backend == "metal"
+                else "circsym_python_dp0_m0"
+            ),
+            "assembly_backend": assembly_backend,
+            "assembly_backend_policy": _requested_circsym_assembly_backend(),
             "circsym": True,
             "m_mode": 0,
             "azimuth_quadrature_points": int(n_psi),
@@ -828,9 +846,20 @@ def run_sweep_coupled_ib(
         for tag in source_tags:
             surface_pavg[int(tag)].append(pavg[int(tag)])
 
+        assembly_backend = _select_circsym_assembly_backend(
+            meridian.segment_count,
+            n_psi,
+        )[0]
         diagnostics = {
             "circsym": True,
             "coupled_ib": True,
+            "assembly_implementation": (
+                "circsym_cpu_static_metal_remainder_dp0_m0_coupled_ib"
+                if assembly_backend == "metal"
+                else "circsym_python_dp0_m0_coupled_ib"
+            ),
+            "assembly_backend": assembly_backend,
+            "assembly_backend_policy": _requested_circsym_assembly_backend(),
             "m_mode": 0,
             "aperture_tag": int(aperture_tag),
             "aperture_segments": int(m),
@@ -1505,26 +1534,47 @@ def _assemble_boundary_matrices_from_geometry(
     H = static_h.copy()
     n = S.shape[0]
     workers = _assembly_worker_count(n)
-    if c_kernel is not None:
-        s_part, h_part = _evaluate_far_remainder_onthefly_compiled(
-            c_kernel,
-            qgeom.far,
-            k,
-            workers=workers,
-            should_continue=should_continue,
-        )
-        S += s_part
-        H += h_part
-    else:
-        _accumulate_far_remainder_numpy(
-            S,
-            H,
-            qgeom,
-            k,
-            n_psi=n_psi,
-            workers=workers,
-            should_continue=should_continue,
-        )
+    assembly_backend, metal_runtime_status = _select_circsym_assembly_backend(
+        n,
+        int(n_psi),
+    )
+    far_complete = False
+    if assembly_backend == "metal":
+        try:
+            s_part, h_part = _evaluate_far_remainder_onthefly_metal(
+                qgeom.far,
+                k,
+                runtime_status=metal_runtime_status,
+                should_continue=should_continue,
+            )
+            S += s_part
+            H += h_part
+            far_complete = True
+        except _CircSymMetalAccelerationError as exc:
+            if _requested_circsym_assembly_backend() == "metal":
+                raise
+            _record_circsym_metal_assembly_failure(exc)
+    if not far_complete:
+        if c_kernel is not None:
+            s_part, h_part = _evaluate_far_remainder_onthefly_compiled(
+                c_kernel,
+                qgeom.far,
+                k,
+                workers=workers,
+                should_continue=should_continue,
+            )
+            S += s_part
+            H += h_part
+        else:
+            _accumulate_far_remainder_numpy(
+                S,
+                H,
+                qgeom,
+                k,
+                n_psi=n_psi,
+                workers=workers,
+                should_continue=should_continue,
+            )
 
     if near_rows.size:
         s_near = np.zeros(near_rows.size, dtype=np.complex128)
@@ -2170,6 +2220,60 @@ def _evaluate_far_remainder_onthefly_compiled(
                 workers=workers,
                 should_continue=should_continue,
             )
+        _check_circsym_continue(should_continue)
+    return s_out, h_out
+
+
+def _evaluate_far_remainder_onthefly_metal(
+    part: _FarRemainderCompactGeometry,
+    k: complex,
+    *,
+    runtime_status: Any,
+    should_continue: Callable[[], bool | None] | None = None,
+) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    from .metal.native import evaluate_circsym_ring_remainder_kernels
+
+    target_count = int(part.target_rho.size)
+    source_count = int(part.source_rho.shape[0])
+    s_out = np.empty((target_count, source_count), dtype=np.complex128)
+    h_out = np.empty_like(s_out)
+    terms_per_target = max(
+        1,
+        source_count * int(part.source_rho.shape[1]) * int(part.cos_psi.size),
+    )
+    cancellation_rows = max(
+        1,
+        _CIRCSYM_METAL_ASSEMBLY_CANCEL_TERMS // terms_per_target,
+    )
+    block_size = (
+        target_count
+        if should_continue is None
+        else min(target_count, cancellation_rows)
+    )
+    for start in range(0, target_count, block_size):
+        _check_circsym_continue(should_continue)
+        stop = min(target_count, start + block_size)
+        try:
+            result = evaluate_circsym_ring_remainder_kernels(
+                target_rho=part.target_rho[start:stop],
+                target_z=part.target_z[start:stop],
+                source_rho=part.source_rho,
+                source_z=part.source_z,
+                measure=part.measure,
+                normal_rho=part.normal_rho,
+                normal_z=part.normal_z,
+                cos_psi=part.cos_psi,
+                psi_weights=part.psi_weights,
+                k=k,
+                baffle_z=part.baffle_z,
+                runtime_status=runtime_status,
+            )
+        except Exception as exc:
+            raise _CircSymMetalAccelerationError(
+                f"native CircSym remainder kernel failed: {exc}"
+            ) from exc
+        s_out[start:stop] = result.slp
+        h_out[start:stop] = result.dlp
         _check_circsym_continue(should_continue)
     return s_out, h_out
 
@@ -3261,7 +3365,7 @@ def _requested_circsym_field_backend() -> str:
 
 
 @lru_cache(maxsize=1)
-def _circsym_metal_field_runtime_status() -> Any:
+def _circsym_metal_runtime_status() -> Any:
     from .metal.native import discover_native_runtime
 
     return discover_native_runtime(run_smoke_test=True)
@@ -3283,7 +3387,7 @@ def _select_circsym_field_backend(
         or _circsym_metal_field_auto_failure is not None
     ):
         return "cpu", None
-    status = _circsym_metal_field_runtime_status()
+    status = _circsym_metal_runtime_status()
     if status.available:
         return "metal", status
     if requested == "metal":
@@ -3316,6 +3420,55 @@ def _circsym_field_backend_summary(
         if int(count) > 0
     }
     return "+".join(sorted(backends)) or "cpu"
+
+
+def _requested_circsym_assembly_backend() -> str:
+    backend = os.environ.get(_CIRCSYM_ASSEMBLY_BACKEND_ENV, "auto").strip().lower()
+    if backend not in {"auto", "cpu", "metal"}:
+        raise ValueError(
+            f"{_CIRCSYM_ASSEMBLY_BACKEND_ENV} must be 'auto', 'cpu', or 'metal'"
+        )
+    return backend
+
+
+def _select_circsym_assembly_backend(
+    segment_count: int,
+    n_psi: int,
+) -> tuple[str, Any | None]:
+    requested = _requested_circsym_assembly_backend()
+    if requested == "cpu":
+        return "cpu", None
+    work_terms = (
+        int(segment_count)
+        * int(segment_count)
+        * _LINE_QUAD_ORDER
+        * int(n_psi)
+    )
+    if requested == "auto" and (
+        work_terms < _CIRCSYM_METAL_ASSEMBLY_MIN_TERMS
+        or _circsym_metal_assembly_auto_failure is not None
+    ):
+        return "cpu", None
+    status = _circsym_metal_runtime_status()
+    if status.available:
+        return "metal", status
+    if requested == "metal":
+        raise RuntimeError(
+            "CircSym Metal assembly backend was requested but is unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+    return "cpu", None
+
+
+def _record_circsym_metal_assembly_failure(exc: BaseException) -> None:
+    global _circsym_metal_assembly_auto_failure
+    if _circsym_metal_assembly_auto_failure is None:
+        _circsym_metal_assembly_auto_failure = str(exc)
+        logger.warning(
+            "CircSym Metal assembly acceleration failed; using CPU for the rest "
+            "of this process: %s",
+            exc,
+        )
 
 
 def _integrate_field_segment_kernels_batched(

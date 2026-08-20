@@ -240,7 +240,7 @@ def validate_session_with_native_helper(
     return json.loads(Path(result_path).read_text(encoding="utf-8"))
 
 
-def evaluate_circsym_ring_field_kernels(
+def _evaluate_circsym_ring_kernels(
     *,
     target_rho: NDArray[Any],
     target_z: NDArray[Any],
@@ -252,6 +252,7 @@ def evaluate_circsym_ring_field_kernels(
     cos_psi: NDArray[Any],
     psi_weights: NDArray[Any],
     k: complex,
+    kernel_mode: str,
     baffle_z: float | None = None,
     runtime_config: MetalNativeRuntimeConfig | None = None,
     runtime_status: MetalNativeRuntimeStatus | None = None,
@@ -315,6 +316,8 @@ def evaluate_circsym_ring_field_kernels(
         raise ValueError("k must be finite")
     if baffle_z is not None and not np.isfinite(float(baffle_z)):
         raise ValueError("baffle_z must be finite when provided")
+    if kernel_mode not in {"field", "remainder"}:
+        raise ValueError("kernel_mode must be 'field' or 'remainder'")
 
     status = runtime_status
     if status is None:
@@ -375,6 +378,7 @@ def evaluate_circsym_ring_field_kernels(
             inputs=inputs,
             outputs=outputs,
             baffle_z_f32=baffle_z,
+            kernel_mode=kernel_mode,
         )
         payload_path = write_json_manifest(payload, op_dir / "request.json")
         result_path = op_dir / "result.json"
@@ -435,6 +439,20 @@ def evaluate_circsym_ring_field_kernels(
     finally:
         if owns_root:
             shutil.rmtree(root, ignore_errors=True)
+
+
+def evaluate_circsym_ring_field_kernels(
+    **kwargs: Any,
+) -> CircSymMetalFieldKernels:
+    """Evaluate full ordinary CircSym field kernels on Apple Metal."""
+    return _evaluate_circsym_ring_kernels(kernel_mode="field", **kwargs)
+
+
+def evaluate_circsym_ring_remainder_kernels(
+    **kwargs: Any,
+) -> CircSymMetalFieldKernels:
+    """Evaluate the smooth frequency-dependent CircSym remainder on Metal."""
+    return _evaluate_circsym_ring_kernels(kernel_mode="remainder", **kwargs)
 
 
 class MetalNativeStandardSession:

@@ -304,6 +304,7 @@ class CircSymRingFieldPayload:
     inputs: dict[str, BinaryArrayDescriptor]
     outputs: dict[str, BinaryArrayDescriptor]
     baffle_z_f32: float | None = None
+    kernel_mode: str = "field"
     schema: str = METAL_STANDARD_SCHEMA
     op: str = "evaluate_circsym_ring_kernels"
     index_base: int = INDEX_BASE
@@ -315,6 +316,7 @@ class CircSymRingFieldPayload:
             "index_base": self.index_base,
             "k_real_f32": float(np.float32(self.k_real_f32)),
             "k_imag_f32": float(np.float32(self.k_imag_f32)),
+            "kernel_mode": self.kernel_mode,
             "inputs": {
                 key: descriptor.to_manifest()
                 for key, descriptor in self.inputs.items()
@@ -965,6 +967,8 @@ def _validate_field_manifest(manifest: dict[str, Any]) -> None:
 
 
 def _validate_circsym_ring_field_manifest(manifest: dict[str, Any]) -> None:
+    if manifest.get("kernel_mode") not in {"field", "remainder"}:
+        raise ValueError("kernel_mode must be 'field' or 'remainder'")
     for name in ("k_real_f32", "k_imag_f32"):
         value = manifest.get(name)
         if not isinstance(value, (int, float)) or not np.isfinite(value):

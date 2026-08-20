@@ -16,6 +16,7 @@ from .native import (
     assert_native_runtime_available,
     discover_native_runtime,
     evaluate_circsym_ring_field_kernels,
+    evaluate_circsym_ring_remainder_kernels,
     validate_session_with_native_helper,
 )
 from .session import (
@@ -61,6 +62,7 @@ __all__ = [
     "build_metal_geometry_buffers",
     "discover_native_runtime",
     "evaluate_circsym_ring_field_kernels",
+    "evaluate_circsym_ring_remainder_kernels",
     "payload_to_manifest",
     "read_json_manifest",
     "validate_session_with_native_helper",
