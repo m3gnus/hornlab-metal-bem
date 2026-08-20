@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pytest
 
@@ -7,6 +9,7 @@ import hornlab_metal_bem as metal_bem
 import hornlab_metal_bem.circsym as circsym
 from hornlab_metal_bem import MeridianMesh, ObservationConfig, SolveConfig, VelocityMode
 from hornlab_metal_bem.metal import (
+    CircSymMetalCancelled,
     discover_native_runtime,
     evaluate_circsym_ring_field_kernels,
     evaluate_circsym_ring_remainder_kernels,
@@ -234,6 +237,45 @@ def test_circsym_metal_ring_remainder_matches_complex128_cpu_reference(baffle_z)
         "swift_native_metal_circsym_ring_remainder"
     )
     assert result.diagnostics["kernel_mode"] == "remainder"
+
+
+def test_circsym_metal_operation_can_be_cancelled_inside_kernel_case():
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+    source_count = 300
+    line_count = 16
+    cos_psi, psi_weights = _psi_rule(256)
+    source_rho = np.linspace(0.001, 0.3, source_count)[:, None] * np.ones(
+        (1, line_count)
+    )
+    source_z = np.linspace(-0.25, 0.25, source_count)[:, None] + np.linspace(
+        -0.001,
+        0.001,
+        line_count,
+    )
+    started = time.monotonic()
+
+    with pytest.raises(CircSymMetalCancelled, match="cancelled"):
+        evaluate_circsym_ring_remainder_kernels(
+            target_rho=np.linspace(0.001, 0.3, source_count),
+            target_z=np.linspace(0.25, -0.25, source_count),
+            source_rho=source_rho,
+            source_z=source_z,
+            measure=source_rho * 1.0e-4,
+            normal_rho=np.ones(source_count),
+            normal_z=np.zeros(source_count),
+            cos_psi=cos_psi,
+            psi_weights=psi_weights,
+            k=293.0 + 1.5j,
+            runtime_status=status,
+            should_continue=lambda: time.monotonic() - started < 0.02,
+        )
+
+    assert time.monotonic() - started < 1.0
 
 
 def test_circsym_full_solve_adaptive_metal_field_matches_cpu(monkeypatch):

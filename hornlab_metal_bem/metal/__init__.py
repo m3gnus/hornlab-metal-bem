@@ -9,6 +9,7 @@ from .geometry import (
 from .backend import DenseBieSystem, MetalBemBackend, MetalBemContext
 from .native import (
     CircSymMetalFieldKernels,
+    CircSymMetalCancelled,
     MetalNativeRuntimeConfig,
     MetalNativeRuntimeStatus,
     MetalNativeSessionInfo,
@@ -44,6 +45,7 @@ __all__ = [
     "AssemblyPayload",
     "BinaryArrayDescriptor",
     "CircSymMetalFieldKernels",
+    "CircSymMetalCancelled",
     "CircSymRingFieldPayload",
     "DenseAssemblyResult",
     "DenseBieSystem",

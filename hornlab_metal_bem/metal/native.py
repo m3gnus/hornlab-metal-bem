@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import time
 import warnings
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 import numpy as np
@@ -100,6 +100,10 @@ class CircSymMetalFieldKernels:
     slp: NDArray[np.complex128]
     dlp: NDArray[np.complex128]
     diagnostics: dict[str, Any]
+
+
+class CircSymMetalCancelled(RuntimeError):
+    """Raised when a native CircSym operation is stopped by its callback."""
 
 
 def discover_native_runtime(
@@ -258,6 +262,7 @@ def _evaluate_circsym_ring_kernels(
     runtime_status: MetalNativeRuntimeStatus | None = None,
     work_dir: Path | None = None,
     operation_id: str | None = None,
+    should_continue: Callable[[], bool | None] | None = None,
 ) -> CircSymMetalFieldKernels:
     """Evaluate ordinary CircSym S/H ring kernels on Apple Metal.
 
@@ -389,26 +394,74 @@ def _evaluate_circsym_ring_kernels(
             str(result_path),
         )
         timeout_s = (runtime_config or MetalNativeRuntimeConfig()).operation_timeout_s
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=status.backend_dir,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                "Swift/Metal native helper timed out during CircSym field integration"
-            ) from exc
-        except OSError as exc:
-            raise RuntimeError(f"Failed to launch Swift/Metal native helper: {exc}") from exc
-        if completed.returncode != 0:
+        if should_continue is None:
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=status.backend_dir,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_s,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    "Swift/Metal native helper timed out during CircSym integration"
+                ) from exc
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Failed to launch Swift/Metal native helper: {exc}"
+                ) from exc
+            returncode = completed.returncode
+            stdout = completed.stdout
+            stderr = completed.stderr
+        else:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=status.backend_dir,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Failed to launch Swift/Metal native helper: {exc}"
+                ) from exc
+            deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+            try:
+                while process.poll() is None:
+                    if should_continue() is False:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+                        raise CircSymMetalCancelled("CircSym Metal operation cancelled")
+                    if deadline is not None and time.monotonic() > deadline:
+                        process.kill()
+                        process.wait()
+                        raise RuntimeError(
+                            "Swift/Metal native helper timed out during CircSym integration"
+                        )
+                    time.sleep(0.005)
+            except BaseException:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                raise
+            stdout, stderr = process.communicate()
+            returncode = int(process.returncode or 0)
+            # Catch a cancellation request that arrived between the final poll
+            # and process exit before accepting and publishing its result.
+            if should_continue() is False:
+                raise CircSymMetalCancelled("CircSym Metal operation cancelled")
+        if returncode != 0:
             message = (
-                completed.stderr.strip()
-                or completed.stdout.strip()
-                or f"Swift helper exited with {completed.returncode}"
+                stderr.strip()
+                or stdout.strip()
+                or f"Swift helper exited with {returncode}"
             )
             raise RuntimeError(
                 "Swift/Metal native helper failed during CircSym field integration: "

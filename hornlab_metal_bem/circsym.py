@@ -90,7 +90,6 @@ _CIRCSYM_METAL_FIELD_MIN_TERMS = 2_000_000
 _CIRCSYM_FIELD_BACKEND_ENV = "HORNLAB_CIRCSYM_FIELD_BACKEND"
 _CIRCSYM_METAL_ASSEMBLY_MIN_TERMS = 80_000_000
 _CIRCSYM_ASSEMBLY_BACKEND_ENV = "HORNLAB_CIRCSYM_ASSEMBLY_BACKEND"
-_CIRCSYM_METAL_ASSEMBLY_CANCEL_TERMS = 350_000_000
 _ASSEMBLY_KERNEL_BLOCK_ELEMENTS = 3_000_000
 _ASSEMBLY_KERNEL_MAX_TARGET_BLOCK = 16
 _ASSEMBLY_KERNEL_PARALLEL_TARGET_BLOCK = 5
@@ -2231,51 +2230,34 @@ def _evaluate_far_remainder_onthefly_metal(
     runtime_status: Any,
     should_continue: Callable[[], bool | None] | None = None,
 ) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    from .metal.native import CircSymMetalCancelled
     from .metal.native import evaluate_circsym_ring_remainder_kernels
 
-    target_count = int(part.target_rho.size)
-    source_count = int(part.source_rho.shape[0])
-    s_out = np.empty((target_count, source_count), dtype=np.complex128)
-    h_out = np.empty_like(s_out)
-    terms_per_target = max(
-        1,
-        source_count * int(part.source_rho.shape[1]) * int(part.cos_psi.size),
-    )
-    cancellation_rows = max(
-        1,
-        _CIRCSYM_METAL_ASSEMBLY_CANCEL_TERMS // terms_per_target,
-    )
-    block_size = (
-        target_count
-        if should_continue is None
-        else min(target_count, cancellation_rows)
-    )
-    for start in range(0, target_count, block_size):
-        _check_circsym_continue(should_continue)
-        stop = min(target_count, start + block_size)
-        try:
-            result = evaluate_circsym_ring_remainder_kernels(
-                target_rho=part.target_rho[start:stop],
-                target_z=part.target_z[start:stop],
-                source_rho=part.source_rho,
-                source_z=part.source_z,
-                measure=part.measure,
-                normal_rho=part.normal_rho,
-                normal_z=part.normal_z,
-                cos_psi=part.cos_psi,
-                psi_weights=part.psi_weights,
-                k=k,
-                baffle_z=part.baffle_z,
-                runtime_status=runtime_status,
-            )
-        except Exception as exc:
-            raise _CircSymMetalAccelerationError(
-                f"native CircSym remainder kernel failed: {exc}"
-            ) from exc
-        s_out[start:stop] = result.slp
-        h_out[start:stop] = result.dlp
-        _check_circsym_continue(should_continue)
-    return s_out, h_out
+    _check_circsym_continue(should_continue)
+    try:
+        result = evaluate_circsym_ring_remainder_kernels(
+            target_rho=part.target_rho,
+            target_z=part.target_z,
+            source_rho=part.source_rho,
+            source_z=part.source_z,
+            measure=part.measure,
+            normal_rho=part.normal_rho,
+            normal_z=part.normal_z,
+            cos_psi=part.cos_psi,
+            psi_weights=part.psi_weights,
+            k=k,
+            baffle_z=part.baffle_z,
+            runtime_status=runtime_status,
+            should_continue=should_continue,
+        )
+    except CircSymMetalCancelled as exc:
+        raise CircSymCancelled("CircSym solve cancelled") from exc
+    except Exception as exc:
+        raise _CircSymMetalAccelerationError(
+            f"native CircSym remainder kernel failed: {exc}"
+        ) from exc
+    _check_circsym_continue(should_continue)
+    return result.slp, result.dlp
 
 
 def _evaluate_near_remainder_compiled(
@@ -3548,6 +3530,7 @@ def _integrate_field_segment_kernels_batched(
             n_psi=n_psi,
             backend=field_backend,
             metal_runtime_status=metal_runtime_status,
+            should_continue=should_continue,
         )
         near_mask = ~_ordinary_far_source_mask_targets(
             block_rho,
@@ -3647,6 +3630,7 @@ def _integrate_ordinary_field_kernels_targets_batched(
     n_psi: int,
     backend: str,
     metal_runtime_status: Any | None,
+    should_continue: Callable[[], bool | None] | None,
 ) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
     indices = np.asarray(source_indices, dtype=np.int64)
     target_rho_arr = np.asarray(target_rho, dtype=np.float64).reshape(-1)
@@ -3671,6 +3655,7 @@ def _integrate_ordinary_field_kernels_targets_batched(
         z_s = source[:, :, 1]
         line_measure = rho_s * lengths[:, None] * w[None, :]
         try:
+            from .metal.native import CircSymMetalCancelled
             from .metal.native import evaluate_circsym_ring_field_kernels
 
             result = evaluate_circsym_ring_field_kernels(
@@ -3686,8 +3671,11 @@ def _integrate_ordinary_field_kernels_targets_batched(
                 k=k,
                 baffle_z=baffle_z,
                 runtime_status=metal_runtime_status,
+                should_continue=should_continue,
             )
             return result.slp, result.dlp
+        except CircSymMetalCancelled as exc:
+            raise CircSymCancelled("CircSym solve cancelled") from exc
         except Exception as exc:
             if _requested_circsym_field_backend() == "metal":
                 raise
