@@ -195,6 +195,9 @@ def test_circsym_sphere_grid_matches_arcs_and_point_source_decay():
     n_points = 7 * 12
     assert result.sphere_pressure_complex is not None
     assert result.sphere_pressure_complex.shape == (1, n_points)
+    diagnostics = result.native_diagnostics[0]
+    assert diagnostics["sphere_targets"] == n_points
+    assert diagnostics["sphere_evaluation_targets"] == 7
 
     angles = np.asarray(result.observation_angles_deg)
     arc_90 = int(np.argmin(np.abs(angles - 90.0)))
@@ -214,3 +217,7 @@ def test_circsym_sphere_grid_matches_arcs_and_point_source_decay():
     normalized = sphere[0] * d * np.exp(-1j * k * d)
     magnitudes = np.abs(normalized)
     assert magnitudes.max() / magnitudes.min() == pytest.approx(1.0, abs=0.02)
+    np.testing.assert_array_equal(
+        sphere[0].reshape(7, 12),
+        np.repeat(sphere[0].reshape(7, 12)[:, :1], 12, axis=1),
+    )

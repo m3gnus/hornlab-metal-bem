@@ -5,6 +5,7 @@ import pytest
 from scipy.special import j1, spherical_jn, spherical_yn, struve
 
 import hornlab_metal_bem as metal_bem
+import hornlab_metal_bem.circsym as circsym
 from hornlab_metal_bem._constants import SPEED_OF_SOUND
 from hornlab_metal_bem.circsym import (
     MeridianMesh,
@@ -533,6 +534,38 @@ def test_vectorized_field_evaluation_matches_scalar_closed_meridian():
     )
 
     np.testing.assert_allclose(vectorized, scalar, rtol=1e-10, atol=1e-12)
+
+
+def test_field_target_batch_deduplicates_exact_axisymmetric_coordinates(monkeypatch):
+    meridian = _sphere_meridian(radius=0.1, segments=12)
+    geom = meridian.segment_geometry()
+    source_indices = np.arange(meridian.segment_count, dtype=np.int64)
+    target_counts: list[int] = []
+    original = circsym._integrate_ordinary_field_kernels_targets_batched
+
+    def counted(**kwargs):
+        target_counts.append(int(np.asarray(kwargs["target_rho"]).size))
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        circsym,
+        "_integrate_ordinary_field_kernels_targets_batched",
+        counted,
+    )
+    s_mat, h_mat = circsym._integrate_field_segment_kernels_batched(
+        target_rho=np.array([2.0, 1.5, 2.0]),
+        target_z=np.array([0.25, -0.4, 0.25]),
+        meridian=meridian,
+        geom=geom,
+        source_indices=source_indices,
+        k=complex(12.0, 0.0),
+        baffle_z=None,
+        n_psi=64,
+    )
+
+    assert target_counts == [2]
+    np.testing.assert_array_equal(s_mat[0], s_mat[2])
+    np.testing.assert_array_equal(h_mat[0], h_mat[2])
 
 
 def test_vectorized_field_evaluation_matches_scalar_baffled_sheet_rayleigh_branch():

@@ -256,6 +256,17 @@ def run_sweep_circsym(
         frame, config.observation
     )
     n_sphere = 0 if sphere_points_arr is None else int(sphere_points_arr.shape[0])
+    sphere_evaluation_points, sphere_evaluation_inverse = (
+        _axisymmetric_sphere_evaluation_targets(
+            sphere_points_arr,
+            sphere_theta_deg,
+        )
+    )
+    n_sphere_evaluation = (
+        0
+        if sphere_evaluation_points is None
+        else int(sphere_evaluation_points.shape[0])
+    )
     source_tags = list(config.velocity_sources.keys())
     source_scale = _build_source_segment_scale(meridian, config, frame)
     impedance_sources_arg = _impedance_sources_for_frequencies(
@@ -393,19 +404,25 @@ def run_sweep_circsym(
             geom=geom,
             n_psi=n_psi,
         )
-        sphere_pressure = (
+        sphere_pressure_unique = (
             _evaluate_points_pressure(
                 meridian,
                 pressure,
                 q_total,
-                sphere_points_arr,
+                sphere_evaluation_points,
                 k_field,
                 config.circsym_baffle_z,
                 geom=geom,
                 n_psi=n_psi,
             )
-            if sphere_points_arr is not None
+            if sphere_evaluation_points is not None
             else None
+        )
+        sphere_pressure = (
+            sphere_pressure_unique[sphere_evaluation_inverse]
+            if sphere_pressure_unique is not None
+            and sphere_evaluation_inverse is not None
+            else sphere_pressure_unique
         )
         field_s = time.time() - t_field
 
@@ -443,6 +460,8 @@ def run_sweep_circsym(
             / (frequency * mesh_max_segment)
             if mesh_max_segment > 0.0
             else math.inf,
+            "sphere_targets": n_sphere,
+            "sphere_evaluation_targets": n_sphere_evaluation,
             "chief_points": bool(config.chief_points is not None),
             "chief_points_count": int(chief_rows_count),
         }
@@ -592,6 +611,17 @@ def run_sweep_coupled_ib(
         frame, config.observation
     )
     n_sphere = 0 if sphere_points_arr is None else int(sphere_points_arr.shape[0])
+    sphere_evaluation_points, sphere_evaluation_inverse = (
+        _axisymmetric_sphere_evaluation_targets(
+            sphere_points_arr,
+            sphere_theta_deg,
+        )
+    )
+    n_sphere_evaluation = (
+        0
+        if sphere_evaluation_points is None
+        else int(sphere_evaluation_points.shape[0])
+    )
 
     n_planes, n_angles, _ = obs_points.shape
     on_axis_idx = int(np.argmin(np.abs(angles_deg)))
@@ -728,15 +758,20 @@ def run_sweep_coupled_ib(
         field_pressure = flat_pressure.reshape(n_planes, n_angles)
 
         sphere_pressure = None
-        if sphere_points_arr is not None:
-            sphere_pressure = _evaluate_coupled_ib_points_pressure(
+        if sphere_evaluation_points is not None:
+            sphere_pressure_unique = _evaluate_coupled_ib_points_pressure(
                 meridian,
                 q_a,
                 idx_a,
-                sphere_points_arr,
+                sphere_evaluation_points,
                 k_field,
                 geom=geom,
                 n_psi=n_psi,
+            )
+            sphere_pressure = (
+                sphere_pressure_unique[sphere_evaluation_inverse]
+                if sphere_evaluation_inverse is not None
+                else sphere_pressure_unique
             )
         field_s = time.time() - t_field
 
@@ -766,6 +801,8 @@ def run_sweep_coupled_ib(
             "aperture_pressure_continuity_rel": aperture_pressure_continuity_rel,
             "dense_solve_rcond": dense_solve_rcond,
             "dense_solve_rcond_estimator": "lapack_gecon_1norm",
+            "sphere_targets": n_sphere,
+            "sphere_evaluation_targets": n_sphere_evaluation,
         }
         native_diagnostics.append(diagnostics)
 
@@ -3022,6 +3059,46 @@ def _points_target_rho_z(
     )
 
 
+def _axisymmetric_sphere_evaluation_targets(
+    points: NDArray[np.float64] | None,
+    theta_deg: NDArray[np.float64] | None,
+) -> tuple[NDArray[np.float64] | None, NDArray[np.int64] | None]:
+    """Collapse a generated sphere grid to one azimuth representative per theta.
+
+    CircSym solves only the rotationally invariant ``m=0`` field, so every phi
+    sample at the same generated polar angle has exactly the same pressure.  Use
+    the grid's theta metadata instead of tolerance-rounding Cartesian-derived
+    ``(rho, z)`` coordinates; the latter can merge genuinely distinct custom
+    targets near a boundary.
+
+    Explicit ``sphere_points`` have no theta metadata and pass through unchanged.
+    The returned inverse expands evaluated pressures back to the caller's original
+    theta-major sphere-grid order.
+    """
+    if points is None:
+        return None, None
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError(f"points must have shape (N, 3), got {pts.shape}")
+    if theta_deg is None:
+        return pts, None
+
+    theta = np.asarray(theta_deg, dtype=np.float64).reshape(-1)
+    if theta.size != pts.shape[0]:
+        raise ValueError("sphere theta metadata must match the point count")
+    _, first_indices, inverse = np.unique(
+        theta,
+        return_index=True,
+        return_inverse=True,
+    )
+    if first_indices.size == pts.shape[0]:
+        return pts, None
+    return (
+        np.ascontiguousarray(pts[first_indices], dtype=np.float64),
+        np.asarray(inverse, dtype=np.int64),
+    )
+
+
 def _integrate_field_segment_kernels_batched(
     *,
     target_rho: NDArray[np.float64],
@@ -3045,23 +3122,34 @@ def _integrate_field_segment_kernels_batched(
             np.empty(shape, dtype=np.complex128),
         )
 
-    s_mat = np.empty((target_rho_arr.size, indices.size), dtype=np.complex128)
+    # Arbitrary/custom observation lists can contain exact axisymmetric
+    # duplicates (different Cartesian points with identical rho and z).  Evaluate
+    # each distinct m=0 target once, then restore the caller's order.  Deliberately
+    # use exact float equality here: generated sphere grids receive the stronger,
+    # metadata-backed theta collapse above, while near-boundary custom points must
+    # never be merged by a geometric rounding tolerance.
+    targets = np.column_stack((target_rho_arr, target_z_arr))
+    unique_targets, inverse = np.unique(targets, axis=0, return_inverse=True)
+    work_rho = unique_targets[:, 0]
+    work_z = unique_targets[:, 1]
+
+    s_mat = np.empty((work_rho.size, indices.size), dtype=np.complex128)
     h_mat = np.empty_like(s_mat)
-    workers = _field_kernel_worker_count(target_rho_arr.size, indices.size)
+    workers = _field_kernel_worker_count(work_rho.size, indices.size)
     block_size = _field_kernel_target_block_size(indices.size, int(n_psi))
     if workers > 1:
         block_size = min(block_size, _FIELD_KERNEL_PARALLEL_TARGET_BLOCK)
     ranges = [
-        (start, min(target_rho_arr.size, start + block_size))
-        for start in range(0, target_rho_arr.size, block_size)
+        (start, min(work_rho.size, start + block_size))
+        for start in range(0, work_rho.size, block_size)
     ]
 
     def compute_block(
         span: tuple[int, int],
     ) -> tuple[int, int, NDArray[np.complex128], NDArray[np.complex128]]:
         start, stop = span
-        block_rho = target_rho_arr[start:stop]
-        block_z = target_z_arr[start:stop]
+        block_rho = work_rho[start:stop]
+        block_z = work_z[start:stop]
         s_block, h_block = _integrate_ordinary_field_kernels_targets_batched(
             target_rho=block_rho,
             target_z=block_z,
@@ -3106,7 +3194,7 @@ def _integrate_field_segment_kernels_batched(
             for start, stop, s_block, h_block in executor.map(compute_block, ranges):
                 s_mat[start:stop] = s_block
                 h_mat[start:stop] = h_block
-    return s_mat, h_mat
+    return s_mat[inverse], h_mat[inverse]
 
 
 def _field_kernel_target_block_size(source_count: int, n_psi: int) -> int:

@@ -168,6 +168,31 @@ def test_coupled_ib_cone_horn_is_a_forward_beam_with_no_rear_radiation():
         assert np.all(db[degs > 91.0] < -40.0)
 
 
+def test_coupled_ib_sphere_grid_evaluates_one_target_per_theta():
+    meridian = _channel_meridian(0.025, 0.05, 0.04, h=0.005)
+    config = SolveConfig(
+        velocity_sources={TAG_THROAT: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        circsym_aperture_tag=TAG_DISC,
+        observation=ObservationConfig(
+            distance_m=1.0,
+            angle_count=3,
+            planes=["horizontal"],
+            origin="mouth",
+            sphere_grid=(4, 6),
+            sphere_theta_max_deg=90.0,
+        ),
+    )
+    result = metal_bem.solve_circsym_frequencies(meridian, [1000.0], config)
+
+    diagnostics = result.native_diagnostics[0]
+    assert diagnostics["sphere_targets"] == 24
+    assert diagnostics["sphere_evaluation_targets"] == 4
+    assert result.sphere_pressure_complex is not None
+    sphere = result.sphere_pressure_complex[0].reshape(4, 6)
+    np.testing.assert_array_equal(sphere, np.repeat(sphere[:, :1], 6, axis=1))
+
+
 def test_circsym_missing_aperture_tag_raises_instead_of_free_space():
     """A requested-but-absent circsym_aperture_tag must fail loudly, not silently
     fall back to a free-space (free-standing) sweep with wrong physics."""
