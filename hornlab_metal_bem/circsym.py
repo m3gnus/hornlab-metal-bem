@@ -20,7 +20,7 @@ import subprocess
 import tempfile
 import time
 from types import SimpleNamespace
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -55,6 +55,23 @@ from .sweep import (
 logger = logging.getLogger(__name__)
 
 
+class CircSymCancelled(RuntimeError):
+    """Raised when a CircSym intra-case continuation callback returns False."""
+
+
+def _check_circsym_continue(
+    config_or_callback: SolveConfig | Callable[[], bool | None] | None,
+) -> None:
+    """Run a cancellation checkpoint without masking caller-owned exceptions."""
+    callback = (
+        config_or_callback.should_continue
+        if isinstance(config_or_callback, SolveConfig)
+        else config_or_callback
+    )
+    if callback is not None and callback() is False:
+        raise CircSymCancelled("CircSym solve cancelled")
+
+
 _AZIMUTH_POINTS_MIN = 64
 _AZIMUTH_POINTS_PER_KRHO = 4.0
 _LINE_QUAD_ORDER = 16
@@ -67,6 +84,7 @@ _FIELD_KERNEL_MAX_WORKERS = 8
 _ASSEMBLY_KERNEL_BLOCK_ELEMENTS = 3_000_000
 _ASSEMBLY_KERNEL_MAX_TARGET_BLOCK = 16
 _ASSEMBLY_KERNEL_PARALLEL_TARGET_BLOCK = 5
+_CANCELLATION_PAIR_BLOCK = 16
 
 
 @dataclass
@@ -312,6 +330,7 @@ def run_sweep_circsym(
     surface_pavg: dict[int, list[complex]] = {int(tag): [] for tag in source_tags}
 
     for freq_index, frequency_hz in enumerate(frequencies_arr):
+        _check_circsym_continue(config)
         frequency = float(frequency_hz)
         t_case = time.time()
         omega = 2.0 * np.pi * frequency
@@ -340,7 +359,9 @@ def run_sweep_circsym(
             config.circsym_baffle_z,
             n_psi=n_psi,
             geometry_cache=assembly_cache,
+            should_continue=config.should_continue,
         )
+        _check_circsym_continue(config)
         A = H.copy()
         A[np.diag_indices_from(A)] -= boundary_free_terms
         if np.any(beta != 0.0):
@@ -361,6 +382,7 @@ def run_sweep_circsym(
                 k,
                 config.circsym_baffle_z,
                 n_psi=n_psi,
+                should_continue=config.should_continue,
             )
             C = chief_H.copy()
             if np.any(beta != 0.0):
@@ -403,6 +425,7 @@ def run_sweep_circsym(
             config,
             geom=geom,
             n_psi=n_psi,
+            should_continue=config.should_continue,
         )
         sphere_pressure_unique = (
             _evaluate_points_pressure(
@@ -414,6 +437,7 @@ def run_sweep_circsym(
                 config.circsym_baffle_z,
                 geom=geom,
                 n_psi=n_psi,
+                should_continue=config.should_continue,
             )
             if sphere_evaluation_points is not None
             else None
@@ -663,6 +687,7 @@ def run_sweep_coupled_ib(
     per_case_impedance = isinstance(impedance_sources_arg, list)
 
     for freq_index, frequency_hz in enumerate(frequencies_arr):
+        _check_circsym_continue(config)
         frequency = float(frequency_hz)
         t_case = time.time()
         omega = 2.0 * np.pi * frequency
@@ -688,7 +713,9 @@ def run_sweep_coupled_ib(
             None,
             n_psi=n_psi,
             geometry_cache=assembly_cache,
+            should_continue=config.should_continue,
         )
+        _check_circsym_continue(config)
         if k.imag == 0.0:
             S_rayleigh_aperture = S[np.ix_(idx_a, idx_a)]
         else:
@@ -701,6 +728,7 @@ def run_sweep_coupled_ib(
                 k_field,
                 geom=geom,
                 n_psi=n_psi,
+                should_continue=config.should_continue,
             )
         q_driver = _build_driver_neumann_segments(
             meridian,
@@ -754,6 +782,7 @@ def run_sweep_coupled_ib(
             k_field,
             geom=geom,
             n_psi=n_psi,
+            should_continue=config.should_continue,
         )
         field_pressure = flat_pressure.reshape(n_planes, n_angles)
 
@@ -767,6 +796,7 @@ def run_sweep_coupled_ib(
                 k_field,
                 geom=geom,
                 n_psi=n_psi,
+                should_continue=config.should_continue,
             )
             sphere_pressure = (
                 sphere_pressure_unique[sphere_evaluation_inverse]
@@ -1150,13 +1180,16 @@ def _assemble_boundary_matrices(
     *,
     n_psi: int,
     geometry_cache: "_BoundaryAssemblyGeometryCache | None" = None,
+    should_continue: Callable[[], bool | None] | None = None,
 ) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    _check_circsym_continue(should_continue)
     if geometry_cache is not None:
         cached = geometry_cache.assemble(
             k,
             n_psi=int(n_psi),
             meridian=meridian,
             baffle_z=baffle_z,
+            should_continue=should_continue,
         )
         if cached is not None:
             return cached
@@ -1165,6 +1198,7 @@ def _assemble_boundary_matrices(
         k,
         baffle_z,
         n_psi=n_psi,
+        should_continue=should_continue,
     )
 
 
@@ -1174,6 +1208,7 @@ def _assemble_boundary_matrices_uncached(
     baffle_z: float | None,
     *,
     n_psi: int,
+    should_continue: Callable[[], bool | None] | None = None,
 ) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
     geom = meridian.segment_geometry()
     n = meridian.segment_count
@@ -1189,6 +1224,7 @@ def _assemble_boundary_matrices_uncached(
     ]
     if workers <= 1 or len(ranges) <= 1:
         for span in ranges:
+            _check_circsym_continue(should_continue)
             start, stop, s_block, h_block = _assemble_boundary_block(
                 span[0],
                 span[1],
@@ -1200,8 +1236,10 @@ def _assemble_boundary_matrices_uncached(
             )
             S[start:stop] = s_block
             H[start:stop] = h_block
+            _check_circsym_continue(should_continue)
     else:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        try:
             blocks = executor.map(
                 lambda span: _assemble_boundary_block(
                     span[0],
@@ -1215,8 +1253,14 @@ def _assemble_boundary_matrices_uncached(
                 ranges,
             )
             for start, stop, s_block, h_block in blocks:
+                _check_circsym_continue(should_continue)
                 S[start:stop] = s_block
                 H[start:stop] = h_block
+        except BaseException:
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
     return S, H
 
 
@@ -1305,7 +1349,9 @@ class _BoundaryAssemblyGeometryCache:
         n_psi: int,
         meridian: MeridianMesh,
         baffle_z: float | None,
+        should_continue: Callable[[], bool | None] | None = None,
     ) -> tuple[NDArray[np.complex128], NDArray[np.complex128]] | None:
+        _check_circsym_continue(should_continue)
         if meridian is not self.meridian or not _same_optional_float(
             baffle_z, self.baffle_z
         ):
@@ -1318,8 +1364,15 @@ class _BoundaryAssemblyGeometryCache:
         c_kernel = _load_circsym_remainder_c_kernel()
 
         try:
-            static_s, static_h, near_rows, near_cols = self._static_geometry()
-            qgeom = self._quadrature_geometry(n_psi_int, near_rows, near_cols)
+            static_s, static_h, near_rows, near_cols = self._static_geometry(
+                should_continue=should_continue
+            )
+            qgeom = self._quadrature_geometry(
+                n_psi_int,
+                near_rows,
+                near_cols,
+                should_continue=should_continue,
+            )
             result = _assemble_boundary_matrices_from_geometry(
                 static_s,
                 static_h,
@@ -1329,6 +1382,7 @@ class _BoundaryAssemblyGeometryCache:
                 k,
                 n_psi=n_psi_int,
                 c_kernel=c_kernel,
+                should_continue=should_continue,
             )
         except MemoryError:
             self._quadrature.pop(n_psi_int, None)
@@ -1338,6 +1392,8 @@ class _BoundaryAssemblyGeometryCache:
 
     def _static_geometry(
         self,
+        *,
+        should_continue: Callable[[], bool | None] | None = None,
     ) -> tuple[
         NDArray[np.complex128],
         NDArray[np.complex128],
@@ -1354,6 +1410,7 @@ class _BoundaryAssemblyGeometryCache:
                 self.meridian,
                 self.geom,
                 self.baffle_z,
+                should_continue=should_continue,
             )
             self._static_s = static_s
             self._static_h = static_h
@@ -1366,9 +1423,12 @@ class _BoundaryAssemblyGeometryCache:
         n_psi: int,
         near_rows: NDArray[np.int64],
         near_cols: NDArray[np.int64],
+        *,
+        should_continue: Callable[[], bool | None] | None = None,
     ) -> _BoundaryAssemblyQuadratureGeometry:
         cached = self._quadrature.get(int(n_psi))
         if cached is None:
+            _check_circsym_continue(should_continue)
             cached = _BoundaryAssemblyQuadratureGeometry(
                 far=_build_far_remainder_compact_geometry(
                     self.meridian,
@@ -1383,9 +1443,11 @@ class _BoundaryAssemblyGeometryCache:
                     near_cols,
                     self.baffle_z,
                     n_psi=int(n_psi),
+                    should_continue=should_continue,
                 ),
             )
             self._quadrature[int(n_psi)] = cached
+            _check_circsym_continue(should_continue)
         return cached
 
     def _release_quadrature_use(self, n_psi: int) -> None:
@@ -1420,7 +1482,9 @@ def _assemble_boundary_matrices_from_geometry(
     *,
     n_psi: int,
     c_kernel: _CircsymRemainderCKernel | None,
+    should_continue: Callable[[], bool | None] | None = None,
 ) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    _check_circsym_continue(should_continue)
     S = static_s.copy()
     H = static_h.copy()
     n = S.shape[0]
@@ -1431,16 +1495,26 @@ def _assemble_boundary_matrices_from_geometry(
             qgeom.far,
             k,
             workers=workers,
+            should_continue=should_continue,
         )
         S += s_part
         H += h_part
     else:
-        _accumulate_far_remainder_numpy(S, H, qgeom, k, n_psi=n_psi, workers=workers)
+        _accumulate_far_remainder_numpy(
+            S,
+            H,
+            qgeom,
+            k,
+            n_psi=n_psi,
+            workers=workers,
+            should_continue=should_continue,
+        )
 
     if near_rows.size:
         s_near = np.zeros(near_rows.size, dtype=np.complex128)
         h_near = np.zeros_like(s_near)
         for part in qgeom.near_parts:
+            _check_circsym_continue(should_continue)
             if c_kernel is None:
                 s_part, h_part = _evaluate_near_remainder(part, k)
             else:
@@ -1465,12 +1539,14 @@ def _accumulate_far_remainder_numpy(
     *,
     n_psi: int,
     workers: int,
+    should_continue: Callable[[], bool | None] | None = None,
 ) -> None:
     del n_psi
     s_dyn, h_dyn = _evaluate_far_remainder_onthefly_reference(
         qgeom.far,
         k,
         workers=workers,
+        should_continue=should_continue,
     )
     S += s_dyn
     H += h_dyn
@@ -2019,6 +2095,7 @@ def _evaluate_far_remainder_onthefly_compiled(
     k: complex,
     *,
     workers: int,
+    should_continue: Callable[[], bool | None] | None = None,
 ) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
     target_rho = np.ascontiguousarray(part.target_rho, dtype=np.float64)
     target_z = np.ascontiguousarray(part.target_z, dtype=np.float64)
@@ -2036,34 +2113,48 @@ def _evaluate_far_remainder_onthefly_compiled(
     h_out = np.empty_like(s_out)
     double_ptr = ctypes.POINTER(ctypes.c_double)
     k_value = complex(k)
-    status = kernel.eval_far_onthefly(
-        ctypes.c_int64(target_count),
-        ctypes.c_int64(source_count),
-        ctypes.c_int64(line_count),
-        ctypes.c_int64(psi_count),
-        target_rho.ctypes.data_as(double_ptr),
-        target_z.ctypes.data_as(double_ptr),
-        source_rho.ctypes.data_as(double_ptr),
-        source_z.ctypes.data_as(double_ptr),
-        measure.ctypes.data_as(double_ptr),
-        normal_rho.ctypes.data_as(double_ptr),
-        normal_z.ctypes.data_as(double_ptr),
-        cos_psi.ctypes.data_as(double_ptr),
-        psi_weights.ctypes.data_as(double_ptr),
-        ctypes.c_int32(part.baffle_z is not None),
-        ctypes.c_double(0.0 if part.baffle_z is None else float(part.baffle_z)),
-        ctypes.c_double(float(k_value.real)),
-        ctypes.c_double(float(k_value.imag)),
-        s_out.ctypes.data_as(double_ptr),
-        h_out.ctypes.data_as(double_ptr),
-        ctypes.c_int32(max(1, int(workers))),
+    block_size = (
+        target_count
+        if should_continue is None
+        else max(1, min(target_count, _ASSEMBLY_KERNEL_MAX_TARGET_BLOCK))
     )
-    if int(status) != 0:
-        return _evaluate_far_remainder_onthefly_reference(
-            part,
-            k,
-            workers=workers,
+    for start in range(0, target_count, block_size):
+        _check_circsym_continue(should_continue)
+        stop = min(target_count, start + block_size)
+        target_rho_block = target_rho[start:stop]
+        target_z_block = target_z[start:stop]
+        s_block = s_out[start:stop]
+        h_block = h_out[start:stop]
+        status = kernel.eval_far_onthefly(
+            ctypes.c_int64(stop - start),
+            ctypes.c_int64(source_count),
+            ctypes.c_int64(line_count),
+            ctypes.c_int64(psi_count),
+            target_rho_block.ctypes.data_as(double_ptr),
+            target_z_block.ctypes.data_as(double_ptr),
+            source_rho.ctypes.data_as(double_ptr),
+            source_z.ctypes.data_as(double_ptr),
+            measure.ctypes.data_as(double_ptr),
+            normal_rho.ctypes.data_as(double_ptr),
+            normal_z.ctypes.data_as(double_ptr),
+            cos_psi.ctypes.data_as(double_ptr),
+            psi_weights.ctypes.data_as(double_ptr),
+            ctypes.c_int32(part.baffle_z is not None),
+            ctypes.c_double(0.0 if part.baffle_z is None else float(part.baffle_z)),
+            ctypes.c_double(float(k_value.real)),
+            ctypes.c_double(float(k_value.imag)),
+            s_block.ctypes.data_as(double_ptr),
+            h_block.ctypes.data_as(double_ptr),
+            ctypes.c_int32(max(1, min(int(workers), stop - start))),
         )
+        if int(status) != 0:
+            return _evaluate_far_remainder_onthefly_reference(
+                part,
+                k,
+                workers=workers,
+                should_continue=should_continue,
+            )
+        _check_circsym_continue(should_continue)
     return s_out, h_out
 
 
@@ -2131,6 +2222,7 @@ def _evaluate_far_remainder_onthefly_reference(
     k: complex,
     *,
     workers: int,
+    should_continue: Callable[[], bool | None] | None = None,
 ) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
     target_count = int(part.target_rho.size)
     source_count = int(part.source_rho.shape[0])
@@ -2163,15 +2255,24 @@ def _evaluate_far_remainder_onthefly_reference(
         return start, stop, s_block, h_block
 
     if workers <= 1 or len(ranges) <= 1:
-        blocks = map(compute_block, ranges)
-        for start, stop, s_block, h_block in blocks:
+        for span in ranges:
+            _check_circsym_continue(should_continue)
+            start, stop, s_block, h_block = compute_block(span)
             s_out[start:stop] = s_block
             h_out[start:stop] = h_block
+            _check_circsym_continue(should_continue)
     else:
-        with ThreadPoolExecutor(max_workers=min(workers, len(ranges))) as executor:
+        executor = ThreadPoolExecutor(max_workers=min(workers, len(ranges)))
+        try:
             for start, stop, s_block, h_block in executor.map(compute_block, ranges):
+                _check_circsym_continue(should_continue)
                 s_out[start:stop] = s_block
                 h_out[start:stop] = h_block
+        except BaseException:
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
     return s_out, h_out
 
 
@@ -2214,6 +2315,8 @@ def _build_boundary_static_geometry(
     meridian: MeridianMesh,
     geom: SimpleNamespace,
     baffle_z: float | None,
+    *,
+    should_continue: Callable[[], bool | None] | None = None,
 ) -> tuple[
     NDArray[np.complex128],
     NDArray[np.complex128],
@@ -2226,6 +2329,7 @@ def _build_boundary_static_geometry(
     H = np.empty((n, n), dtype=np.complex128)
     block_size = min(_ASSEMBLY_KERNEL_MAX_TARGET_BLOCK, n)
     for start in range(0, n, block_size):
+        _check_circsym_continue(should_continue)
         stop = min(n, start + block_size)
         s_block, h_block = _integrate_static_ordinary_segment_kernels_targets_batched(
             target_rho=geom.rho_mid[start:stop],
@@ -2239,7 +2343,9 @@ def _build_boundary_static_geometry(
         H[start:stop] = h_block
 
     near_rows, near_cols = _boundary_near_pairs(geom, source_indices)
-    for row, col in zip(near_rows, near_cols):
+    for pair_index, (row, col) in enumerate(zip(near_rows, near_cols)):
+        if pair_index % _CANCELLATION_PAIR_BLOCK == 0:
+            _check_circsym_continue(should_continue)
         S[row, col], H[row, col] = _integrate_static_segment_kernel(
             target_rho=float(geom.rho_mid[row]),
             target_z=float(geom.z_mid[row]),
@@ -2564,7 +2670,9 @@ def _build_near_remainder_geometry_parts(
     baffle_z: float | None,
     *,
     n_psi: int,
+    should_continue: Callable[[], bool | None] | None = None,
 ) -> tuple[_NearRemainderGeometry, ...]:
+    _check_circsym_continue(should_continue)
     parts = [
         _build_near_remainder_geometry(
             meridian,
@@ -2574,6 +2682,7 @@ def _build_near_remainder_geometry_parts(
             baffle_z=None,
             image=False,
             n_psi=int(n_psi),
+            should_continue=should_continue,
         )
     ]
     if baffle_z is not None:
@@ -2586,6 +2695,7 @@ def _build_near_remainder_geometry_parts(
                 baffle_z=baffle_z,
                 image=True,
                 n_psi=int(n_psi),
+                should_continue=should_continue,
             )
         )
     return tuple(parts)
@@ -2600,11 +2710,14 @@ def _build_near_remainder_geometry(
     baffle_z: float | None,
     image: bool,
     n_psi: int,
+    should_continue: Callable[[], bool | None] | None = None,
 ) -> _NearRemainderGeometry:
     psi, psi_weights = _leggauss_psi(int(n_psi))
     cos_psi = np.cos(psi)[None, :]
     counts = []
-    for row, col in zip(near_rows, near_cols):
+    for pair_index, (row, col) in enumerate(zip(near_rows, near_cols)):
+        if pair_index % _CANCELLATION_PAIR_BLOCK == 0:
+            _check_circsym_continue(should_continue)
         u, _ = _segment_quadrature_nodes(
             target_rho=float(geom.rho_mid[row]),
             target_z=float(geom.z_mid[row]),
@@ -2622,6 +2735,8 @@ def _build_near_remainder_geometry(
     psi_factor = 2.0 * psi_weights / (4.0 * np.pi)
 
     for pair_index, (row, col) in enumerate(zip(near_rows, near_cols)):
+        if pair_index % _CANCELLATION_PAIR_BLOCK == 0:
+            _check_circsym_continue(should_continue)
         target_rho = float(geom.rho_mid[row])
         target_z = float(geom.z_mid[row])
         u, w = _segment_quadrature_nodes(
@@ -2737,6 +2852,7 @@ def _assemble_coupled_ib_rayleigh_aperture_matrix(
     *,
     geom: SimpleNamespace,
     n_psi: int,
+    should_continue: Callable[[], bool | None] | None = None,
 ) -> NDArray[np.complex128]:
     """Assemble the real-k Rayleigh single-layer aperture block only.
 
@@ -2746,16 +2862,22 @@ def _assemble_coupled_ib_rayleigh_aperture_matrix(
     """
     indices = np.asarray(aperture_indices, dtype=np.int64).reshape(-1)
     targets = geom.midpoints[indices]
-    s_block, _ = _integrate_ordinary_segment_kernels_targets_batched(
-        target_rho=targets[:, 0],
-        target_z=targets[:, 1],
-        meridian=meridian,
-        geom=geom,
-        source_indices=indices,
-        k=k,
-        baffle_z=None,
-        n_psi=n_psi,
-    )
+    s_block = np.empty((indices.size, indices.size), dtype=np.complex128)
+    block_size = _assembly_target_block_size(indices.size, int(n_psi))
+    for start in range(0, indices.size, block_size):
+        _check_circsym_continue(should_continue)
+        stop = min(indices.size, start + block_size)
+        s_part, _ = _integrate_ordinary_segment_kernels_targets_batched(
+            target_rho=targets[start:stop, 0],
+            target_z=targets[start:stop, 1],
+            meridian=meridian,
+            geom=geom,
+            source_indices=indices,
+            k=k,
+            baffle_z=None,
+            n_psi=n_psi,
+        )
+        s_block[start:stop] = s_part
     far_mask = _ordinary_far_source_mask_targets(
         targets[:, 0],
         targets[:, 1],
@@ -2763,7 +2885,9 @@ def _assemble_coupled_ib_rayleigh_aperture_matrix(
         source_indices=indices,
     )
     near_rows, near_cols = np.nonzero(~far_mask)
-    for row_local, source_local in zip(near_rows, near_cols):
+    for pair_index, (row_local, source_local) in enumerate(zip(near_rows, near_cols)):
+        if pair_index % _CANCELLATION_PAIR_BLOCK == 0:
+            _check_circsym_continue(should_continue)
         s_block[row_local, source_local] = _integrate_segment_kernel(
             target_rho=float(targets[row_local, 0]),
             target_z=float(targets[row_local, 1]),
@@ -2871,15 +2995,19 @@ def _assemble_chief_matrices(
     baffle_z: float | None,
     *,
     n_psi: int,
+    should_continue: Callable[[], bool | None] | None = None,
 ) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
     pts = np.asarray(chief_points, dtype=np.float64)
     geom = meridian.segment_geometry()
     S = np.empty((pts.shape[0], meridian.segment_count), dtype=np.complex128)
     H = np.empty_like(S)
     for i, point in enumerate(pts):
+        _check_circsym_continue(should_continue)
         target_rho = float(math.hypot(float(point[0]), float(point[1])))
         target_z = float(point[2])
         for j in range(meridian.segment_count):
+            if j % _CANCELLATION_PAIR_BLOCK == 0:
+                _check_circsym_continue(should_continue)
             S[i, j], H[i, j] = _integrate_segment_kernel(
                 target_rho=target_rho,
                 target_z=target_z,
@@ -2916,6 +3044,7 @@ def _evaluate_observation_pressure(
     *,
     geom: SimpleNamespace | None = None,
     n_psi: int,
+    should_continue: Callable[[], bool | None] | None = None,
 ) -> NDArray[np.complex128]:
     if config.observation.custom_points is None:
         first = _evaluate_points_pressure(
@@ -2927,6 +3056,7 @@ def _evaluate_observation_pressure(
             config.circsym_baffle_z,
             geom=geom,
             n_psi=n_psi,
+            should_continue=should_continue,
         )
         return np.tile(first[None, :], (obs_points.shape[0], 1))
 
@@ -2941,6 +3071,7 @@ def _evaluate_observation_pressure(
             config.circsym_baffle_z,
             geom=geom,
             n_psi=n_psi,
+            should_continue=should_continue,
         )
     return out
 
@@ -2955,6 +3086,7 @@ def _evaluate_points_pressure(
     *,
     geom: SimpleNamespace | None = None,
     n_psi: int,
+    should_continue: Callable[[], bool | None] | None = None,
 ) -> NDArray[np.complex128]:
     pts = np.asarray(points, dtype=np.float64)
     if pts.ndim != 2 or pts.shape[1] != 3:
@@ -2988,6 +3120,7 @@ def _evaluate_points_pressure(
             k=k,
             baffle_z=baffle_z,
             n_psi=n_psi,
+            should_continue=should_continue,
         )
         out[active] = -(s_mat @ q_total)
         return out
@@ -3002,6 +3135,7 @@ def _evaluate_points_pressure(
         k=k,
         baffle_z=baffle_z,
         n_psi=n_psi,
+        should_continue=should_continue,
     )
     return np.asarray(h_mat @ pressure - s_mat @ q_total, dtype=np.complex128)
 
@@ -3015,6 +3149,7 @@ def _evaluate_coupled_ib_points_pressure(
     *,
     geom: SimpleNamespace | None = None,
     n_psi: int,
+    should_continue: Callable[[], bool | None] | None = None,
 ) -> NDArray[np.complex128]:
     pts = np.asarray(points, dtype=np.float64)
     if pts.ndim != 2 or pts.shape[1] != 3:
@@ -3040,6 +3175,7 @@ def _evaluate_coupled_ib_points_pressure(
         k=k,
         baffle_z=None,
         n_psi=n_psi,
+        should_continue=should_continue,
     )
     # The augmented coupling row enforces p_aperture = 2*S_R*q_aperture.
     # Evaluate the exterior Rayleigh field with that same trace convention;
@@ -3109,7 +3245,9 @@ def _integrate_field_segment_kernels_batched(
     k: complex,
     baffle_z: float | None,
     n_psi: int,
+    should_continue: Callable[[], bool | None] | None = None,
 ) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    _check_circsym_continue(should_continue)
     target_rho_arr = np.asarray(target_rho, dtype=np.float64).reshape(-1)
     target_z_arr = np.asarray(target_z, dtype=np.float64).reshape(-1)
     if target_rho_arr.shape != target_z_arr.shape:
@@ -3186,14 +3324,23 @@ def _integrate_field_segment_kernels_batched(
 
     if workers <= 1 or len(ranges) <= 1:
         for span in ranges:
+            _check_circsym_continue(should_continue)
             start, stop, s_block, h_block = compute_block(span)
             s_mat[start:stop] = s_block
             h_mat[start:stop] = h_block
+            _check_circsym_continue(should_continue)
     else:
-        with ThreadPoolExecutor(max_workers=min(workers, len(ranges))) as executor:
+        executor = ThreadPoolExecutor(max_workers=min(workers, len(ranges)))
+        try:
             for start, stop, s_block, h_block in executor.map(compute_block, ranges):
+                _check_circsym_continue(should_continue)
                 s_mat[start:stop] = s_block
                 h_mat[start:stop] = h_block
+        except BaseException:
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
     return s_mat[inverse], h_mat[inverse]
 
 

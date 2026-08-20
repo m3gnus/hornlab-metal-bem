@@ -305,8 +305,9 @@ def test_coupled_ib_complex_k_aperture_block_matches_full_assembly(monkeypatch):
         *,
         geom,
         n_psi,
+        should_continue=None,
     ):
-        del geom
+        del geom, should_continue
         full_s, _ = circsym._assemble_boundary_matrices(
             meridian,
             k,

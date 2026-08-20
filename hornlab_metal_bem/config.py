@@ -447,6 +447,11 @@ class SolveConfig:
     # any other return value, including None, continues.
     on_frequency_result: Callable[[int, float, dict], bool] | None = None
 
+    # Fine-grained CircSym cancellation checkpoint. Called within expensive
+    # assembly and field-evaluation blocks. Return exactly False to cancel;
+    # callers may instead raise their own runtime-specific cancellation exception.
+    should_continue: Callable[[], bool | None] | None = None
+
     def __post_init__(self) -> None:
         if self.freq_spacing not in {"log", "linear"}:
             raise ValueError("freq_spacing must be 'log' or 'linear'")

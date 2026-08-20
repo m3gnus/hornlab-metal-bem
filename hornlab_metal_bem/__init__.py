@@ -18,7 +18,7 @@ from .config import (
     TaperProfile,
     VelocityMode,
 )
-from .circsym import MeridianMesh
+from .circsym import CircSymCancelled, MeridianMesh
 from .field_traces import evaluate_exterior_from_traces
 from .mesh import LoadedMesh, MeshError, load_mesh
 from .observation import ObservationFrame, infer_frame
@@ -34,6 +34,7 @@ __all__ = [
     "evaluate_exterior_from_traces",
     "load_mesh",
     "MeridianMesh",
+    "CircSymCancelled",
     "SolveConfig",
     "SolveResult",
     "ObservationConfig",

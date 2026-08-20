@@ -452,6 +452,38 @@ def test_far_onthefly_compiled_matches_precomputed_reference():
             )
 
 
+def test_compiled_remainder_checks_cancellation_between_target_blocks():
+    kernel = _load_circsym_remainder_c_kernel()
+    if kernel is None:
+        pytest.skip("runtime C compiler is unavailable")
+    meridian = _sphere_meridian(radius=0.1, segments=32)
+    compact = _build_far_remainder_compact_geometry(
+        meridian,
+        meridian.segment_geometry(),
+        None,
+        n_psi=64,
+    )
+    checks = 0
+
+    def should_continue():
+        nonlocal checks
+        checks += 1
+        return checks < 3
+
+    with pytest.raises(metal_bem.CircSymCancelled, match="cancelled"):
+        _evaluate_far_remainder_onthefly_compiled(
+            kernel,
+            compact,
+            30.0 + 0.1j,
+            workers=2,
+            should_continue=should_continue,
+        )
+
+    # One check on each side of the first sixteen-target compiled block, followed
+    # by cancellation before the second block starts.
+    assert checks == 3
+
+
 def test_boundary_assembly_cache_release_and_budget_fallback(monkeypatch):
     k = 37.0 + 0.02j
     meridian = _sphere_meridian(radius=0.1, segments=9)
@@ -657,6 +689,29 @@ def test_pulsating_sphere_recovers_analytic_impedance_and_uniform_directivity():
     assert float(np.max(np.abs(result.directivity_db))) < 0.02
     np.testing.assert_allclose(result.pressure_complex[:, 0], result.pressure_complex[:, 1])
     np.testing.assert_allclose(result.pressure_complex[:, 0], result.pressure_complex[:, 2])
+
+
+def test_circsym_sweep_honors_intra_case_cancellation_callback():
+    checks = 0
+
+    def should_continue():
+        nonlocal checks
+        checks += 1
+        return checks < 5
+
+    config = SolveConfig(
+        velocity_sources={2: 1.0},
+        should_continue=should_continue,
+        observation=ObservationConfig(angle_count=3, planes=["horizontal"]),
+    )
+    with pytest.raises(metal_bem.CircSymCancelled, match="cancelled"):
+        metal_bem.solve_circsym_frequencies(
+            _sphere_meridian(radius=0.1, segments=48),
+            [4000.0],
+            config,
+        )
+
+    assert checks == 5
 
 
 def test_rigid_oscillating_sphere_matches_first_order_series():

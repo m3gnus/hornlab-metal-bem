@@ -51,6 +51,11 @@ def test_solve_config_on_frequency_result_defaults_none():
     assert cfg.on_frequency_result is None
 
 
+def test_solve_config_should_continue_defaults_none():
+    cfg = SolveConfig()
+    assert cfg.should_continue is None
+
+
 def test_solve_config_default_native_metal_controls():
     cfg = SolveConfig()
     assert cfg.formulation == BIEFormulation.STANDARD
@@ -608,10 +613,12 @@ def test_solve_config_callbacks_accept_callables():
     cfg = SolveConfig(
         progress_callback=lambda i, n, f: calls.append(("progress", i)),
         on_frequency_result=lambda i, f, log: True,
+        should_continue=lambda: True,
     )
     cfg.progress_callback(0, 5, 1000.0)
     assert calls == [("progress", 0)]
     assert cfg.on_frequency_result(0, 1000.0, {}) is True
+    assert cfg.should_continue() is True
 
 
 def test_solve_config_dense_solve_dtype_defaults_float32():
