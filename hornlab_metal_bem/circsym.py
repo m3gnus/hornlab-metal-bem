@@ -1,10 +1,11 @@
 """Axisymmetric body-of-revolution acoustic BEM solver.
 
-This module implements the Phase 1 m=0 solver as a pure NumPy/SciPy sibling to
-the 3D native Metal path. The meridian discretization uses DP0 constants on
-straight generating-curve segments with midpoint collocation. Segment integrals
-carry the full ring surface measure ``rho ds``; no ``1 / rho`` factors are
-introduced, so axis nodes are regular for m=0.
+This module implements the m=0 solver as a NumPy/SciPy sibling to the 3D native
+Metal path, with adaptive Metal acceleration for large ordinary field
+quadratures. The meridian discretization uses DP0 constants on straight
+generating-curve segments with midpoint collocation. Segment integrals carry the
+full ring surface measure ``rho ds``; no ``1 / rho`` factors are introduced, so
+axis nodes are regular for m=0.
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ import subprocess
 import tempfile
 import time
 from types import SimpleNamespace
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -81,10 +82,13 @@ _FIELD_KERNEL_BLOCK_ELEMENTS = 8_000_000
 _FIELD_KERNEL_MAX_TARGET_BLOCK = 64
 _FIELD_KERNEL_PARALLEL_TARGET_BLOCK = 8
 _FIELD_KERNEL_MAX_WORKERS = 8
+_CIRCSYM_METAL_FIELD_MIN_TERMS = 2_000_000
+_CIRCSYM_FIELD_BACKEND_ENV = "HORNLAB_CIRCSYM_FIELD_BACKEND"
 _ASSEMBLY_KERNEL_BLOCK_ELEMENTS = 3_000_000
 _ASSEMBLY_KERNEL_MAX_TARGET_BLOCK = 16
 _ASSEMBLY_KERNEL_PARALLEL_TARGET_BLOCK = 5
 _CANCELLATION_PAIR_BLOCK = 16
+_circsym_metal_field_auto_failure: str | None = None
 
 
 @dataclass
@@ -486,6 +490,12 @@ def run_sweep_circsym(
             else math.inf,
             "sphere_targets": n_sphere,
             "sphere_evaluation_targets": n_sphere_evaluation,
+            "field_backend": _circsym_field_backend_summary(
+                (n_angles, n_sphere_evaluation),
+                meridian.segment_count,
+                n_psi,
+            ),
+            "field_backend_policy": _requested_circsym_field_backend(),
             "chief_points": bool(config.chief_points is not None),
             "chief_points_count": int(chief_rows_count),
         }
@@ -833,6 +843,12 @@ def run_sweep_coupled_ib(
             "dense_solve_rcond_estimator": "lapack_gecon_1norm",
             "sphere_targets": n_sphere,
             "sphere_evaluation_targets": n_sphere_evaluation,
+            "field_backend": _circsym_field_backend_summary(
+                (n_angles, n_sphere_evaluation),
+                m,
+                n_psi,
+            ),
+            "field_backend_policy": _requested_circsym_field_backend(),
         }
         native_diagnostics.append(diagnostics)
 
@@ -3235,6 +3251,73 @@ def _axisymmetric_sphere_evaluation_targets(
     )
 
 
+def _requested_circsym_field_backend() -> str:
+    backend = os.environ.get(_CIRCSYM_FIELD_BACKEND_ENV, "auto").strip().lower()
+    if backend not in {"auto", "cpu", "metal"}:
+        raise ValueError(
+            f"{_CIRCSYM_FIELD_BACKEND_ENV} must be 'auto', 'cpu', or 'metal'"
+        )
+    return backend
+
+
+@lru_cache(maxsize=1)
+def _circsym_metal_field_runtime_status() -> Any:
+    from .metal.native import discover_native_runtime
+
+    return discover_native_runtime(run_smoke_test=True)
+
+
+def _select_circsym_field_backend(
+    target_count: int,
+    source_count: int,
+    n_psi: int,
+) -> tuple[str, Any | None]:
+    requested = _requested_circsym_field_backend()
+    if requested == "cpu":
+        return "cpu", None
+    work_terms = (
+        int(target_count) * int(source_count) * _LINE_QUAD_ORDER * int(n_psi)
+    )
+    if requested == "auto" and (
+        work_terms < _CIRCSYM_METAL_FIELD_MIN_TERMS
+        or _circsym_metal_field_auto_failure is not None
+    ):
+        return "cpu", None
+    status = _circsym_metal_field_runtime_status()
+    if status.available:
+        return "metal", status
+    if requested == "metal":
+        raise RuntimeError(
+            "CircSym Metal field backend was requested but is unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+    return "cpu", None
+
+
+def _record_circsym_metal_field_failure(exc: BaseException) -> None:
+    global _circsym_metal_field_auto_failure
+    if _circsym_metal_field_auto_failure is None:
+        _circsym_metal_field_auto_failure = str(exc)
+        logger.warning(
+            "CircSym Metal field acceleration failed; using CPU for the rest "
+            "of this process: %s",
+            exc,
+        )
+
+
+def _circsym_field_backend_summary(
+    target_counts: Iterable[int],
+    source_count: int,
+    n_psi: int,
+) -> str:
+    backends = {
+        _select_circsym_field_backend(int(count), source_count, n_psi)[0]
+        for count in target_counts
+        if int(count) > 0
+    }
+    return "+".join(sorted(backends)) or "cpu"
+
+
 def _integrate_field_segment_kernels_batched(
     *,
     target_rho: NDArray[np.float64],
@@ -3273,8 +3356,21 @@ def _integrate_field_segment_kernels_batched(
 
     s_mat = np.empty((work_rho.size, indices.size), dtype=np.complex128)
     h_mat = np.empty_like(s_mat)
-    workers = _field_kernel_worker_count(work_rho.size, indices.size)
-    block_size = _field_kernel_target_block_size(indices.size, int(n_psi))
+    field_backend, metal_runtime_status = _select_circsym_field_backend(
+        work_rho.size,
+        indices.size,
+        int(n_psi),
+    )
+    workers = (
+        1
+        if field_backend == "metal"
+        else _field_kernel_worker_count(work_rho.size, indices.size)
+    )
+    block_size = (
+        int(work_rho.size)
+        if field_backend == "metal"
+        else _field_kernel_target_block_size(indices.size, int(n_psi))
+    )
     if workers > 1:
         block_size = min(block_size, _FIELD_KERNEL_PARALLEL_TARGET_BLOCK)
     ranges = [
@@ -3297,6 +3393,8 @@ def _integrate_field_segment_kernels_batched(
             k=k,
             baffle_z=baffle_z,
             n_psi=n_psi,
+            backend=field_backend,
+            metal_runtime_status=metal_runtime_status,
         )
         near_mask = ~_ordinary_far_source_mask_targets(
             block_rho,
@@ -3394,6 +3492,8 @@ def _integrate_ordinary_field_kernels_targets_batched(
     k: complex,
     baffle_z: float | None,
     n_psi: int,
+    backend: str,
+    metal_runtime_status: Any | None,
 ) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
     indices = np.asarray(source_indices, dtype=np.int64)
     target_rho_arr = np.asarray(target_rho, dtype=np.float64).reshape(-1)
@@ -3412,6 +3512,34 @@ def _integrate_ordinary_field_kernels_targets_batched(
     delta = geom.delta[indices]
     lengths = geom.lengths[indices]
     normal = meridian.normals[indices]
+    if backend == "metal":
+        source = p0[:, None, :] + u[None, :, None] * delta[:, None, :]
+        rho_s = source[:, :, 0]
+        z_s = source[:, :, 1]
+        line_measure = rho_s * lengths[:, None] * w[None, :]
+        try:
+            from .metal.native import evaluate_circsym_ring_field_kernels
+
+            result = evaluate_circsym_ring_field_kernels(
+                target_rho=target_rho_arr,
+                target_z=target_z_arr,
+                source_rho=rho_s,
+                source_z=z_s,
+                measure=line_measure,
+                normal_rho=normal[:, 0],
+                normal_z=normal[:, 1],
+                cos_psi=np.cos(psi),
+                psi_weights=psi_weights,
+                k=k,
+                baffle_z=baffle_z,
+                runtime_status=metal_runtime_status,
+            )
+            return result.slp, result.dlp
+        except Exception as exc:
+            if _requested_circsym_field_backend() == "metal":
+                raise
+            _record_circsym_metal_field_failure(exc)
+
     normal_rho = normal[:, 0][None, :, None]
     normal_z = normal[:, 1][None, :, None]
     rt = target_rho_arr[:, None, None]
