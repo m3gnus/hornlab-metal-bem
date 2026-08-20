@@ -93,6 +93,15 @@ class MetalNativeSessionInfo:
     runtime_status: MetalNativeRuntimeStatus
 
 
+@dataclass(frozen=True)
+class CircSymMetalFieldKernels:
+    """Axisymmetric ring-integral matrices returned by the Metal helper."""
+
+    slp: NDArray[np.complex128]
+    dlp: NDArray[np.complex128]
+    diagnostics: dict[str, Any]
+
+
 def discover_native_runtime(
     config: MetalNativeRuntimeConfig | None = None,
     *,
@@ -229,6 +238,203 @@ def validate_session_with_native_helper(
     if not Path(result_path).is_file():
         raise RuntimeError(f"Swift/Metal native helper did not write {result_path}")
     return json.loads(Path(result_path).read_text(encoding="utf-8"))
+
+
+def evaluate_circsym_ring_field_kernels(
+    *,
+    target_rho: NDArray[Any],
+    target_z: NDArray[Any],
+    source_rho: NDArray[Any],
+    source_z: NDArray[Any],
+    measure: NDArray[Any],
+    normal_rho: NDArray[Any],
+    normal_z: NDArray[Any],
+    cos_psi: NDArray[Any],
+    psi_weights: NDArray[Any],
+    k: complex,
+    baffle_z: float | None = None,
+    runtime_config: MetalNativeRuntimeConfig | None = None,
+    runtime_status: MetalNativeRuntimeStatus | None = None,
+    work_dir: Path | None = None,
+    operation_id: str | None = None,
+) -> CircSymMetalFieldKernels:
+    """Evaluate ordinary CircSym S/H ring kernels on Apple Metal.
+
+    This is the parity-gated P2 primitive. It deliberately accepts compact
+    line/azimuth quadrature geometry rather than a full ``MeridianMesh`` so the
+    CPU implementation remains responsible for near-boundary replacement;
+    boundary assembly retains its exact static elliptic-integral terms.
+    """
+    from .session import (
+        BinaryArrayDescriptor,
+        CircSymRingFieldPayload,
+        read_json_manifest,
+        write_binary_array,
+        write_json_manifest,
+    )
+
+    def real_array(name: str, value: NDArray[Any], ndim: int) -> NDArray[np.float32]:
+        array = np.asarray(value)
+        if array.ndim != ndim or any(int(dim) <= 0 for dim in array.shape):
+            raise ValueError(f"{name} must be a non-empty {ndim}D array")
+        if not np.issubdtype(array.dtype, np.number) or np.iscomplexobj(array):
+            raise ValueError(f"{name} must be real numeric data")
+        if not np.all(np.isfinite(array)):
+            raise ValueError(f"{name} must contain only finite values")
+        return np.ascontiguousarray(array, dtype=np.float32)
+
+    target_rho_arr = real_array("target_rho", target_rho, 1)
+    target_z_arr = real_array("target_z", target_z, 1)
+    if target_z_arr.shape != target_rho_arr.shape:
+        raise ValueError("target_z must have the same shape as target_rho")
+    source_rho_arr = real_array("source_rho", source_rho, 2)
+    source_z_arr = real_array("source_z", source_z, 2)
+    measure_arr = real_array("measure", measure, 2)
+    if source_z_arr.shape != source_rho_arr.shape:
+        raise ValueError("source_z must have the same shape as source_rho")
+    if measure_arr.shape != source_rho_arr.shape:
+        raise ValueError("measure must have the same shape as source_rho")
+    normal_rho_arr = real_array("normal_rho", normal_rho, 1)
+    normal_z_arr = real_array("normal_z", normal_z, 1)
+    source_vector_shape = (source_rho_arr.shape[0],)
+    if normal_rho_arr.shape != source_vector_shape:
+        raise ValueError("normal_rho length must match the source count")
+    if normal_z_arr.shape != source_vector_shape:
+        raise ValueError("normal_z length must match the source count")
+    cos_psi_arr = real_array("cos_psi", cos_psi, 1)
+    psi_weights_arr = real_array("psi_weights", psi_weights, 1)
+    if psi_weights_arr.shape != cos_psi_arr.shape:
+        raise ValueError("psi_weights must have the same shape as cos_psi")
+    if np.any(target_rho_arr < 0.0) or np.any(source_rho_arr < 0.0):
+        raise ValueError("target_rho and source_rho must be non-negative")
+    if np.any(np.abs(cos_psi_arr) > 1.000001):
+        raise ValueError("cos_psi values must lie in [-1, 1]")
+
+    k_value = complex(k)
+    if not np.isfinite(k_value.real) or not np.isfinite(k_value.imag):
+        raise ValueError("k must be finite")
+    if baffle_z is not None and not np.isfinite(float(baffle_z)):
+        raise ValueError("baffle_z must be finite when provided")
+
+    status = runtime_status
+    if status is None:
+        status = assert_native_runtime_available(runtime_config, run_smoke_test=True)
+    elif not status.available:
+        raise RuntimeError(
+            "Swift/Metal native helper is unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    owns_root = work_dir is None
+    root = (
+        Path(tempfile.mkdtemp(prefix="hornlab-circsym-metal-field-"))
+        if owns_root
+        else Path(work_dir)
+    )
+    op_dir = root / (operation_id or f"circsym-field-{uuid4().hex[:12]}")
+    inputs_dir = op_dir / "inputs"
+    outputs_dir = op_dir / "outputs"
+    try:
+        values = {
+            "target_rho_f32": target_rho_arr,
+            "target_z_f32": target_z_arr,
+            "source_rho_f32": source_rho_arr,
+            "source_z_f32": source_z_arr,
+            "measure_f32": measure_arr,
+            "normal_rho_f32": normal_rho_arr,
+            "normal_z_f32": normal_z_arr,
+            "cos_psi_f32": cos_psi_arr,
+            "psi_weights_f32": psi_weights_arr,
+        }
+        inputs = {
+            name: write_binary_array(
+                value,
+                inputs_dir / f"{name}.bin",
+                dtype=np.float32,
+                relative_to=op_dir,
+            )
+            for name, value in values.items()
+        }
+        output_shape = (target_rho_arr.size, source_rho_arr.shape[0])
+        outputs = {
+            name: BinaryArrayDescriptor(
+                path=(outputs_dir / f"{name}.bin").relative_to(op_dir).as_posix(),
+                shape=output_shape,
+                dtype="float32",
+            )
+            for name in (
+                "slp_real_f32",
+                "slp_imag_f32",
+                "dlp_real_f32",
+                "dlp_imag_f32",
+            )
+        }
+        payload = CircSymRingFieldPayload(
+            k_real_f32=k_value.real,
+            k_imag_f32=k_value.imag,
+            inputs=inputs,
+            outputs=outputs,
+            baffle_z_f32=baffle_z,
+        )
+        payload_path = write_json_manifest(payload, op_dir / "request.json")
+        result_path = op_dir / "result.json"
+        command = _native_helper_command(
+            status,
+            "evaluate_circsym_ring_kernels",
+            str(payload_path),
+            str(result_path),
+        )
+        timeout_s = (runtime_config or MetalNativeRuntimeConfig()).operation_timeout_s
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=status.backend_dir,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                "Swift/Metal native helper timed out during CircSym field integration"
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(f"Failed to launch Swift/Metal native helper: {exc}") from exc
+        if completed.returncode != 0:
+            message = (
+                completed.stderr.strip()
+                or completed.stdout.strip()
+                or f"Swift helper exited with {completed.returncode}"
+            )
+            raise RuntimeError(
+                "Swift/Metal native helper failed during CircSym field integration: "
+                + message
+            )
+        if not result_path.is_file():
+            raise RuntimeError(f"Swift/Metal native helper did not write {result_path}")
+        diagnostics = read_json_manifest(result_path)
+
+        def read_complex(real_key: str, imag_key: str) -> NDArray[np.complex128]:
+            count = int(np.prod(output_shape))
+            real_path = op_dir / str(diagnostics[real_key])
+            imag_path = op_dir / str(diagnostics[imag_key])
+            real_values = np.fromfile(real_path, dtype="<f4", count=count)
+            imag_values = np.fromfile(imag_path, dtype="<f4", count=count)
+            if real_values.size != count or imag_values.size != count:
+                raise RuntimeError("CircSym Metal helper output byte count mismatch")
+            return np.asarray(
+                real_values.reshape(output_shape) + 1j * imag_values.reshape(output_shape),
+                dtype=np.complex128,
+            )
+
+        return CircSymMetalFieldKernels(
+            slp=read_complex("slp_real_f32", "slp_imag_f32"),
+            dlp=read_complex("dlp_real_f32", "dlp_imag_f32"),
+            diagnostics=diagnostics,
+        )
+    finally:
+        if owns_root:
+            shutil.rmtree(root, ignore_errors=True)
 
 
 class MetalNativeStandardSession:

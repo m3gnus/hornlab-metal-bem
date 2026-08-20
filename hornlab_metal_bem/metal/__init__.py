@@ -8,12 +8,14 @@ from .geometry import (
 )
 from .backend import DenseBieSystem, MetalBemBackend, MetalBemContext
 from .native import (
+    CircSymMetalFieldKernels,
     MetalNativeRuntimeConfig,
     MetalNativeRuntimeStatus,
     MetalNativeSessionInfo,
     MetalNativeStandardSession,
     assert_native_runtime_available,
     discover_native_runtime,
+    evaluate_circsym_ring_field_kernels,
     validate_session_with_native_helper,
 )
 from .session import (
@@ -22,6 +24,7 @@ from .session import (
     METAL_STANDARD_SCHEMA,
     AssemblyPayload,
     BinaryArrayDescriptor,
+    CircSymRingFieldPayload,
     DenseAssemblyResult,
     FieldPayload,
     FieldResult,
@@ -39,6 +42,8 @@ __all__ = [
     "METAL_STANDARD_SCHEMA",
     "AssemblyPayload",
     "BinaryArrayDescriptor",
+    "CircSymMetalFieldKernels",
+    "CircSymRingFieldPayload",
     "DenseAssemblyResult",
     "DenseBieSystem",
     "FieldPayload",
@@ -55,6 +60,7 @@ __all__ = [
     "assert_native_runtime_available",
     "build_metal_geometry_buffers",
     "discover_native_runtime",
+    "evaluate_circsym_ring_field_kernels",
     "payload_to_manifest",
     "read_json_manifest",
     "validate_session_with_native_helper",

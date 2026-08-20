@@ -3498,6 +3498,17 @@ struct MetalKernelParams {
     var hasRobin: Int32
 }
 
+struct CircSymFieldKernelParams {
+    var nTargets: Int32
+    var nSources: Int32
+    var nLine: Int32
+    var nPsi: Int32
+    var k: Float
+    var kImag: Float
+    var baffleZ: Float
+    var hasBaffle: Int32
+}
+
 let regularAssemblyMetalSource = """
 #include <metal_stdlib>
 using namespace metal;
@@ -3515,6 +3526,17 @@ struct Params {
     float k;
     float kImag;
     int hasRobin;
+};
+
+struct CircSymFieldParams {
+    int nTargets;
+    int nSources;
+    int nLine;
+    int nPsi;
+    float k;
+    float kImag;
+    float baffleZ;
+    int hasBaffle;
 };
 
 constant float qx[6] = {
@@ -4336,6 +4358,117 @@ kernel void evaluate_field_regular(
     }
     outRe[obsIdx] = acc.x;
     outIm[obsIdx] = acc.y;
+}
+
+inline void accumulate_circsym_ring_point(
+    thread float2 &slp,
+    thread float2 &dlp,
+    float targetRho,
+    float targetZ,
+    float sourceRho,
+    float sourceZ,
+    float normalRho,
+    float normalZ,
+    float measure,
+    device const float *cosPsi,
+    device const float *psiWeights,
+    constant CircSymFieldParams &params
+) {
+    for (int p = 0; p < params.nPsi; ++p) {
+        float cp = cosPsi[p];
+        float dz = sourceZ - targetZ;
+        float r2 = targetRho * targetRho + sourceRho * sourceRho
+            - 2.0f * targetRho * sourceRho * cp + dz * dz;
+        if (r2 <= 1.0e-26f) {
+            continue;
+        }
+        float r = sqrt(r2);
+        float phase = params.k * r;
+        float attenuation = params.kImag == 0.0f ? 1.0f : exp(-params.kImag * r);
+        float inv4PiR = 0.07957747154594767f / r;
+        float2 green = float2(cos(phase), sin(phase)) * (attenuation * inv4PiR);
+        float weight = 2.0f * psiWeights[p] * measure;
+        slp += green * weight;
+
+        float numerator = (sourceRho - targetRho * cp) * normalRho + dz * normalZ;
+        float2 factor = float2(-params.kImag * r - 1.0f, params.k * r);
+        float2 derivative = c_mul(green, factor) * (numerator / r2);
+        dlp += derivative * weight;
+    }
+}
+
+// Axisymmetric m=0 field integration. Each thread owns one target/source pair
+// and integrates the line and azimuth quadrature locally, avoiding atomics and
+// retaining enough independent work for typical 37 x N directivity fields.
+kernel void evaluate_circsym_ring_kernels(
+    device float *slpRe [[buffer(0)]],
+    device float *slpIm [[buffer(1)]],
+    device float *dlpRe [[buffer(2)]],
+    device float *dlpIm [[buffer(3)]],
+    device const float *targetRho [[buffer(4)]],
+    device const float *targetZ [[buffer(5)]],
+    device const float *sourceRho [[buffer(6)]],
+    device const float *sourceZ [[buffer(7)]],
+    device const float *measure [[buffer(8)]],
+    device const float *normalRho [[buffer(9)]],
+    device const float *normalZ [[buffer(10)]],
+    device const float *cosPsi [[buffer(11)]],
+    device const float *psiWeights [[buffer(12)]],
+    constant CircSymFieldParams &params [[buffer(13)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    int pairCount = params.nTargets * params.nSources;
+    if (gid >= uint(pairCount)) {
+        return;
+    }
+    int pair = int(gid);
+    int targetIndex = pair / params.nSources;
+    int sourceIndex = pair - targetIndex * params.nSources;
+    float2 slp = float2(0.0f, 0.0f);
+    float2 dlp = float2(0.0f, 0.0f);
+    for (int line = 0; line < params.nLine; ++line) {
+        int sourceLineIndex = sourceIndex * params.nLine + line;
+        float sourceRhoValue = sourceRho[sourceLineIndex];
+        float sourceZValue = sourceZ[sourceLineIndex];
+        float measureValue = measure[sourceLineIndex];
+        if (measureValue == 0.0f) {
+            continue;
+        }
+        accumulate_circsym_ring_point(
+            slp,
+            dlp,
+            targetRho[targetIndex],
+            targetZ[targetIndex],
+            sourceRhoValue,
+            sourceZValue,
+            normalRho[sourceIndex],
+            normalZ[sourceIndex],
+            measureValue,
+            cosPsi,
+            psiWeights,
+            params
+        );
+        if (params.hasBaffle != 0) {
+            accumulate_circsym_ring_point(
+                slp,
+                dlp,
+                targetRho[targetIndex],
+                targetZ[targetIndex],
+                sourceRhoValue,
+                2.0f * params.baffleZ - sourceZValue,
+                normalRho[sourceIndex],
+                -normalZ[sourceIndex],
+                measureValue,
+                cosPsi,
+                psiWeights,
+                params
+            );
+        }
+    }
+    slpRe[pair] = slp.x;
+    slpIm[pair] = slp.y;
+    dlpRe[pair] = dlp.x;
+    dlpIm[pair] = dlp.y;
 }
 
 inline float ref_x(int local) {
@@ -10292,6 +10425,252 @@ func evaluateStandardExteriorBatch(
     try writeJSON(resultPath, result)
 }
 
+func evaluateCircSymRingKernels(
+    payloadPath: String,
+    resultPath: String
+) throws {
+    let payload = try loadJSON(payloadPath)
+    if try requireString(payload, "schema") != schema {
+        try fail("unsupported schema")
+    }
+    if try requireString(payload, "op") != "evaluate_circsym_ring_kernels" {
+        try fail("expected evaluate_circsym_ring_kernels op")
+    }
+    let root = URL(fileURLWithPath: payloadPath).deletingLastPathComponent().path
+    let inputs = try requireObject(payload, "inputs")
+    let outputs = try requireObject(payload, "outputs")
+
+    let targetRhoDesc = try requireObject(inputs, "target_rho_f32")
+    let targetZDesc = try requireObject(inputs, "target_z_f32")
+    let sourceRhoDesc = try requireObject(inputs, "source_rho_f32")
+    let sourceZDesc = try requireObject(inputs, "source_z_f32")
+    let measureDesc = try requireObject(inputs, "measure_f32")
+    let normalRhoDesc = try requireObject(inputs, "normal_rho_f32")
+    let normalZDesc = try requireObject(inputs, "normal_z_f32")
+    let cosPsiDesc = try requireObject(inputs, "cos_psi_f32")
+    let psiWeightsDesc = try requireObject(inputs, "psi_weights_f32")
+
+    let targetShape = try validateDescriptor(
+        targetRhoDesc,
+        name: "inputs.target_rho_f32",
+        dtype: "float32",
+        rank: 1
+    )
+    let nTargets = targetShape[0]
+    try validateDescriptor(
+        targetZDesc,
+        name: "inputs.target_z_f32",
+        dtype: "float32",
+        shape: targetShape
+    )
+    let sourceShape = try validateDescriptor(
+        sourceRhoDesc,
+        name: "inputs.source_rho_f32",
+        dtype: "float32",
+        rank: 2
+    )
+    let nSources = sourceShape[0]
+    let nLine = sourceShape[1]
+    for (name, descriptor) in [
+        ("inputs.source_z_f32", sourceZDesc),
+        ("inputs.measure_f32", measureDesc),
+    ] {
+        try validateDescriptor(
+            descriptor,
+            name: name,
+            dtype: "float32",
+            shape: sourceShape
+        )
+    }
+    for (name, descriptor) in [
+        ("inputs.normal_rho_f32", normalRhoDesc),
+        ("inputs.normal_z_f32", normalZDesc),
+    ] {
+        try validateDescriptor(
+            descriptor,
+            name: name,
+            dtype: "float32",
+            shape: [nSources]
+        )
+    }
+    let psiShape = try validateDescriptor(
+        cosPsiDesc,
+        name: "inputs.cos_psi_f32",
+        dtype: "float32",
+        rank: 1
+    )
+    let nPsi = psiShape[0]
+    try validateDescriptor(
+        psiWeightsDesc,
+        name: "inputs.psi_weights_f32",
+        dtype: "float32",
+        shape: psiShape
+    )
+    let outputShape = [nTargets, nSources]
+    let slpReDesc = try requireObject(outputs, "slp_real_f32")
+    let slpImDesc = try requireObject(outputs, "slp_imag_f32")
+    let dlpReDesc = try requireObject(outputs, "dlp_real_f32")
+    let dlpImDesc = try requireObject(outputs, "dlp_imag_f32")
+    for (name, descriptor) in [
+        ("outputs.slp_real_f32", slpReDesc),
+        ("outputs.slp_imag_f32", slpImDesc),
+        ("outputs.dlp_real_f32", dlpReDesc),
+        ("outputs.dlp_imag_f32", dlpImDesc),
+    ] {
+        try validateDescriptor(
+            descriptor,
+            name: name,
+            dtype: "float32",
+            shape: outputShape
+        )
+    }
+
+    let targetRhoValues = try readF32(
+        try descriptorPath(root: root, descriptor: targetRhoDesc),
+        expectedCount: nTargets
+    )
+    let targetZValues = try readF32(
+        try descriptorPath(root: root, descriptor: targetZDesc),
+        expectedCount: nTargets
+    )
+    let sourceValueCount = nSources * nLine
+    let sourceRhoValues = try readF32(
+        try descriptorPath(root: root, descriptor: sourceRhoDesc),
+        expectedCount: sourceValueCount
+    )
+    let sourceZValues = try readF32(
+        try descriptorPath(root: root, descriptor: sourceZDesc),
+        expectedCount: sourceValueCount
+    )
+    let measureValues = try readF32(
+        try descriptorPath(root: root, descriptor: measureDesc),
+        expectedCount: sourceValueCount
+    )
+    let normalRhoValues = try readF32(
+        try descriptorPath(root: root, descriptor: normalRhoDesc),
+        expectedCount: nSources
+    )
+    let normalZValues = try readF32(
+        try descriptorPath(root: root, descriptor: normalZDesc),
+        expectedCount: nSources
+    )
+    let cosPsiValues = try readF32(
+        try descriptorPath(root: root, descriptor: cosPsiDesc),
+        expectedCount: nPsi
+    )
+    let psiWeightsValues = try readF32(
+        try descriptorPath(root: root, descriptor: psiWeightsDesc),
+        expectedCount: nPsi
+    )
+
+    let start = CFAbsoluteTimeGetCurrent()
+    let device = try MetalWarmup.shared.device()
+    guard let commandQueue = device.makeCommandQueue() else {
+        try fail("failed to create CircSym Metal command queue")
+    }
+    let libraryLoad = try assemblyLibrary(device: device)
+    guard let function = libraryLoad.library.makeFunction(
+        name: "evaluate_circsym_ring_kernels"
+    ) else {
+        try fail("failed to load resident Metal kernel evaluate_circsym_ring_kernels")
+    }
+    let pipeline = try device.makeComputePipelineState(function: function)
+    let pairCount = nTargets * nSources
+    let slpRe = try makeOutputBuffer(device, count: pairCount, label: "circsym_slp_re")
+    let slpIm = try makeOutputBuffer(device, count: pairCount, label: "circsym_slp_im")
+    let dlpRe = try makeOutputBuffer(device, count: pairCount, label: "circsym_dlp_re")
+    let dlpIm = try makeOutputBuffer(device, count: pairCount, label: "circsym_dlp_im")
+    let targetRho = try makeBuffer(device, targetRhoValues, label: "circsym_target_rho")
+    let targetZ = try makeBuffer(device, targetZValues, label: "circsym_target_z")
+    let sourceRho = try makeBuffer(device, sourceRhoValues, label: "circsym_source_rho")
+    let sourceZ = try makeBuffer(device, sourceZValues, label: "circsym_source_z")
+    let measure = try makeBuffer(device, measureValues, label: "circsym_measure")
+    let normalRho = try makeBuffer(device, normalRhoValues, label: "circsym_normal_rho")
+    let normalZ = try makeBuffer(device, normalZValues, label: "circsym_normal_z")
+    let cosPsi = try makeBuffer(device, cosPsiValues, label: "circsym_cos_psi")
+    let psiWeights = try makeBuffer(device, psiWeightsValues, label: "circsym_psi_weights")
+    let baffleValue = (payload["baffle_z_f32"] as? NSNumber)?.floatValue
+    var params = CircSymFieldKernelParams(
+        nTargets: Int32(nTargets),
+        nSources: Int32(nSources),
+        nLine: Int32(nLine),
+        nPsi: Int32(nPsi),
+        k: Float(try requireDouble(payload, "k_real_f32")),
+        kImag: Float(try optionalDouble(payload, "k_imag_f32", default: 0.0)),
+        baffleZ: baffleValue ?? 0.0,
+        hasBaffle: baffleValue == nil ? 0 : 1
+    )
+
+    guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+        try fail("failed to create CircSym Metal command buffer")
+    }
+    guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+        try fail("failed to create CircSym Metal encoder")
+    }
+    encoder.setBuffer(slpRe, offset: 0, index: 0)
+    encoder.setBuffer(slpIm, offset: 0, index: 1)
+    encoder.setBuffer(dlpRe, offset: 0, index: 2)
+    encoder.setBuffer(dlpIm, offset: 0, index: 3)
+    encoder.setBuffer(targetRho, offset: 0, index: 4)
+    encoder.setBuffer(targetZ, offset: 0, index: 5)
+    encoder.setBuffer(sourceRho, offset: 0, index: 6)
+    encoder.setBuffer(sourceZ, offset: 0, index: 7)
+    encoder.setBuffer(measure, offset: 0, index: 8)
+    encoder.setBuffer(normalRho, offset: 0, index: 9)
+    encoder.setBuffer(normalZ, offset: 0, index: 10)
+    encoder.setBuffer(cosPsi, offset: 0, index: 11)
+    encoder.setBuffer(psiWeights, offset: 0, index: 12)
+    encoder.setBytes(
+        &params,
+        length: MemoryLayout<CircSymFieldKernelParams>.stride,
+        index: 13
+    )
+    let dispatch = try dispatch1D(
+        encoder: encoder,
+        pipeline: pipeline,
+        count: pairCount,
+        kernel: "field"
+    )
+    encoder.endEncoding()
+    commandBuffer.commit()
+    commandBuffer.waitUntilCompleted()
+    if let error = commandBuffer.error {
+        try fail("CircSym Metal field integration failed: \(error)")
+    }
+
+    try writeF32(
+        try descriptorPath(root: root, descriptor: slpReDesc),
+        readFloatBuffer(slpRe, count: pairCount)
+    )
+    try writeF32(
+        try descriptorPath(root: root, descriptor: slpImDesc),
+        readFloatBuffer(slpIm, count: pairCount)
+    )
+    try writeF32(
+        try descriptorPath(root: root, descriptor: dlpReDesc),
+        readFloatBuffer(dlpRe, count: pairCount)
+    )
+    try writeF32(
+        try descriptorPath(root: root, descriptor: dlpImDesc),
+        readFloatBuffer(dlpIm, count: pairCount)
+    )
+    try writeJSON(resultPath, [
+        "schema": schema,
+        "op": "evaluate_circsym_ring_kernels_result",
+        "implementation": "swift_native_metal_circsym_ring_field",
+        "shape": outputShape,
+        "slp_real_f32": try requireString(slpReDesc, "path"),
+        "slp_imag_f32": try requireString(slpImDesc, "path"),
+        "dlp_real_f32": try requireString(dlpReDesc, "path"),
+        "dlp_imag_f32": try requireString(dlpImDesc, "path"),
+        "field_seconds": CFAbsoluteTimeGetCurrent() - start,
+        "metal_library_seconds": libraryLoad.seconds,
+        "metal_library_source": libraryLoad.source,
+        "metal_dispatch": dispatch,
+        "baffle_image": baffleValue != nil,
+    ])
+}
+
 func smoke() throws {
     let device = try MetalWarmup.shared.device()
     // Exercise assembly-library discovery as part of readiness. This catches
@@ -10373,6 +10752,14 @@ func main(_ args: [String]) throws {
             sessionManifestPath: args[1],
             payloadPath: args[2],
             resultPath: args[3]
+        )
+    } else if op == "evaluate_circsym_ring_kernels" {
+        guard args.count == 3 else {
+            try fail("usage: HornlabMetalBemNative.swift evaluate_circsym_ring_kernels <payload.json> <result.json>")
+        }
+        try evaluateCircSymRingKernels(
+            payloadPath: args[1],
+            resultPath: args[2]
         )
     } else {
         try fail("unsupported operation: \(op)")

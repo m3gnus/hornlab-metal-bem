@@ -296,6 +296,40 @@ class BatchFieldPayload:
 
 
 @dataclass(frozen=True)
+class CircSymRingFieldPayload:
+    """One parity-gated axisymmetric ring-quadrature Metal request."""
+
+    k_real_f32: float
+    k_imag_f32: float
+    inputs: dict[str, BinaryArrayDescriptor]
+    outputs: dict[str, BinaryArrayDescriptor]
+    baffle_z_f32: float | None = None
+    schema: str = METAL_STANDARD_SCHEMA
+    op: str = "evaluate_circsym_ring_kernels"
+    index_base: int = INDEX_BASE
+
+    def to_manifest(self) -> dict[str, Any]:
+        manifest: dict[str, Any] = {
+            "schema": self.schema,
+            "op": self.op,
+            "index_base": self.index_base,
+            "k_real_f32": float(np.float32(self.k_real_f32)),
+            "k_imag_f32": float(np.float32(self.k_imag_f32)),
+            "inputs": {
+                key: descriptor.to_manifest()
+                for key, descriptor in self.inputs.items()
+            },
+            "outputs": {
+                key: descriptor.to_manifest()
+                for key, descriptor in self.outputs.items()
+            },
+        }
+        if self.baffle_z_f32 is not None:
+            manifest["baffle_z_f32"] = float(np.float32(self.baffle_z_f32))
+        return manifest
+
+
+@dataclass(frozen=True)
 class DenseAssemblyResult:
     """Dense matrix/RHS result descriptor returned by packaged helpers."""
 
@@ -545,6 +579,8 @@ def _validate_manifest_contract(manifest: dict[str, Any]) -> None:
         _validate_field_manifest(manifest)
     elif op == "evaluate_standard_exterior_batch":
         _validate_batch_field_manifest(manifest)
+    elif op == "evaluate_circsym_ring_kernels":
+        _validate_circsym_ring_field_manifest(manifest)
     else:
         raise ValueError(f"Unsupported Metal session op: {op!r}")
 
@@ -926,6 +962,102 @@ def _validate_batch_assembly_solve_field_manifest(manifest: dict[str, Any]) -> N
 
 def _validate_field_manifest(manifest: dict[str, Any]) -> None:
     _validate_field_case_manifest(manifest)
+
+
+def _validate_circsym_ring_field_manifest(manifest: dict[str, Any]) -> None:
+    for name in ("k_real_f32", "k_imag_f32"):
+        value = manifest.get(name)
+        if not isinstance(value, (int, float)) or not np.isfinite(value):
+            raise ValueError(f"{name} must be finite")
+    baffle_z = manifest.get("baffle_z_f32")
+    if baffle_z is not None and (
+        not isinstance(baffle_z, (int, float)) or not np.isfinite(baffle_z)
+    ):
+        raise ValueError("baffle_z_f32 must be finite when provided")
+
+    inputs = _require_descriptor_group(
+        manifest.get("inputs"),
+        name="inputs",
+        keys=(
+            "target_rho_f32",
+            "target_z_f32",
+            "source_rho_f32",
+            "source_z_f32",
+            "measure_f32",
+            "normal_rho_f32",
+            "normal_z_f32",
+            "cos_psi_f32",
+            "psi_weights_f32",
+        ),
+    )
+    target_shape = _validate_descriptor(
+        inputs["target_rho_f32"],
+        name="inputs.target_rho_f32",
+        dtype="float32",
+        rank=1,
+    )
+    _validate_descriptor(
+        inputs["target_z_f32"],
+        name="inputs.target_z_f32",
+        dtype="float32",
+        shape=target_shape,
+    )
+    source_shape = _validate_descriptor(
+        inputs["source_rho_f32"],
+        name="inputs.source_rho_f32",
+        dtype="float32",
+        rank=2,
+    )
+    for name in ("source_z_f32", "measure_f32"):
+        _validate_descriptor(
+            inputs[name],
+            name=f"inputs.{name}",
+            dtype="float32",
+            shape=source_shape,
+        )
+    for name in ("normal_rho_f32", "normal_z_f32"):
+        _validate_descriptor(
+            inputs[name],
+            name=f"inputs.{name}",
+            dtype="float32",
+            shape=(source_shape[0],),
+        )
+    psi_shape = _validate_descriptor(
+        inputs["cos_psi_f32"],
+        name="inputs.cos_psi_f32",
+        dtype="float32",
+        rank=1,
+    )
+    _validate_descriptor(
+        inputs["psi_weights_f32"],
+        name="inputs.psi_weights_f32",
+        dtype="float32",
+        shape=psi_shape,
+    )
+
+    outputs = _require_descriptor_group(
+        manifest.get("outputs"),
+        name="outputs",
+        keys=(
+            "slp_real_f32",
+            "slp_imag_f32",
+            "dlp_real_f32",
+            "dlp_imag_f32",
+        ),
+    )
+    output_shape = (target_shape[0], source_shape[0])
+    for name in (
+        "slp_real_f32",
+        "slp_imag_f32",
+        "dlp_real_f32",
+        "dlp_imag_f32",
+    ):
+        _validate_descriptor(
+            outputs[name],
+            name=f"outputs.{name}",
+            dtype="float32",
+            shape=output_shape,
+        )
 
 
 def _validate_field_case_manifest(manifest: dict[str, Any]) -> None:
