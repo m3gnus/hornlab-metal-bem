@@ -44,6 +44,7 @@ from hornlab_metal_bem.config import (
     TaperProfile,
     VelocityMode,
 )
+from hornlab_metal_bem.observation import ObservationFrame
 
 
 def _sphere_meridian(radius: float = 0.1, segments: int = 48) -> MeridianMesh:
@@ -767,6 +768,47 @@ def test_pulsating_sphere_recovers_analytic_impedance_and_uniform_directivity():
     assert float(np.max(np.abs(result.directivity_db))) < 0.02
     np.testing.assert_allclose(result.pressure_complex[:, 0], result.pressure_complex[:, 1])
     np.testing.assert_allclose(result.pressure_complex[:, 0], result.pressure_complex[:, 2])
+
+
+def test_circsym_honors_explicit_observation_frame_override():
+    radius = 0.1
+    origin = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+    frame = ObservationFrame(
+        axis=np.array([0.0, 0.0, 1.0], dtype=np.float64),
+        origin=origin,
+        u=np.array([1.0, 0.0, 0.0], dtype=np.float64),
+        v=np.array([0.0, 1.0, 0.0], dtype=np.float64),
+        mouth_center=origin,
+        source_center=origin,
+    )
+    config = SolveConfig(
+        velocity_sources={2: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        frame_override=frame,
+        observation=ObservationConfig(
+            distance_m=2.0,
+            angle_min_deg=0.0,
+            angle_max_deg=180.0,
+            angle_count=5,
+            planes=["horizontal"],
+            origin="mouth",
+        ),
+    )
+
+    result = metal_bem.solve_circsym_frequencies(
+        _sphere_meridian(radius=radius, segments=32),
+        [1200.0],
+        config,
+    )
+
+    distances = np.linalg.norm(result.observation_points[0] - origin, axis=1)
+    np.testing.assert_allclose(distances, 2.0, rtol=0.0, atol=1.0e-12)
+    np.testing.assert_allclose(
+        result.observation_points[0, 0], [0.0, 0.0, 2.0], atol=1.0e-12
+    )
+    np.testing.assert_allclose(
+        result.observation_points[0, -1], [0.0, 0.0, -2.0], atol=1.0e-12
+    )
 
 
 def test_circsym_sweep_honors_intra_case_cancellation_callback():

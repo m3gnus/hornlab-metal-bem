@@ -27,4 +27,5 @@ jobs:
           tests/test_circsym_ib.py
           tests/test_circsym_cross_os_golden.py
           tests/test_native_coupled_ib_validation.py
+          tests/test_sphere_grid_native.py
           -q

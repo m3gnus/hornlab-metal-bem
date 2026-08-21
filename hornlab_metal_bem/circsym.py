@@ -1016,6 +1016,13 @@ def _infer_circsym_frame(
     meridian: MeridianMesh,
     config: SolveConfig,
 ) -> ObservationFrame:
+    # Match the full-3D solver contract: a caller-supplied frame is
+    # authoritative.  This is required for solver-to-solver parity and for
+    # geometries (such as a fully driven closed body) whose source centroid is
+    # not the intended acoustic measurement origin.
+    if config.frame_override is not None:
+        return config.frame_override
+
     geom = meridian.segment_geometry()
     axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
     source_tags = {int(tag) for tag in config.velocity_sources}
