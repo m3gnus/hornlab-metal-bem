@@ -335,7 +335,7 @@ def test_native_coupled_ib_straight_circular_channel_matches_circsym(
     native_directivity = native_result.directivity_db[:, 0, :]
     circsym_directivity = circsym_result.directivity_db[:, 0, :]
     max_error_db = float(
-        np.max(np.abs(native_directivity[:, :-1] - circsym_directivity[:, :-1]))
+        np.max(np.abs(native_directivity - circsym_directivity))
     )
 
     assert all(entry.get("coupled_ib") is True for entry in native_result.native_diagnostics)
@@ -344,7 +344,7 @@ def test_native_coupled_ib_straight_circular_channel_matches_circsym(
         for entry in native_result.native_diagnostics
     )
     assert native_directivity[:, -1].min() > -20.0
-    assert max_error_db < 1.0
+    assert max_error_db < 0.05
 
 
 def test_native_coupled_ib_deep_circular_channel_matches_circsym(
@@ -399,11 +399,11 @@ def test_native_coupled_ib_deep_circular_channel_matches_circsym(
     native_directivity = native_result.directivity_db[:, 0, :]
     circsym_directivity = circsym_result.directivity_db[:, 0, :]
     max_error_db = float(
-        np.max(np.abs(native_directivity[:, :-1] - circsym_directivity[:, :-1]))
+        np.max(np.abs(native_directivity - circsym_directivity))
     )
 
     assert all(entry.get("coupled_ib") is True for entry in native_result.native_diagnostics)
-    assert max_error_db < 1.0
+    assert max_error_db < 0.8
 
 
 # ---------------------------------------------------------------------------
