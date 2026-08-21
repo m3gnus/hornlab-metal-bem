@@ -17,6 +17,7 @@ import hashlib
 import logging
 import math
 import os
+import platform
 import subprocess
 import tempfile
 import time
@@ -90,12 +91,15 @@ _CIRCSYM_METAL_FIELD_MIN_TERMS = 2_000_000
 _CIRCSYM_FIELD_BACKEND_ENV = "HORNLAB_CIRCSYM_FIELD_BACKEND"
 _CIRCSYM_METAL_ASSEMBLY_MIN_TERMS = 80_000_000
 _CIRCSYM_ASSEMBLY_BACKEND_ENV = "HORNLAB_CIRCSYM_ASSEMBLY_BACKEND"
+_CIRCSYM_CPU_REMAINDER_BACKEND_ENV = "HORNLAB_CIRCSYM_CPU_REMAINDER_BACKEND"
 _ASSEMBLY_KERNEL_BLOCK_ELEMENTS = 3_000_000
 _ASSEMBLY_KERNEL_MAX_TARGET_BLOCK = 16
 _ASSEMBLY_KERNEL_PARALLEL_TARGET_BLOCK = 5
 _CANCELLATION_PAIR_BLOCK = 16
 _circsym_metal_field_auto_failure: str | None = None
 _circsym_metal_assembly_auto_failure: str | None = None
+_circsym_c_kernel_failure: str | None = None
+_circsym_numba_kernel_failure: str | None = None
 
 
 @dataclass
@@ -476,14 +480,16 @@ def run_sweep_circsym(
             meridian.segment_count,
             n_psi,
         )[0]
+        cpu_remainder = _circsym_cpu_remainder_status()
         diagnostics = {
             "assembly_implementation": (
                 "circsym_cpu_static_metal_remainder_dp0_m0"
                 if assembly_backend == "metal"
-                else "circsym_python_dp0_m0"
+                else f"circsym_{cpu_remainder['selected']}_dp0_m0"
             ),
             "assembly_backend": assembly_backend,
             "assembly_backend_policy": _requested_circsym_assembly_backend(),
+            "cpu_remainder": cpu_remainder,
             "circsym": True,
             "m_mode": 0,
             "azimuth_quadrature_points": int(n_psi),
@@ -849,16 +855,18 @@ def run_sweep_coupled_ib(
             meridian.segment_count,
             n_psi,
         )[0]
+        cpu_remainder = _circsym_cpu_remainder_status()
         diagnostics = {
             "circsym": True,
             "coupled_ib": True,
             "assembly_implementation": (
                 "circsym_cpu_static_metal_remainder_dp0_m0_coupled_ib"
                 if assembly_backend == "metal"
-                else "circsym_python_dp0_m0_coupled_ib"
+                else f"circsym_{cpu_remainder['selected']}_dp0_m0_coupled_ib"
             ),
             "assembly_backend": assembly_backend,
             "assembly_backend_policy": _requested_circsym_assembly_backend(),
+            "cpu_remainder": cpu_remainder,
             "m_mode": 0,
             "aperture_tag": int(aperture_tag),
             "aperture_segments": int(m),
@@ -1008,6 +1016,13 @@ def _infer_circsym_frame(
     meridian: MeridianMesh,
     config: SolveConfig,
 ) -> ObservationFrame:
+    # Match the full-3D solver contract: a caller-supplied frame is
+    # authoritative.  This is required for solver-to-solver parity and for
+    # geometries (such as a fully driven closed body) whose source centroid is
+    # not the intended acoustic measurement origin.
+    if config.frame_override is not None:
+        return config.frame_override
+
     geom = meridian.segment_geometry()
     axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
     source_tags = {int(tag) for tag in config.velocity_sources}
@@ -1405,7 +1420,7 @@ class _BoundaryAssemblyGeometryCache:
             return None
         if self._remaining_uses is not None and n_psi_int in self._exhausted_n_psi:
             return None
-        c_kernel = _load_circsym_remainder_c_kernel()
+        remainder_kernel = _load_circsym_remainder_kernel()
 
         try:
             static_s, static_h, near_rows, near_cols = self._static_geometry(
@@ -1425,7 +1440,7 @@ class _BoundaryAssemblyGeometryCache:
                 qgeom,
                 k,
                 n_psi=n_psi_int,
-                c_kernel=c_kernel,
+                remainder_kernel=remainder_kernel,
                 should_continue=should_continue,
             )
         except MemoryError:
@@ -1525,7 +1540,7 @@ def _assemble_boundary_matrices_from_geometry(
     k: complex,
     *,
     n_psi: int,
-    c_kernel: _CircsymRemainderCKernel | None,
+    remainder_kernel: _CircsymRemainderKernel | None,
     should_continue: Callable[[], bool | None] | None = None,
 ) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
     _check_circsym_continue(should_continue)
@@ -1554,9 +1569,9 @@ def _assemble_boundary_matrices_from_geometry(
                 raise
             _record_circsym_metal_assembly_failure(exc)
     if not far_complete:
-        if c_kernel is not None:
-            s_part, h_part = _evaluate_far_remainder_onthefly_compiled(
-                c_kernel,
+        if remainder_kernel is not None:
+            s_part, h_part = _evaluate_far_remainder_with_kernel(
+                remainder_kernel,
                 qgeom.far,
                 k,
                 workers=workers,
@@ -1580,11 +1595,11 @@ def _assemble_boundary_matrices_from_geometry(
         h_near = np.zeros_like(s_near)
         for part in qgeom.near_parts:
             _check_circsym_continue(should_continue)
-            if c_kernel is None:
+            if remainder_kernel is None:
                 s_part, h_part = _evaluate_near_remainder(part, k)
             else:
-                s_part, h_part = _evaluate_near_remainder_compiled(
-                    c_kernel,
+                s_part, h_part = _evaluate_near_remainder_with_kernel(
+                    remainder_kernel,
                     part,
                     k,
                     workers=workers,
@@ -2118,18 +2133,32 @@ class _CircsymRemainderCKernel:
         self.eval_near.restype = ctypes.c_int
 
 
+@dataclass(frozen=True)
+class _CircsymRemainderKernel:
+    backend: str
+    implementation: Any
+
+
 @lru_cache(maxsize=1)
 def _load_circsym_remainder_c_kernel() -> _CircsymRemainderCKernel | None:
+    global _circsym_c_kernel_failure
     if os.environ.get("HORNLAB_CIRCSYM_DISABLE_C_REMAINDER_KERNEL"):
+        _circsym_c_kernel_failure = "disabled by HORNLAB_CIRCSYM_DISABLE_C_REMAINDER_KERNEL"
+        return None
+    if platform.system() == "Windows":
+        _circsym_c_kernel_failure = (
+            "the legacy runtime C kernel requires a POSIX compiler and pthreads"
+        )
         return None
     cc = os.environ.get("CC", "cc")
     source_hash = hashlib.sha256(_CIRCSYM_REMAINDER_C_SOURCE.encode("utf-8")).hexdigest()[:16]
     cache_dir = os.path.join(tempfile.gettempdir(), "hornlab-metal-bem-circsym")
     try:
         os.makedirs(cache_dir, exist_ok=True)
-    except OSError:
+    except OSError as exc:
+        _circsym_c_kernel_failure = f"could not create the kernel cache: {exc}"
         return None
-    platform_name = os.uname().sysname.lower() if hasattr(os, "uname") else ""
+    platform_name = platform.system().lower()
     lib_ext = ".dylib" if platform_name == "darwin" else ".so"
     source_path = os.path.join(cache_dir, f"circsym_remainder_{source_hash}.c")
     library_path = os.path.join(cache_dir, f"circsym_remainder_{source_hash}{lib_ext}")
@@ -2145,13 +2174,87 @@ def _load_circsym_remainder_c_kernel() -> _CircsymRemainderCKernel | None:
             command.extend([source_path, "-o", library_path, "-lm", "-pthread"])
             subprocess.run(command, check=True, capture_output=True, text=True)
         except Exception as exc:
+            _circsym_c_kernel_failure = str(exc)
             logger.debug("CircSym C remainder kernel unavailable: %s", exc)
             return None
     try:
-        return _CircsymRemainderCKernel(library_path)
+        kernel = _CircsymRemainderCKernel(library_path)
+        _circsym_c_kernel_failure = None
+        return kernel
     except Exception as exc:
+        _circsym_c_kernel_failure = str(exc)
         logger.debug("CircSym C remainder kernel load failed: %s", exc)
         return None
+
+
+@lru_cache(maxsize=1)
+def _load_circsym_remainder_numba_kernel() -> Any | None:
+    global _circsym_numba_kernel_failure
+    try:
+        from . import _circsym_numba
+    except Exception as exc:
+        _circsym_numba_kernel_failure = str(exc)
+        logger.debug("CircSym Numba remainder kernel unavailable: %s", exc)
+        return None
+    _circsym_numba_kernel_failure = None
+    return _circsym_numba
+
+
+def _requested_circsym_cpu_remainder_backend() -> str:
+    backend = os.environ.get(
+        _CIRCSYM_CPU_REMAINDER_BACKEND_ENV,
+        "auto",
+    ).strip().lower()
+    if backend not in {"auto", "c", "numba", "numpy"}:
+        raise ValueError(
+            f"{_CIRCSYM_CPU_REMAINDER_BACKEND_ENV} must be 'auto', 'c', "
+            "'numba', or 'numpy'"
+        )
+    return backend
+
+
+@lru_cache(maxsize=1)
+def _load_circsym_remainder_kernel() -> _CircsymRemainderKernel | None:
+    requested = _requested_circsym_cpu_remainder_backend()
+    if requested == "numpy":
+        return None
+
+    if requested in {"auto", "c"}:
+        c_kernel = _load_circsym_remainder_c_kernel()
+        if c_kernel is not None:
+            return _CircsymRemainderKernel("c", c_kernel)
+        if requested == "c":
+            raise RuntimeError(
+                "CircSym C remainder backend was requested but is unavailable: "
+                + (_circsym_c_kernel_failure or "unknown load failure")
+            )
+
+    numba_kernel = _load_circsym_remainder_numba_kernel()
+    if numba_kernel is not None:
+        return _CircsymRemainderKernel("numba", numba_kernel)
+    if requested == "numba":
+        raise RuntimeError(
+            "CircSym Numba remainder backend was requested but is unavailable: "
+            + (_circsym_numba_kernel_failure or "unknown import failure")
+        )
+
+    logger.warning(
+        "CircSym compiled CPU remainder kernels are unavailable; using the "
+        "slower NumPy reference path (C: %s; Numba: %s)",
+        _circsym_c_kernel_failure or "not available",
+        _circsym_numba_kernel_failure or "not available",
+    )
+    return None
+
+
+def _circsym_cpu_remainder_status() -> dict[str, Any]:
+    kernel = _load_circsym_remainder_kernel()
+    return {
+        "policy": _requested_circsym_cpu_remainder_backend(),
+        "selected": "numpy" if kernel is None else kernel.backend,
+        "c_unavailable_reason": _circsym_c_kernel_failure,
+        "numba_unavailable_reason": _circsym_numba_kernel_failure,
+    }
 
 
 def _evaluate_far_remainder_onthefly_compiled(
@@ -2219,6 +2322,59 @@ def _evaluate_far_remainder_onthefly_compiled(
                 workers=workers,
                 should_continue=should_continue,
             )
+        _check_circsym_continue(should_continue)
+    return s_out, h_out
+
+
+def _evaluate_far_remainder_with_kernel(
+    kernel: _CircsymRemainderKernel,
+    part: _FarRemainderCompactGeometry,
+    k: complex,
+    *,
+    workers: int,
+    should_continue: Callable[[], bool | None] | None = None,
+) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    if kernel.backend == "c":
+        return _evaluate_far_remainder_onthefly_compiled(
+            kernel.implementation,
+            part,
+            k,
+            workers=workers,
+            should_continue=should_continue,
+        )
+    if kernel.backend != "numba":
+        raise RuntimeError(f"unknown CircSym remainder backend {kernel.backend!r}")
+
+    target_count = int(part.target_rho.size)
+    source_count = int(part.source_rho.shape[0])
+    s_out = np.empty((target_count, source_count), dtype=np.complex128)
+    h_out = np.empty_like(s_out)
+    block_size = (
+        target_count
+        if should_continue is None
+        else max(1, min(target_count, _ASSEMBLY_KERNEL_MAX_TARGET_BLOCK))
+    )
+    k_value = complex(k)
+    for start in range(0, target_count, block_size):
+        _check_circsym_continue(should_continue)
+        stop = min(target_count, start + block_size)
+        s_block, h_block = kernel.implementation.evaluate_far_remainder_onthefly(
+            np.ascontiguousarray(part.target_rho[start:stop], dtype=np.float64),
+            np.ascontiguousarray(part.target_z[start:stop], dtype=np.float64),
+            np.ascontiguousarray(part.source_rho, dtype=np.float64),
+            np.ascontiguousarray(part.source_z, dtype=np.float64),
+            np.ascontiguousarray(part.measure, dtype=np.float64),
+            np.ascontiguousarray(part.normal_rho, dtype=np.float64),
+            np.ascontiguousarray(part.normal_z, dtype=np.float64),
+            np.ascontiguousarray(part.cos_psi, dtype=np.float64),
+            np.ascontiguousarray(part.psi_weights, dtype=np.float64),
+            part.baffle_z is not None,
+            0.0 if part.baffle_z is None else float(part.baffle_z),
+            float(k_value.real),
+            float(k_value.imag),
+        )
+        s_out[start:stop] = s_block
+        h_out[start:stop] = h_block
         _check_circsym_continue(should_continue)
     return s_out, h_out
 
@@ -2299,6 +2455,38 @@ def _evaluate_near_remainder_compiled(
     if int(status) != 0:
         return _evaluate_near_remainder(part, k)
     return s_out, h_out
+
+
+def _evaluate_near_remainder_with_kernel(
+    kernel: _CircsymRemainderKernel,
+    part: _NearRemainderGeometry,
+    k: complex,
+    *,
+    workers: int,
+) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    if kernel.backend == "c":
+        return _evaluate_near_remainder_compiled(
+            kernel.implementation,
+            part,
+            k,
+            workers=workers,
+        )
+    if kernel.backend != "numba":
+        raise RuntimeError(f"unknown CircSym remainder backend {kernel.backend!r}")
+    if part.R.shape[0] == 0:
+        return (
+            np.empty(0, dtype=np.complex128),
+            np.empty(0, dtype=np.complex128),
+        )
+    del workers
+    k_value = complex(k)
+    return kernel.implementation.evaluate_near_remainder(
+        np.ascontiguousarray(part.R, dtype=np.float64),
+        np.ascontiguousarray(part.num, dtype=np.float64),
+        np.ascontiguousarray(part.weight, dtype=np.float64),
+        float(k_value.real),
+        float(k_value.imag),
+    )
 
 
 def _evaluate_far_remainder_block(

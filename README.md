@@ -16,9 +16,10 @@ Use the `hornlab_metal_bem` namespace for all new integrations.
 
 ## Status
 
-This is an Apple Silicon/macOS solver backend. It is intended to replace or
-augment local acoustic BEM backends on Apple Silicon, not NVIDIA CUDA backends
-on Windows.
+The full-3D native backend is Apple Silicon/macOS only. The axisymmetric
+meridian (`solve_circsym*`) formulation is portable: it runs on macOS, Windows,
+and Linux through compiled CPU kernels, and opportunistically uses Metal on
+Apple Silicon. It does not route Windows users through the full-3D Metal helper.
 
 The solver uses a NumPy-only mesh/grid/function-space loader and does not
 depend on `bempp-cl`. There is no OpenCL/Bempp fallback path in this package.
@@ -51,6 +52,20 @@ Recent ASRO2 corrected-quarter benchmark (HornLab, Apple M-series):
 - corrected assembly matches the subdivided-quadrature reference to `< 1e-4`
   relative L2 (matrix and RHS), and the `yz+xz` quarter matches the
   full-domain solve
+
+For a reproducible axisymmetric benchmark, including the exact backend and
+quadrature order used, run:
+
+```bash
+python scripts/bench_circsym.py --json
+python scripts/bench_circsym.py --fixture infinite-baffle --backend cpu --json
+```
+
+The default fixture is a closed free-standing conical horn swept from 400 Hz to
+16 kHz. `--target-edge-mm`, `--frequencies`, `--angles`, and `--repeat` expose
+the workload without hiding it behind a machine-specific preset. CI separately
+checks free-standing and coupled infinite-baffle numerical goldens on macOS,
+Windows, and Linux.
 
 ## Inputs
 

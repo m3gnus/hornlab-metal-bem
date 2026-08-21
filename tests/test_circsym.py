@@ -10,6 +10,8 @@ from hornlab_metal_bem._constants import SPEED_OF_SOUND
 from hornlab_metal_bem.circsym import (
     MeridianMesh,
     _BoundaryAssemblyGeometryCache,
+    _CircsymRemainderKernel,
+    _NearRemainderGeometry,
     _assemble_boundary_matrices,
     _build_far_remainder_compact_geometry,
     _build_far_remainder_geometry_parts,
@@ -17,11 +19,17 @@ from hornlab_metal_bem.circsym import (
     _build_source_segment_scale,
     _evaluate_far_remainder_block,
     _evaluate_far_remainder_onthefly_compiled,
+    _evaluate_far_remainder_onthefly_reference,
+    _evaluate_far_remainder_with_kernel,
+    _evaluate_near_remainder,
+    _evaluate_near_remainder_with_kernel,
     _evaluate_points_pressure,
     _infer_circsym_frame,
     _is_flat_baffled_sheet,
     _integrate_segment_kernel,
     _load_circsym_remainder_c_kernel,
+    _load_circsym_remainder_kernel,
+    _load_circsym_remainder_numba_kernel,
     _ring_remainder_kernel_m0,
     _ring_remainder_kernel_m0_targets_batched,
     _validate_closed_or_baffled_meridian,
@@ -36,6 +44,7 @@ from hornlab_metal_bem.config import (
     TaperProfile,
     VelocityMode,
 )
+from hornlab_metal_bem.observation import ObservationFrame
 
 
 def _sphere_meridian(radius: float = 0.1, segments: int = 48) -> MeridianMesh:
@@ -452,6 +461,76 @@ def test_far_onthefly_compiled_matches_precomputed_reference():
             )
 
 
+@pytest.mark.parametrize("baffle_z", [None, -0.137])
+def test_numba_remainder_kernels_match_numpy_reference(baffle_z):
+    implementation = _load_circsym_remainder_numba_kernel()
+    if implementation is None:
+        pytest.skip("Numba is unavailable")
+    kernel = _CircsymRemainderKernel("numba", implementation)
+    meridian = _sphere_meridian(radius=0.1, segments=7)
+    compact = _build_far_remainder_compact_geometry(
+        meridian,
+        meridian.segment_geometry(),
+        baffle_z,
+        n_psi=48,
+    )
+
+    for k in (0.2 + 0.03j, 30.0 + 1.0j):
+        actual_s, actual_h = _evaluate_far_remainder_with_kernel(
+            kernel,
+            compact,
+            k,
+            workers=2,
+        )
+        expected_s, expected_h = _evaluate_far_remainder_onthefly_reference(
+            compact,
+            k,
+            workers=1,
+        )
+        np.testing.assert_allclose(actual_s, expected_s, rtol=3e-13, atol=3e-14)
+        np.testing.assert_allclose(actual_h, expected_h, rtol=3e-13, atol=3e-14)
+
+    distances = np.array(
+        [
+            [[0.0, 1.0e-10, 0.03], [0.04, 0.07, 0.11]],
+            [[0.02, 0.05, 0.09], [0.01, 0.08, 0.13]],
+        ],
+        dtype=np.float64,
+    )
+    near = _NearRemainderGeometry(
+        R=distances,
+        num=np.linspace(-0.7, 0.8, distances.size).reshape(distances.shape),
+        weight=np.linspace(0.01, 0.12, distances.size).reshape(distances.shape),
+    )
+    expected_s, expected_h = _evaluate_near_remainder(near, 12.0 + 0.4j)
+    actual_s, actual_h = _evaluate_near_remainder_with_kernel(
+        kernel,
+        near,
+        12.0 + 0.4j,
+        workers=2,
+    )
+    np.testing.assert_allclose(actual_s, expected_s, rtol=3e-13, atol=3e-14)
+    np.testing.assert_allclose(actual_h, expected_h, rtol=3e-13, atol=3e-14)
+
+
+def test_windows_auto_cpu_remainder_uses_numba_without_trying_posix_c(monkeypatch):
+    monkeypatch.delenv("HORNLAB_CIRCSYM_CPU_REMAINDER_BACKEND", raising=False)
+    monkeypatch.delenv("HORNLAB_CIRCSYM_DISABLE_C_REMAINDER_KERNEL", raising=False)
+    monkeypatch.setattr(circsym.platform, "system", lambda: "Windows")
+    circsym._load_circsym_remainder_c_kernel.cache_clear()
+    circsym._load_circsym_remainder_numba_kernel.cache_clear()
+    circsym._load_circsym_remainder_kernel.cache_clear()
+    try:
+        kernel = _load_circsym_remainder_kernel()
+        assert kernel is not None
+        assert kernel.backend == "numba"
+        assert "POSIX compiler" in str(circsym._circsym_c_kernel_failure)
+    finally:
+        circsym._load_circsym_remainder_c_kernel.cache_clear()
+        circsym._load_circsym_remainder_numba_kernel.cache_clear()
+        circsym._load_circsym_remainder_kernel.cache_clear()
+
+
 def test_compiled_remainder_checks_cancellation_between_target_blocks():
     kernel = _load_circsym_remainder_c_kernel()
     if kernel is None:
@@ -689,6 +768,47 @@ def test_pulsating_sphere_recovers_analytic_impedance_and_uniform_directivity():
     assert float(np.max(np.abs(result.directivity_db))) < 0.02
     np.testing.assert_allclose(result.pressure_complex[:, 0], result.pressure_complex[:, 1])
     np.testing.assert_allclose(result.pressure_complex[:, 0], result.pressure_complex[:, 2])
+
+
+def test_circsym_honors_explicit_observation_frame_override():
+    radius = 0.1
+    origin = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+    frame = ObservationFrame(
+        axis=np.array([0.0, 0.0, 1.0], dtype=np.float64),
+        origin=origin,
+        u=np.array([1.0, 0.0, 0.0], dtype=np.float64),
+        v=np.array([0.0, 1.0, 0.0], dtype=np.float64),
+        mouth_center=origin,
+        source_center=origin,
+    )
+    config = SolveConfig(
+        velocity_sources={2: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        frame_override=frame,
+        observation=ObservationConfig(
+            distance_m=2.0,
+            angle_min_deg=0.0,
+            angle_max_deg=180.0,
+            angle_count=5,
+            planes=["horizontal"],
+            origin="mouth",
+        ),
+    )
+
+    result = metal_bem.solve_circsym_frequencies(
+        _sphere_meridian(radius=radius, segments=32),
+        [1200.0],
+        config,
+    )
+
+    distances = np.linalg.norm(result.observation_points[0] - origin, axis=1)
+    np.testing.assert_allclose(distances, 2.0, rtol=0.0, atol=1.0e-12)
+    np.testing.assert_allclose(
+        result.observation_points[0, 0], [0.0, 0.0, 2.0], atol=1.0e-12
+    )
+    np.testing.assert_allclose(
+        result.observation_points[0, -1], [0.0, 0.0, -2.0], atol=1.0e-12
+    )
 
 
 def test_circsym_sweep_honors_intra_case_cancellation_callback():

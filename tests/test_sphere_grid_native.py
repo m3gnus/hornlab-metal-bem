@@ -13,7 +13,10 @@ import pytest
 
 import hornlab_metal_bem as metal_bem
 from hornlab_metal_bem._constants import SPEED_OF_SOUND
+from hornlab_metal_bem.circsym import MeridianMesh
+from hornlab_metal_bem.config import ObservationConfig, SolveConfig, VelocityMode
 from hornlab_metal_bem.mesh import LoadedMesh, make_pure_grid
+from hornlab_metal_bem.observation import ObservationFrame
 from hornlab_metal_bem.result import MeshInfo
 
 
@@ -90,6 +93,75 @@ def _capped_sphere_mesh() -> LoadedMesh:
             physical_groups={1: "rigid", 2: "cap"},
             bounding_box_m=bbox,
         ),
+    )
+
+
+def _pulsating_sphere_mesh(radius: float, *, subdivisions: int = 3) -> LoadedMesh:
+    """Closed full-3D sphere with unit normal velocity on every face."""
+    vertices, triangles = _octasphere(subdivisions)
+    vertices *= radius
+    tags = np.full(triangles.shape[0], 2, dtype=np.int32)
+    return LoadedMesh(
+        grid=make_pure_grid(vertices, triangles),
+        physical_tags=tags,
+        info=MeshInfo(
+            n_vertices=vertices.shape[0],
+            n_triangles=triangles.shape[0],
+            physical_groups={2: "pulsating-sphere"},
+            bounding_box_m=(vertices.min(axis=0), vertices.max(axis=0)),
+        ),
+    )
+
+
+def _pulsating_sphere_meridian(radius: float, *, segments: int = 64) -> MeridianMesh:
+    theta = np.linspace(0.0, np.pi, segments + 1)
+    return MeridianMesh.from_polyline(
+        np.column_stack([radius * np.sin(theta), radius * np.cos(theta)]),
+        tags=2,
+    )
+
+
+def _sphere_frame() -> ObservationFrame:
+    origin = np.zeros(3, dtype=np.float64)
+    return ObservationFrame(
+        axis=np.array([0.0, 0.0, 1.0]),
+        origin=origin,
+        u=np.array([1.0, 0.0, 0.0]),
+        v=np.array([0.0, 1.0, 0.0]),
+        mouth_center=origin,
+        source_center=origin,
+    )
+
+
+def _axisymmetric_directivity_index_db(
+    pressure: np.ndarray,
+    angles_deg: np.ndarray,
+) -> np.ndarray:
+    """Integrate an axisymmetric polar response over the complete sphere."""
+    theta = np.deg2rad(angles_deg)
+    normalized_power = np.abs(pressure / pressure[:, :1]) ** 2
+    integral = np.trapezoid(
+        normalized_power * np.sin(theta)[None, :],
+        theta,
+        axis=1,
+    )
+    return 10.0 * np.log10(2.0 / integral)
+
+
+def _analytic_pulsating_sphere_pressure(
+    frequencies_hz: np.ndarray,
+    radius: float,
+    distance: float,
+    air_density: float,
+) -> np.ndarray:
+    """Outgoing spherical pressure for unit radial surface velocity."""
+    k = 2.0 * np.pi * frequencies_hz / SPEED_OF_SOUND
+    ka = k * radius
+    surface_impedance = air_density * SPEED_OF_SOUND * (
+        ka**2 - 1j * ka
+    ) / (1.0 + ka**2)
+    return surface_impedance * (radius / distance) * np.exp(
+        1j * k * (distance - radius)
     )
 
 
@@ -220,4 +292,96 @@ def test_circsym_sphere_grid_matches_arcs_and_point_source_decay():
     np.testing.assert_array_equal(
         sphere[0].reshape(7, 12),
         np.repeat(sphere[0].reshape(7, 12)[:, :1], 12, axis=1),
+    )
+
+
+@pytest.mark.slow
+def test_native_full3d_pulsating_sphere_matches_circsym_through_16khz():
+    """Qualify CircSym against full-3D Metal on a closed round body.
+
+    This gate intentionally includes an HF case and compares un-normalized
+    complex pressure, not only response shape.  The analytic spherical-wave
+    reference prevents two implementations from passing through a shared
+    amplitude or phase error; the complete 0..180-degree arc also pins the
+    integrated directivity index.
+    """
+    _require_native()
+    radius = 0.005
+    distance = 1.0
+    frequencies_hz = np.array([1000.0, 16000.0], dtype=np.float64)
+    observation = ObservationConfig(
+        planes=["horizontal", "vertical"],
+        angle_min_deg=0.0,
+        angle_max_deg=180.0,
+        angle_count=73,
+        distance_m=distance,
+        origin="mouth",
+    )
+    common = dict(
+        velocity_sources={2: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        observation=observation,
+        frame_override=_sphere_frame(),
+        dense_solve_dtype="float64",
+    )
+
+    native = metal_bem.solve_frequencies(
+        _pulsating_sphere_mesh(radius),
+        frequencies_hz,
+        SolveConfig(**common),
+    )
+    circsym = metal_bem.solve_circsym_frequencies(
+        _pulsating_sphere_meridian(radius),
+        frequencies_hz,
+        SolveConfig(**common),
+    )
+
+    native_pressure = native.pressure_complex[:, 0, :]
+    circsym_pressure = circsym.pressure_complex[:, 0, :]
+    analytic = _analytic_pulsating_sphere_pressure(
+        frequencies_hz,
+        radius,
+        distance,
+        SolveConfig().air_density,
+    )
+
+    # Both discretizations must independently recover the analytic level and
+    # phase.  This is stricter and more diagnostic than normalized-pattern-only
+    # parity, especially for a nominally omnidirectional radiator.
+    for measured in (native_pressure[:, 0], circsym_pressure[:, 0]):
+        level_error_db = 20.0 * np.log10(np.abs(measured / analytic))
+        phase_error_deg = np.rad2deg(np.angle(measured / analytic))
+        assert float(np.max(np.abs(level_error_db))) < 0.5
+        assert float(np.max(np.abs(phase_error_deg))) < 5.0
+
+    parity_ratio = native_pressure / circsym_pressure
+    assert float(np.max(np.abs(20.0 * np.log10(np.abs(parity_ratio))))) < 0.5
+    assert float(np.max(np.abs(np.rad2deg(np.angle(parity_ratio))))) < 5.0
+    assert float(np.max(np.abs(native.directivity_db - circsym.directivity_db))) < 0.5
+
+    native_di = _axisymmetric_directivity_index_db(
+        native_pressure,
+        native.observation_angles_deg,
+    )
+    circsym_di = _axisymmetric_directivity_index_db(
+        circsym_pressure,
+        circsym.observation_angles_deg,
+    )
+    assert float(np.max(np.abs(native_di - circsym_di))) < 0.1
+    assert float(np.max(np.abs(native_di))) < 0.1
+    assert float(np.max(np.abs(circsym_di))) < 0.1
+
+    # Rotational invariance is part of the model contract, not merely expected
+    # from the analytic solution.
+    np.testing.assert_allclose(
+        native.pressure_complex[:, 0, :],
+        native.pressure_complex[:, 1, :],
+        rtol=2.0e-3,
+        atol=1.0e-8,
+    )
+    np.testing.assert_allclose(
+        circsym.pressure_complex[:, 0, :],
+        circsym.pressure_complex[:, 1, :],
+        rtol=1.0e-10,
+        atol=1.0e-10,
     )
