@@ -25,5 +25,6 @@ jobs:
           python -m pytest
           tests/test_circsym.py
           tests/test_circsym_ib.py
+          tests/test_circsym_cross_os_golden.py
           tests/test_native_coupled_ib_validation.py
           -q
