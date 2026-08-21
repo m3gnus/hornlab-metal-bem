@@ -74,18 +74,38 @@ def _total_neumann_from_surface_pressure(
 
         robin_dofs = local2global[robin_faces]
         p_values = pressure_f32[frequency_index]
-        p_average = (
-            p_values[robin_dofs[:, 0]]
-            + p_values[robin_dofs[:, 1]]
-            + p_values[robin_dofs[:, 2]]
-        ) / np.float32(3.0)
+        p_average_real = (
+            p_values[robin_dofs[:, 0]].real + p_values[robin_dofs[:, 1]].real
+        )
+        p_average_real = p_average_real + p_values[robin_dofs[:, 2]].real
+        p_average_real = p_average_real / np.float32(3.0)
+        p_average_imag = (
+            p_values[robin_dofs[:, 0]].imag + p_values[robin_dofs[:, 1]].imag
+        )
+        p_average_imag = p_average_imag + p_values[robin_dofs[:, 2]].imag
+        p_average_imag = p_average_imag / np.float32(3.0)
         i_k = np.complex64(
             complex(
                 -float(k_imag_values[frequency_index]),
                 float(k_real_values[frequency_index]),
             )
         )
-        total[frequency_index, robin_faces] += i_k * beta[robin_faces] * p_average
+        robin_beta = beta[robin_faces]
+        coupling_real = i_k.real * robin_beta.real - i_k.imag * robin_beta.imag
+        coupling_imag = i_k.real * robin_beta.imag + i_k.imag * robin_beta.real
+        correction_real = (
+            coupling_real * p_average_real - coupling_imag * p_average_imag
+        )
+        correction_imag = (
+            coupling_real * p_average_imag + coupling_imag * p_average_real
+        )
+        total_row = total[frequency_index]
+        total_row.real[robin_faces] = (
+            total_row.real[robin_faces] + correction_real
+        )
+        total_row.imag[robin_faces] = (
+            total_row.imag[robin_faces] + correction_imag
+        )
     return total.astype(np.complex128)
 
 
