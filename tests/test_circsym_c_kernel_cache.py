@@ -240,6 +240,7 @@ def test_c_kernel_cache_recompiles_once_after_load_failure(
     ]
     selected = _selected_library_path(cache_dir)
     assert selected != rejected_path
+    assert not rejected_path.exists()
     assert Path(kernel.library._name) == selected
     assert hasattr(kernel.library, "circsym_eval_near_remainder")
 
@@ -251,6 +252,10 @@ def test_concurrent_processes_heal_one_missing_export_generation(tmp_path: Path)
     _prepare_circsym_c_kernel_cache(str(cache_dir))
     rejected_path = _generation_library_path(cache_dir, "missing-exports")
     _compile_library_without_kernel_exports(rejected_path, tmp_path)
+    crash_orphan = _generation_library_path(cache_dir, "crash-orphan")
+    crash_orphan.write_bytes(b"unpublished crash artifact")
+    crash_orphan.chmod(0o700)
+    os.utime(crash_orphan, (1, 1))
     compiler_wrapper, invocation_log = _counting_compiler(tmp_path, delay_s=0.2)
 
     env = os.environ.copy()
@@ -289,6 +294,91 @@ def test_concurrent_processes_heal_one_missing_export_generation(tmp_path: Path)
     assert failures == []
     assert invocation_log.read_text(encoding="utf-8").splitlines() == ["compile"]
     assert _selected_library_path(cache_dir) != rejected_path
+    assert not rejected_path.exists()
+    assert not crash_orphan.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the runtime C kernel is POSIX-only")
+def test_generation_rename_failure_removes_unpublished_library(
+    monkeypatch,
+    tmp_path: Path,
+):
+    cache_dir = tmp_path / "cache" / "hornlab-metal-bem" / "circsym"
+    _prepare_circsym_c_kernel_cache(str(cache_dir))
+    compiler = shutil.which(os.environ.get("CC", "cc"))
+    if compiler is None:
+        pytest.skip("runtime C compiler is unavailable")
+    extension = ".dylib" if platform.system() == "Darwin" else ".so"
+    original_replace = circsym.os.replace
+
+    def fail_after_generation_rename(source, destination):
+        original_replace(source, destination)
+        if str(source).endswith(f"{extension}.tmp") and str(destination).endswith(
+            extension
+        ):
+            raise OSError("injected failure after generation rename")
+
+    monkeypatch.setattr(circsym.os, "replace", fail_after_generation_rename)
+    with pytest.raises(OSError, match="injected failure"):
+        circsym._compile_circsym_remainder_c_kernel(
+            cache_dir=str(cache_dir),
+            cache_key=_circsym_c_kernel_cache_key(),
+            platform_name=platform.system().lower(),
+            compiler=compiler,
+        )
+
+    assert not _kernel_selection_path(cache_dir).exists()
+    assert list(
+        cache_dir.glob(
+            f"circsym_remainder_{_circsym_c_kernel_cache_key()}.*{extension}"
+        )
+    ) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the runtime C kernel is POSIX-only")
+def test_orphan_gc_is_bounded_and_preserves_selected_and_recent_generations(
+    monkeypatch,
+    tmp_path: Path,
+):
+    cache_home = tmp_path / "cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
+    cache_dir = Path(_circsym_c_kernel_cache_dir())
+    circsym._load_circsym_remainder_c_kernel.cache_clear()
+    try:
+        assert circsym._load_circsym_remainder_c_kernel() is not None
+    finally:
+        circsym._load_circsym_remainder_c_kernel.cache_clear()
+    selected = _selected_library_path(cache_dir)
+    old_orphans = [
+        _generation_library_path(cache_dir, f"crash-{index}")
+        for index in range(circsym._CIRCSYM_C_KERNEL_GC_MAX_REMOVALS + 2)
+    ]
+    for orphan in old_orphans:
+        orphan.write_bytes(b"unpublished crash artifact")
+        orphan.chmod(0o700)
+        os.utime(orphan, (1, 1))
+    recent = _generation_library_path(cache_dir, "concurrent-healer")
+    recent.write_bytes(b"recent unpublished artifact")
+    recent.chmod(0o700)
+
+    compile_args = {
+        "cache_dir": str(cache_dir),
+        "cache_key": _circsym_c_kernel_cache_key(),
+        "platform_name": platform.system().lower(),
+        "compiler": os.environ.get("CC", "cc"),
+    }
+    returned, _identity = circsym._compile_circsym_remainder_c_kernel(
+        **compile_args
+    )
+    assert Path(returned) == selected
+    assert sum(path.exists() for path in old_orphans) == 2
+    assert selected.exists()
+    assert recent.exists()
+
+    circsym._compile_circsym_remainder_c_kernel(**compile_args)
+    assert not any(path.exists() for path in old_orphans)
+    assert selected.exists()
+    assert recent.exists()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="the runtime C kernel is POSIX-only")

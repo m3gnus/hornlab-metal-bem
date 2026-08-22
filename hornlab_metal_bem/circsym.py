@@ -96,6 +96,9 @@ _CIRCSYM_FIELD_BACKEND_ENV = "HORNLAB_CIRCSYM_FIELD_BACKEND"
 _CIRCSYM_METAL_ASSEMBLY_MIN_TERMS = 80_000_000
 _CIRCSYM_ASSEMBLY_BACKEND_ENV = "HORNLAB_CIRCSYM_ASSEMBLY_BACKEND"
 _CIRCSYM_CPU_REMAINDER_BACKEND_ENV = "HORNLAB_CIRCSYM_CPU_REMAINDER_BACKEND"
+_CIRCSYM_C_KERNEL_ORPHAN_GRACE_SECONDS = 300.0
+_CIRCSYM_C_KERNEL_GC_MAX_SCAN = 256
+_CIRCSYM_C_KERNEL_GC_MAX_REMOVALS = 8
 _ASSEMBLY_KERNEL_BLOCK_ELEMENTS = 3_000_000
 _ASSEMBLY_KERNEL_MAX_TARGET_BLOCK = 16
 _ASSEMBLY_KERNEL_PARALLEL_TARGET_BLOCK = 5
@@ -2355,6 +2358,72 @@ def _selected_circsym_c_kernel_library(
     return library_path, _cache_file_identity(library_stat)
 
 
+def _unlink_private_cache_file_if_identity(
+    path: str,
+    identity: tuple[int, int, int, int],
+    *,
+    expected_mode: int = 0o700,
+) -> bool:
+    """Unlink one regular private file only while its identity still matches."""
+
+    try:
+        file_stat = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    if (
+        _cache_file_identity(file_stat) != identity
+        or not stat.S_ISREG(file_stat.st_mode)
+        or file_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(file_stat.st_mode) != expected_mode
+        or file_stat.st_nlink != 1
+    ):
+        return False
+    os.unlink(path)
+    return True
+
+
+def _collect_circsym_c_kernel_orphans(
+    *,
+    cache_dir: str,
+    cache_key: str,
+    platform_name: str,
+    selected_path: str | None,
+    now: float | None = None,
+) -> int:
+    """Remove a bounded batch of old, unselected generation artifacts."""
+
+    extension = ".dylib" if platform_name == "darwin" else ".so"
+    prefix = f"circsym_remainder_{cache_key}."
+    cutoff = (time.time() if now is None else now) - (
+        _CIRCSYM_C_KERNEL_ORPHAN_GRACE_SECONDS
+    )
+    candidates: list[tuple[int, str, tuple[int, int, int, int]]] = []
+    with os.scandir(cache_dir) as entries:
+        for index, entry in enumerate(entries):
+            if index >= _CIRCSYM_C_KERNEL_GC_MAX_SCAN:
+                break
+            if (
+                not entry.name.startswith(prefix)
+                or not entry.name.endswith(extension)
+            ):
+                continue
+            path = os.path.join(cache_dir, entry.name)
+            if selected_path is not None and path == selected_path:
+                continue
+            file_stat = _validated_private_cache_file(path, expected_mode=0o700)
+            if file_stat is None or file_stat.st_mtime > cutoff:
+                continue
+            candidates.append(
+                (file_stat.st_mtime_ns, path, _cache_file_identity(file_stat))
+            )
+    removed = 0
+    for _mtime, path, identity in sorted(candidates):
+        if removed >= _CIRCSYM_C_KERNEL_GC_MAX_REMOVALS:
+            break
+        removed += int(_unlink_private_cache_file_if_identity(path, identity))
+    return removed
+
+
 def _compile_circsym_remainder_c_kernel(
     *,
     cache_dir: str,
@@ -2378,6 +2447,7 @@ def _compile_circsym_remainder_c_kernel(
     source_temp: str | None = None
     library_temp: str | None = None
     selection_temp: str | None = None
+    generation_path: str | None = None
     try:
         # Lock the directory inode itself. This serializes validation and
         # publication without first having to trust a pre-existing lock file.
@@ -2423,11 +2493,36 @@ def _compile_circsym_remainder_c_kernel(
         )
         if selected is not None:
             library_path, identity = selected
-            if (
-                rejected_library_identity is None
-                or identity != rejected_library_identity
-            ):
+            if rejected_library_identity is None or identity != rejected_library_identity:
+                _collect_circsym_c_kernel_orphans(
+                    cache_dir=cache_dir,
+                    cache_key=cache_key,
+                    platform_name=platform_name,
+                    selected_path=library_path,
+                )
                 return library_path, identity
+            # The loader rejected this exact generation. Reconfirm both its
+            # selection and file identity under the lock before removing it;
+            # a concurrent healer may already have published a replacement.
+            confirmed = _selected_circsym_c_kernel_library(
+                cache_dir=cache_dir,
+                cache_key=cache_key,
+                platform_name=platform_name,
+                selection_path=selection_path,
+            )
+            if confirmed == selected and _unlink_private_cache_file_if_identity(
+                library_path,
+                identity,
+            ):
+                os.unlink(selection_path)
+            selected = None
+
+        _collect_circsym_c_kernel_orphans(
+            cache_dir=cache_dir,
+            cache_key=cache_key,
+            platform_name=platform_name,
+            selected_path=None,
+        )
 
         source_fd, source_temp = tempfile.mkstemp(
             prefix=f".circsym_remainder_{cache_key}.",
@@ -2495,6 +2590,11 @@ def _compile_circsym_remainder_c_kernel(
             raise PermissionError(
                 "CircSym C-kernel cache publication failed validation"
             )
+        if final_selection[0] != generation_path:
+            raise PermissionError(
+                "CircSym C-kernel cache selected an unexpected generation"
+            )
+        generation_path = None
         return final_selection
     finally:
         for temporary in (source_temp, library_temp, selection_temp):
@@ -2503,6 +2603,26 @@ def _compile_circsym_remainder_c_kernel(
                     os.unlink(temporary)
                 except FileNotFoundError:
                     pass
+        if generation_path is not None:
+            try:
+                current = _selected_circsym_c_kernel_library(
+                    cache_dir=cache_dir,
+                    cache_key=cache_key,
+                    platform_name=platform_name,
+                    selection_path=selection_path,
+                )
+                if current is None or current[0] != generation_path:
+                    generation_stat = _validated_private_cache_file(
+                        generation_path,
+                        expected_mode=0o700,
+                    )
+                    if generation_stat is not None:
+                        _unlink_private_cache_file_if_identity(
+                            generation_path,
+                            _cache_file_identity(generation_stat),
+                        )
+            except FileNotFoundError:
+                pass
         os.close(cache_fd)
 
 
