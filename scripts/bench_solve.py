@@ -464,6 +464,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from hornlab_metal_bem import load_mesh, native_config
     from hornlab_metal_bem._constants import SPEED_OF_SOUND
+    from hornlab_metal_bem.field_traces import _native_field_env_overrides
     from hornlab_metal_bem.mesh import make_pure_function_spaces
     from hornlab_metal_bem.metal import discover_native_runtime
     from hornlab_metal_bem.metal.geometry import build_metal_geometry_buffers
@@ -539,9 +540,12 @@ def main(argv: list[str] | None = None) -> int:
         velocity_source_tags=[source_tag],
         check_open_edges=not args.native_allow_open_rim,
         runtime_status=runtime,
-        # Deliberately omit extra_env: subprocess inherits os.environ verbatim,
-        # so assembly implementation, dense dtype, and near-quadrature A/B knobs
-        # select the helper path without this harness silently normalizing them.
+        # Only the field-kernel default is normalized, exactly as the production
+        # sweep does: an unset HORNLAB_METAL_BEM_NATIVE_FIELD_MODE would make the
+        # helper fall back to the serial CPU reference evaluator, which once
+        # reported a 4 s balloon that the Metal kernel evaluates in 13 ms. Every
+        # other A/B knob is still inherited from os.environ verbatim.
+        extra_env=_native_field_env_overrides(),
     ) as session:
         points, sphere_total, sphere_evaluated = _observation_points(
             mesh,
