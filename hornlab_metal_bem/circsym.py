@@ -19,6 +19,7 @@ import math
 import os
 import platform
 import secrets
+import shutil
 import stat
 import subprocess
 import sys
@@ -96,9 +97,14 @@ _CIRCSYM_FIELD_BACKEND_ENV = "HORNLAB_CIRCSYM_FIELD_BACKEND"
 _CIRCSYM_METAL_ASSEMBLY_MIN_TERMS = 80_000_000
 _CIRCSYM_ASSEMBLY_BACKEND_ENV = "HORNLAB_CIRCSYM_ASSEMBLY_BACKEND"
 _CIRCSYM_CPU_REMAINDER_BACKEND_ENV = "HORNLAB_CIRCSYM_CPU_REMAINDER_BACKEND"
+_CIRCSYM_C_KERNEL_BUILD_SCHEMA = "circsym-c-kernel-v2"
+_CIRCSYM_C_KERNEL_COMPILE_ARGS = ("-O3", "-fPIC", "-pthread")
+_CIRCSYM_C_KERNEL_LINK_ARGS = ("-lm",)
 _CIRCSYM_C_KERNEL_ORPHAN_GRACE_SECONDS = 300.0
-_CIRCSYM_C_KERNEL_GC_MAX_SCAN = 256
 _CIRCSYM_C_KERNEL_GC_MAX_REMOVALS = 8
+_CIRCSYM_C_KERNEL_GC_MAX_REMOVAL_BYTES = 64 * 1024 * 1024
+_CIRCSYM_C_KERNEL_CACHE_MAX_ARTIFACTS = 64
+_CIRCSYM_C_KERNEL_CACHE_MAX_BYTES = 256 * 1024 * 1024
 _ASSEMBLY_KERNEL_BLOCK_ELEMENTS = 3_000_000
 _ASSEMBLY_KERNEL_MAX_TARGET_BLOCK = 16
 _ASSEMBLY_KERNEL_PARALLEL_TARGET_BLOCK = 5
@@ -2097,47 +2103,88 @@ int circsym_eval_near_remainder(
 
 class _CircsymRemainderCKernel:
     def __init__(self, library_path: str) -> None:
-        self.library = ctypes.CDLL(library_path)
-        self.eval_near = self.library.circsym_eval_near_remainder
-        double_ptr = ctypes.POINTER(ctypes.c_double)
-        self.eval_far_onthefly = self.library.circsym_eval_far_remainder_onthefly
-        self.eval_far_onthefly.argtypes = [
-            ctypes.c_int64,
-            ctypes.c_int64,
-            ctypes.c_int64,
-            ctypes.c_int64,
-            double_ptr,
-            double_ptr,
-            double_ptr,
-            double_ptr,
-            double_ptr,
-            double_ptr,
-            double_ptr,
-            double_ptr,
-            double_ptr,
-            ctypes.c_int32,
-            ctypes.c_double,
-            ctypes.c_double,
-            ctypes.c_double,
-            double_ptr,
-            double_ptr,
-            ctypes.c_int32,
-        ]
-        self.eval_far_onthefly.restype = ctypes.c_int
-        self.eval_near.argtypes = [
-            ctypes.c_int64,
-            ctypes.c_int64,
-            ctypes.c_int64,
-            double_ptr,
-            double_ptr,
-            double_ptr,
-            ctypes.c_double,
-            ctypes.c_double,
-            double_ptr,
-            double_ptr,
-            ctypes.c_int32,
-        ]
-        self.eval_near.restype = ctypes.c_int
+        import fcntl
+
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        self._lease_fd: int | None = None
+        self._lease_fd = os.open(library_path, flags)
+        try:
+            lease_stat = os.fstat(self._lease_fd)
+            path_stat = os.lstat(library_path)
+            if (
+                _cache_file_identity(lease_stat) != _cache_file_identity(path_stat)
+                or not stat.S_ISREG(lease_stat.st_mode)
+                or lease_stat.st_uid != os.geteuid()
+                or stat.S_IMODE(lease_stat.st_mode) != 0o700
+                or lease_stat.st_nlink != 1
+                or lease_stat.st_size <= 0
+            ):
+                raise PermissionError(
+                    "CircSym C-kernel generation failed load-time validation"
+                )
+            fcntl.flock(self._lease_fd, fcntl.LOCK_SH)
+            self.library = ctypes.CDLL(library_path)
+            self.eval_near = self.library.circsym_eval_near_remainder
+            double_ptr = ctypes.POINTER(ctypes.c_double)
+            self.eval_far_onthefly = self.library.circsym_eval_far_remainder_onthefly
+            self.eval_far_onthefly.argtypes = [
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                double_ptr,
+                double_ptr,
+                double_ptr,
+                double_ptr,
+                double_ptr,
+                double_ptr,
+                double_ptr,
+                double_ptr,
+                double_ptr,
+                ctypes.c_int32,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+                double_ptr,
+                double_ptr,
+                ctypes.c_int32,
+            ]
+            self.eval_far_onthefly.restype = ctypes.c_int
+            self.eval_near.argtypes = [
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                double_ptr,
+                double_ptr,
+                double_ptr,
+                ctypes.c_double,
+                ctypes.c_double,
+                double_ptr,
+                double_ptr,
+                ctypes.c_int32,
+            ]
+            self.eval_near.restype = ctypes.c_int
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if getattr(self, "_lease_fd", None) is not None:
+            os.close(self._lease_fd)
+            self._lease_fd = None
+
+    def __del__(self) -> None:
+        self.close()
+
+    def validate_build_fingerprint(self, expected: str) -> None:
+        fingerprint = self.library.circsym_c_kernel_build_fingerprint
+        fingerprint.argtypes = []
+        fingerprint.restype = ctypes.c_char_p
+        actual = fingerprint()
+        if actual is None or actual.decode("ascii", errors="replace") != expected:
+            raise RuntimeError(
+                "CircSym C-kernel build fingerprint does not match its cache key"
+            )
 
 
 @dataclass(frozen=True)
@@ -2166,8 +2213,114 @@ def _circsym_c_kernel_cache_dir() -> str:
     return os.path.join(base, "hornlab-metal-bem", "circsym")
 
 
-def _circsym_c_kernel_cache_key() -> str:
-    """Hash the kernel source together with its binary compatibility domain."""
+def _circsym_c_kernel_link_mode(platform_name: str) -> str:
+    return "-dynamiclib" if platform_name == "darwin" else "-shared"
+
+
+def _circsym_c_kernel_rendered_source(build_fingerprint: str) -> str:
+    if len(build_fingerprint) != 64 or any(
+        character not in "0123456789abcdef" for character in build_fingerprint
+    ):
+        raise ValueError("invalid CircSym C-kernel build fingerprint")
+    return (
+        _CIRCSYM_REMAINDER_C_SOURCE
+        + "\nconst char *circsym_c_kernel_build_fingerprint(void) {\n"
+        + f'    return "{build_fingerprint}";\n'
+        + "}\n"
+    )
+
+
+def _circsym_c_kernel_resolved_compiler(compiler: str) -> str:
+    resolved = shutil.which(compiler)
+    if resolved is None:
+        raise FileNotFoundError(f"CircSym C compiler not found: {compiler}")
+    return os.path.realpath(resolved)
+
+
+def _hash_framed_bytes(digest: Any, value: bytes) -> None:
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)
+
+
+def _circsym_c_kernel_build_fingerprint(
+    *,
+    compiler: str,
+    platform_name: str,
+) -> str:
+    """Fingerprint the effective compiler, recipe, macros, and headers."""
+
+    resolved_compiler = _circsym_c_kernel_resolved_compiler(compiler)
+    compiler_digest = hashlib.sha256()
+    with open(resolved_compiler, "rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            compiler_digest.update(chunk)
+
+    def probe(arguments: list[str], *, source: bytes | None = None) -> bytes:
+        completed = subprocess.run(
+            [resolved_compiler, *arguments],
+            input=source,
+            check=True,
+            capture_output=True,
+        )
+        return completed.stdout + b"\0" + completed.stderr
+
+    link_mode = _circsym_c_kernel_link_mode(platform_name)
+    normalized_recipe = (
+        *_CIRCSYM_C_KERNEL_COMPILE_ARGS,
+        link_mode,
+        "<SOURCE>",
+        "-o",
+        "<OUTPUT>",
+        *_CIRCSYM_C_KERNEL_LINK_ARGS,
+    )
+    # ``-dD`` retains the effective predefined macros while preprocessing the
+    # actual headers used by this source. ``-v`` also records the compiler's
+    # include search paths and effective sysroot. Every compile argument is
+    # deliberately shared with the real compiler invocation below.
+    preprocess_source = _circsym_c_kernel_rendered_source("0" * 64).encode()
+    preprocessed = probe(
+        [
+            *_CIRCSYM_C_KERNEL_COMPILE_ARGS,
+            "-E",
+            "-dD",
+            "-P",
+            "-v",
+            "-x",
+            "c",
+            "-",
+        ],
+        source=preprocess_source,
+    )
+
+    digest = hashlib.sha256()
+    for material in (
+        _CIRCSYM_C_KERNEL_BUILD_SCHEMA.encode(),
+        os.fsencode(resolved_compiler),
+        compiler_digest.digest(),
+        probe(["--version"]),
+        probe(["-dumpmachine"]),
+        "\0".join(normalized_recipe).encode(),
+        preprocessed,
+    ):
+        _hash_framed_bytes(digest, material)
+    return digest.hexdigest()
+
+
+def _circsym_c_kernel_cache_key(
+    *,
+    build_fingerprint: str | None = None,
+    compiler: str | None = None,
+    platform_name: str | None = None,
+) -> str:
+    """Hash the build fingerprint and binary compatibility domain."""
+
+    effective_platform = platform.system().lower() if platform_name is None else platform_name
+    if build_fingerprint is None:
+        selected_compiler = os.environ.get("CC", "cc") if compiler is None else compiler
+        build_fingerprint = _circsym_c_kernel_build_fingerprint(
+            compiler=selected_compiler,
+            platform_name=effective_platform,
+        )
 
     discriminator = "\0".join(
         (
@@ -2183,7 +2336,9 @@ def _circsym_c_kernel_cache_key() -> str:
             str(ctypes.sizeof(ctypes.c_void_p) * 8),
         )
     )
-    material = _CIRCSYM_REMAINDER_C_SOURCE + "\0" + discriminator
+    material = "\0".join(
+        (_CIRCSYM_C_KERNEL_BUILD_SCHEMA, build_fingerprint, discriminator)
+    )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
 
 
@@ -2362,24 +2517,94 @@ def _unlink_private_cache_file_if_identity(
     path: str,
     identity: tuple[int, int, int, int],
     *,
-    expected_mode: int = 0o700,
+    expected_mode: int | tuple[int, ...] = 0o700,
+    require_unleased: bool = False,
 ) -> bool:
     """Unlink one regular private file only while its identity still matches."""
 
+    expected_modes = (
+        (expected_mode,) if isinstance(expected_mode, int) else expected_mode
+    )
+    lease_fd: int | None = None
     try:
-        file_stat = os.lstat(path)
-    except FileNotFoundError:
-        return False
+        if require_unleased:
+            import fcntl
+
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                lease_fd = os.open(path, flags)
+                lease_stat = os.fstat(lease_fd)
+                if _cache_file_identity(lease_stat) != identity:
+                    return False
+                fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, FileNotFoundError, OSError):
+                return False
+        try:
+            file_stat = os.lstat(path)
+        except FileNotFoundError:
+            return False
+        if (
+            _cache_file_identity(file_stat) != identity
+            or not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_uid != os.geteuid()
+            or stat.S_IMODE(file_stat.st_mode) not in expected_modes
+            or file_stat.st_nlink != 1
+        ):
+            return False
+        os.unlink(path)
+        return True
+    finally:
+        if lease_fd is not None:
+            os.close(lease_fd)
+
+
+def _circsym_c_kernel_owned_artifact(
+    name: str,
+) -> tuple[tuple[int, ...], bool] | None:
+    """Return accepted modes and whether an owned cache artifact is a library."""
+
+    hidden = name.startswith(".")
+    visible_name = name[1:] if hidden else name
+    prefix = "circsym_remainder_"
+    if not visible_name.startswith(prefix):
+        return None
+    keyed_suffix = visible_name[len(prefix) :]
+    cache_key, separator, suffix = keyed_suffix.partition(".")
     if (
-        _cache_file_identity(file_stat) != identity
-        or not stat.S_ISREG(file_stat.st_mode)
-        or file_stat.st_uid != os.geteuid()
-        or stat.S_IMODE(file_stat.st_mode) != expected_mode
-        or file_stat.st_nlink != 1
+        not separator
+        or len(cache_key) != 24
+        or any(character not in "0123456789abcdef" for character in cache_key)
     ):
-        return False
-    os.unlink(path)
-    return True
+        return None
+
+    token_characters = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+    )
+
+    def valid_token(token: str) -> bool:
+        return bool(token) and all(
+            character in token_characters for character in token
+        )
+
+    if hidden:
+        for ending, modes, is_library in (
+            (".tmp.c", (0o600,), False),
+            (".current.tmp", (0o600,), False),
+            (".so.tmp", (0o600, 0o700), True),
+            (".dylib.tmp", (0o600, 0o700), True),
+        ):
+            if suffix.endswith(ending) and valid_token(suffix[: -len(ending)]):
+                return modes, is_library
+        return None
+
+    if suffix in {"c", "current"}:
+        return (0o600,), False
+    if suffix in {"so", "dylib"}:
+        return (0o700,), True
+    for extension in (".so", ".dylib"):
+        if suffix.endswith(extension) and valid_token(suffix[: -len(extension)]):
+            return (0o700,), True
+    return None
 
 
 def _collect_circsym_c_kernel_orphans(
@@ -2390,37 +2615,89 @@ def _collect_circsym_c_kernel_orphans(
     selected_path: str | None,
     now: float | None = None,
 ) -> int:
-    """Remove a bounded batch of old, unselected generation artifacts."""
+    """Remove a bounded batch of stale artifacts from the whole owned cache."""
 
-    extension = ".dylib" if platform_name == "darwin" else ".so"
-    prefix = f"circsym_remainder_{cache_key}."
+    source_path, selection_path, _legacy_path, _extension = (
+        _circsym_c_kernel_artifact_paths(cache_dir, cache_key, platform_name)
+    )
+    protected_paths = {source_path, selection_path}
+    if selected_path is not None:
+        protected_paths.add(selected_path)
     cutoff = (time.time() if now is None else now) - (
         _CIRCSYM_C_KERNEL_ORPHAN_GRACE_SECONDS
     )
-    candidates: list[tuple[int, str, tuple[int, int, int, int]]] = []
+    owned: list[
+        tuple[
+            int,
+            str,
+            tuple[int, int, int, int],
+            tuple[int, ...],
+            bool,
+            int,
+        ]
+    ] = []
+    owned_count = 0
+    owned_bytes = 0
     with os.scandir(cache_dir) as entries:
-        for index, entry in enumerate(entries):
-            if index >= _CIRCSYM_C_KERNEL_GC_MAX_SCAN:
-                break
+        for entry in entries:
+            artifact = _circsym_c_kernel_owned_artifact(entry.name)
+            if artifact is None:
+                continue
+            expected_modes, is_library = artifact
+            path = os.path.join(cache_dir, entry.name)
+            try:
+                file_stat = os.lstat(path)
+            except FileNotFoundError:
+                continue
             if (
-                not entry.name.startswith(prefix)
-                or not entry.name.endswith(extension)
+                not stat.S_ISREG(file_stat.st_mode)
+                or file_stat.st_uid != os.geteuid()
+                or stat.S_IMODE(file_stat.st_mode) not in expected_modes
+                or file_stat.st_nlink != 1
             ):
                 continue
-            path = os.path.join(cache_dir, entry.name)
-            if selected_path is not None and path == selected_path:
+            owned_count += 1
+            owned_bytes += file_stat.st_size
+            if path in protected_paths:
                 continue
-            file_stat = _validated_private_cache_file(path, expected_mode=0o700)
-            if file_stat is None or file_stat.st_mtime > cutoff:
-                continue
-            candidates.append(
-                (file_stat.st_mtime_ns, path, _cache_file_identity(file_stat))
+            owned.append(
+                (
+                    file_stat.st_mtime_ns,
+                    path,
+                    _cache_file_identity(file_stat),
+                    expected_modes,
+                    is_library,
+                    file_stat.st_size,
+                )
             )
+
+    over_ceiling = (
+        owned_count > _CIRCSYM_C_KERNEL_CACHE_MAX_ARTIFACTS
+        or owned_bytes > _CIRCSYM_C_KERNEL_CACHE_MAX_BYTES
+    )
+    candidates = [
+        candidate
+        for candidate in owned
+        if candidate[0] <= int(cutoff * 1_000_000_000) or over_ceiling
+    ]
     removed = 0
-    for _mtime, path, identity in sorted(candidates):
+    removed_bytes = 0
+    for _mtime, path, identity, modes, is_library, size in sorted(candidates):
         if removed >= _CIRCSYM_C_KERNEL_GC_MAX_REMOVALS:
             break
-        removed += int(_unlink_private_cache_file_if_identity(path, identity))
+        if (
+            removed > 0
+            and removed_bytes + size > _CIRCSYM_C_KERNEL_GC_MAX_REMOVAL_BYTES
+        ):
+            break
+        unlinked = _unlink_private_cache_file_if_identity(
+            path,
+            identity,
+            expected_mode=modes,
+            require_unleased=is_library,
+        )
+        removed += int(unlinked)
+        removed_bytes += size if unlinked else 0
     return removed
 
 
@@ -2430,11 +2707,26 @@ def _compile_circsym_remainder_c_kernel(
     cache_key: str,
     platform_name: str,
     compiler: str,
+    build_fingerprint: str | None = None,
     rejected_library_identity: tuple[int, int, int, int] | None = None,
 ) -> tuple[str, tuple[int, int, int, int]]:
     """Compile once across processes and publish the library atomically."""
 
     import fcntl
+
+    resolved_compiler = _circsym_c_kernel_resolved_compiler(compiler)
+    if build_fingerprint is None:
+        build_fingerprint = _circsym_c_kernel_build_fingerprint(
+            compiler=resolved_compiler,
+            platform_name=platform_name,
+        )
+    expected_cache_key = _circsym_c_kernel_cache_key(
+        build_fingerprint=build_fingerprint,
+        platform_name=platform_name,
+    )
+    if cache_key != expected_cache_key:
+        raise ValueError("CircSym C-kernel cache key does not match its build recipe")
+    rendered_source = _circsym_c_kernel_rendered_source(build_fingerprint)
 
     source_path, selection_path, legacy_library_path, lib_ext = (
         _circsym_c_kernel_artifact_paths(
@@ -2513,6 +2805,7 @@ def _compile_circsym_remainder_c_kernel(
             if confirmed == selected and _unlink_private_cache_file_if_identity(
                 library_path,
                 identity,
+                require_unleased=True,
             ):
                 os.unlink(selection_path)
             selected = None
@@ -2533,7 +2826,7 @@ def _compile_circsym_remainder_c_kernel(
             dir=cache_dir,
         )
         with os.fdopen(source_fd, "w", encoding="utf-8") as handle:
-            handle.write(_CIRCSYM_REMAINDER_C_SOURCE)
+            handle.write(rendered_source)
 
         library_fd, library_temp = tempfile.mkstemp(
             prefix=f".circsym_remainder_{cache_key}.",
@@ -2541,15 +2834,25 @@ def _compile_circsym_remainder_c_kernel(
             dir=cache_dir,
         )
         os.close(library_fd)
-        command = [compiler, "-O3", "-fPIC"]
-        if platform_name == "darwin":
-            command.append("-dynamiclib")
-        else:
-            command.append("-shared")
+        command = [
+            resolved_compiler,
+            *_CIRCSYM_C_KERNEL_COMPILE_ARGS,
+            _circsym_c_kernel_link_mode(platform_name),
+        ]
         command.extend(
-            [source_temp, "-o", library_temp, "-lm", "-pthread"]
+            [source_temp, "-o", library_temp, *_CIRCSYM_C_KERNEL_LINK_ARGS]
         )
         subprocess.run(command, check=True, capture_output=True, text=True)
+        if (
+            _circsym_c_kernel_build_fingerprint(
+                compiler=resolved_compiler,
+                platform_name=platform_name,
+            )
+            != build_fingerprint
+        ):
+            raise RuntimeError(
+                "CircSym C compiler or build inputs changed during compilation"
+            )
         os.chmod(library_temp, 0o700)
 
         generation_path = os.path.join(
@@ -2637,27 +2940,40 @@ def _load_circsym_remainder_c_kernel() -> _CircsymRemainderCKernel | None:
             "the legacy runtime C kernel requires a POSIX compiler and pthreads"
         )
         return None
-    cc = os.environ.get("CC", "cc")
-    cache_key = _circsym_c_kernel_cache_key()
-    cache_dir = _circsym_c_kernel_cache_dir()
     try:
+        platform_name = platform.system().lower()
+        cc = _circsym_c_kernel_resolved_compiler(os.environ.get("CC", "cc"))
+        build_fingerprint = _circsym_c_kernel_build_fingerprint(
+            compiler=cc,
+            platform_name=platform_name,
+        )
+        cache_key = _circsym_c_kernel_cache_key(
+            build_fingerprint=build_fingerprint,
+            platform_name=platform_name,
+        )
+        cache_dir = _circsym_c_kernel_cache_dir()
         _prepare_circsym_c_kernel_cache(cache_dir)
         library_path, library_identity = _compile_circsym_remainder_c_kernel(
             cache_dir=cache_dir,
             cache_key=cache_key,
-            platform_name=platform.system().lower(),
+            platform_name=platform_name,
             compiler=cc,
+            build_fingerprint=build_fingerprint,
         )
     except Exception as exc:
         _circsym_c_kernel_failure = str(exc)
         logger.debug("CircSym C remainder kernel unavailable: %s", exc)
         return None
     for attempt in range(2):
+        kernel: _CircsymRemainderCKernel | None = None
         try:
             kernel = _CircsymRemainderCKernel(library_path)
+            kernel.validate_build_fingerprint(build_fingerprint)
             _circsym_c_kernel_failure = None
             return kernel
         except Exception as exc:
+            if kernel is not None:
+                kernel.close()
             if attempt == 0:
                 logger.debug(
                     "CircSym C remainder kernel load failed; rebuilding once: %s",
@@ -2668,8 +2984,9 @@ def _load_circsym_remainder_c_kernel() -> _CircsymRemainderCKernel | None:
                         _compile_circsym_remainder_c_kernel(
                             cache_dir=cache_dir,
                             cache_key=cache_key,
-                            platform_name=platform.system().lower(),
+                            platform_name=platform_name,
                             compiler=cc,
+                            build_fingerprint=build_fingerprint,
                             rejected_library_identity=library_identity,
                         )
                     )
