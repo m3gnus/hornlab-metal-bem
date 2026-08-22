@@ -36,6 +36,7 @@ RELEVANT_ENV = (
     "HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY",
     "HORNLAB_METAL_BEM_NATIVE_NEAR_QUADRATURE",
     "HORNLAB_METAL_BEM_NATIVE_FIELD_MODE",
+    "HORNLAB_METAL_BEM_SPHERE_SYMMETRY_DEDUPE",
     "HORNLAB_METAL_BEM_NATIVE_COUPLED_IB_APERTURE_ASSEMBLY",
     "HORNLAB_METAL_BEM_NATIVE_COUPLED_IB_SOLVE",
 )
@@ -53,6 +54,20 @@ def _positive_float(value: str) -> float:
     if not np.isfinite(parsed) or parsed <= 0.0:
         raise argparse.ArgumentTypeError("must be finite and positive")
     return parsed
+
+
+def _sphere_grid(value: str) -> tuple[int, int]:
+    try:
+        raw_theta, raw_phi = value.split(",", maxsplit=1)
+        n_theta = _positive_int(raw_theta)
+        n_phi = _positive_int(raw_phi)
+    except (TypeError, ValueError, argparse.ArgumentTypeError) as exc:
+        raise argparse.ArgumentTypeError(
+            "must be two positive integers formatted n_theta,n_phi"
+        ) from exc
+    if n_theta < 2 or n_phi < 3:
+        raise argparse.ArgumentTypeError("requires n_theta >= 2 and n_phi >= 3")
+    return n_theta, n_phi
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -96,6 +111,29 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=DEFAULT_SOURCE_TAG,
         help="driven physical tag (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--sphere-grid",
+        type=_sphere_grid,
+        default=None,
+        metavar="N_THETA,N_PHI",
+        help="append a frame-relative full-sphere field grid",
+    )
+    parser.add_argument(
+        "--native-symmetry-plane",
+        choices=("yz", "xz", "xy", "yz+xz"),
+        default=None,
+        help="native mirror plane for an already reduced input mesh",
+    )
+    parser.add_argument(
+        "--disable-sphere-symmetry-dedupe",
+        action="store_true",
+        help="evaluate every sphere-grid point for a symmetry A/B",
+    )
+    parser.add_argument(
+        "--native-allow-open-rim",
+        action="store_true",
+        help="allow real off-plane free edges on a mirror-reduced open shell",
     )
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     return parser.parse_args(argv)
@@ -169,7 +207,14 @@ def _built_in_box():
     )
 
 
-def _observation_points(mesh: Any) -> np.ndarray:
+def _observation_points(
+    mesh: Any,
+    *,
+    source_tag: int,
+    sphere_grid: tuple[int, int] | None,
+    native_symmetry_plane: str | None,
+    disable_sphere_symmetry_dedupe: bool,
+) -> tuple[np.ndarray, int, int]:
     lower, upper = mesh.info.bounding_box_m
     lower = np.asarray(lower, dtype=np.float64)
     upper = np.asarray(upper, dtype=np.float64)
@@ -189,7 +234,47 @@ def _observation_points(mesh: Any) -> np.ndarray:
         ],
         dtype=np.float64,
     )
-    return np.ascontiguousarray(points.T, dtype=np.float32)
+    sphere_total = 0
+    sphere_evaluated = 0
+    if sphere_grid is not None:
+        from hornlab_metal_bem.config import ObservationConfig
+        from hornlab_metal_bem.observation import (
+            build_mirror_evaluation_classes,
+            build_sphere_grid_points,
+            infer_frame,
+        )
+
+        frame = infer_frame(
+            mesh.grid,
+            mesh.physical_tags,
+            source_tag=source_tag,
+            origin_at="mouth",
+            symmetry_plane=native_symmetry_plane,
+        )
+        sphere_points, _theta, _phi = build_sphere_grid_points(
+            frame,
+            ObservationConfig(
+                distance_m=span,
+                sphere_grid=sphere_grid,
+            ),
+        )
+        sphere_total = int(sphere_points.shape[0])
+        evaluation_points = sphere_points
+        if (
+            native_symmetry_plane in {"yz", "xz", "yz+xz"}
+            and not disable_sphere_symmetry_dedupe
+        ):
+            evaluation_points, _inverse = build_mirror_evaluation_classes(
+                sphere_points,
+                native_symmetry_plane,
+            )
+        sphere_evaluated = int(evaluation_points.shape[0])
+        points = np.vstack([points, evaluation_points])
+    return (
+        np.ascontiguousarray(points.T, dtype=np.float32),
+        sphere_total,
+        sphere_evaluated,
+    )
 
 
 def _environment_header() -> dict[str, str | None]:
@@ -323,6 +408,7 @@ def _run_record(
         "first_result_latency_seconds": first_latency_s,
         "first_result_latency_source": first_latency_source,
         "system_order_dofs": system_order,
+        "field_share_of_wall": field_s / wall_s if wall_s > 0.0 else 0.0,
         "case_diagnostics": case_diagnostics,
     }
     if correction_detail:
@@ -358,6 +444,7 @@ def _print_plain(payload: dict[str, Any]) -> None:
                 for name, seconds in record["stages"].items()
             )
         )
+        print(f"  field_share_of_wall={100.0 * record['field_share_of_wall']:.2f}%")
         for diagnostics in record["case_diagnostics"]:
             values = [
                 f"{name}={value}"
@@ -399,7 +486,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"solve benchmark skipped: {reason}", file=sys.stderr)
         return 0
 
-    mesh = load_mesh(args.mesh) if args.mesh is not None else _built_in_box()
+    mesh = (
+        load_mesh(
+            args.mesh,
+            native_symmetry_plane=args.native_symmetry_plane,
+        )
+        if args.mesh is not None
+        else _built_in_box()
+    )
     source_tag = int(args.source_tag)
     available_tags = {int(value) for value in np.unique(mesh.physical_tags)}
     if source_tag not in available_tags:
@@ -440,14 +534,24 @@ def main(argv: list[str] | None = None) -> int:
     records: list[dict[str, Any]] = []
     with MetalNativeStandardSession.create_session(
         geometry_buffers=geometry,
+        symmetry_plane=args.native_symmetry_plane,
         aperture_tag=aperture_tag,
         velocity_source_tags=[source_tag],
+        check_open_edges=not args.native_allow_open_rim,
         runtime_status=runtime,
         # Deliberately omit extra_env: subprocess inherits os.environ verbatim,
         # so assembly implementation, dense dtype, and near-quadrature A/B knobs
         # select the helper path without this harness silently normalizing them.
     ) as session:
-        points = _observation_points(mesh)
+        points, sphere_total, sphere_evaluated = _observation_points(
+            mesh,
+            source_tag=source_tag,
+            sphere_grid=args.sphere_grid,
+            native_symmetry_plane=args.native_symmetry_plane,
+            disable_sphere_symmetry_dedupe=(
+                args.disable_sphere_symmetry_dedupe
+            ),
+        )
         for repeat_index in range(args.repeat):
             records.append(
                 _run_record(
@@ -487,6 +591,17 @@ def main(argv: list[str] | None = None) -> int:
         "frequency_count": int(frequencies.size),
         "frequencies_hz": frequencies.tolist(),
         "repeat_count": args.repeat,
+        "observation": {
+            "sphere_grid": list(args.sphere_grid) if args.sphere_grid else None,
+            "sphere_targets": sphere_total,
+            "sphere_evaluation_targets": sphere_evaluated,
+            "native_symmetry_plane": args.native_symmetry_plane,
+            "sphere_symmetry_dedupe": bool(
+                args.sphere_grid is not None
+                and args.native_symmetry_plane in {"yz", "xz", "yz+xz"}
+                and not args.disable_sphere_symmetry_dedupe
+            ),
+        },
         "timing_notes": {
             "reported_stages_sum_seconds": (
                 "regular assembly + Duffy/near corrections + dense solve + field"
