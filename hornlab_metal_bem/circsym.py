@@ -30,7 +30,11 @@ from scipy import linalg
 from scipy.special import ellipe, ellipk
 
 from ._constants import SPEED_OF_SOUND
-from .bie import _taper_values
+from .bie import (
+    _taper_values,
+    integrate_driven_surface_power,
+    normal_velocity_from_driver_neumann,
+)
 from .config import (
     AnnularProfile,
     AxialProfile,
@@ -51,6 +55,7 @@ from .sweep import (
     _directivity_from_pressure,
     _impedance_sources_for_frequencies,
     _resolve_sphere_observation,
+    _sphere_power_from_log,
     _sphere_pressure_from_log,
 )
 
@@ -343,6 +348,7 @@ def run_sweep_circsym(
         [] if config.return_surface_pressure else None
     )
     surface_pavg: dict[int, list[complex]] = {int(tag): [] for tag in source_tags}
+    surface_power_rows: list[float] = []
 
     for freq_index, frequency_hz in enumerate(frequencies_arr):
         _check_circsym_continue(config)
@@ -466,6 +472,20 @@ def run_sweep_circsym(
         field_s = time.time() - t_field
 
         directivity = _directivity_from_pressure(field_pressure, on_axis_idx)
+        normal_velocity = normal_velocity_from_driver_neumann(
+            q_driver,
+            omega,
+            config.air_density,
+        )
+        surface_power_rows.append(
+            float(
+                integrate_driven_surface_power(
+                    pressure,
+                    normal_velocity,
+                    geom.area_weights,
+                )
+            )
+        )
         pavg = _surface_pressure_average(meridian, pressure, source_tags)
         for tag in source_tags:
             surface_pavg[int(tag)].append(pavg[int(tag)])
@@ -568,6 +588,11 @@ def run_sweep_circsym(
         "directivity_s": sum(float(entry["field_s"]) for entry in solver_log),
         "total_s": time.time() - t_total,
     }
+    radiated_power_sphere_w, sphere_coverage_sr = _sphere_power_from_log(
+        solver_log,
+        config,
+        n_sphere,
+    )
 
     return SolveResult(
         frequencies_hz=np.asarray(completed_freqs, dtype=np.float64),
@@ -592,6 +617,12 @@ def run_sweep_circsym(
         sphere_points=sphere_points_arr,
         sphere_theta_deg=sphere_theta_deg,
         sphere_phi_deg=sphere_phi_deg,
+        radiated_power_surface_w=np.asarray(
+            surface_power_rows,
+            dtype=np.float64,
+        ),
+        radiated_power_sphere_w=radiated_power_sphere_w,
+        radiated_power_sphere_coverage_sr=sphere_coverage_sr,
     )
 
 
@@ -714,6 +745,7 @@ def run_sweep_coupled_ib(
     surface_pavg: dict[int, list[complex]] = {
         int(tag): [] for tag in source_tags
     }
+    surface_power_rows: list[float] = []
     impedance_sources_arg = _impedance_sources_for_frequencies(
         meridian.physical_tags, frequencies_arr, config
     )
@@ -839,6 +871,20 @@ def run_sweep_coupled_ib(
         field_s = time.time() - t_field
 
         directivity = _directivity_from_pressure(field_pressure, on_axis_idx)
+        normal_velocity = normal_velocity_from_driver_neumann(
+            q_driver,
+            omega,
+            config.air_density,
+        )
+        surface_power_rows.append(
+            float(
+                integrate_driven_surface_power(
+                    p_srf,
+                    normal_velocity,
+                    geom.area_weights,
+                )
+            )
+        )
         impedance = complex(np.sum(p_srf[idx_t] * throat_weights) / throat_area)
 
         pressure_rows.append(field_pressure)
@@ -932,6 +978,11 @@ def run_sweep_coupled_ib(
         "directivity_s": sum(float(entry["field_s"]) for entry in solver_log),
         "total_s": time.time() - t_total,
     }
+    radiated_power_sphere_w, sphere_coverage_sr = _sphere_power_from_log(
+        solver_log,
+        config,
+        n_sphere,
+    )
 
     return SolveResult(
         frequencies_hz=np.asarray(completed_freqs, dtype=np.float64),
@@ -956,6 +1007,12 @@ def run_sweep_coupled_ib(
         sphere_points=sphere_points_arr,
         sphere_theta_deg=sphere_theta_deg,
         sphere_phi_deg=sphere_phi_deg,
+        radiated_power_surface_w=np.asarray(
+            surface_power_rows,
+            dtype=np.float64,
+        ),
+        radiated_power_sphere_w=radiated_power_sphere_w,
+        radiated_power_sphere_coverage_sr=sphere_coverage_sr,
     )
 
 

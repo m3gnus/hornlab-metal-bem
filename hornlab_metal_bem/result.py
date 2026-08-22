@@ -85,6 +85,18 @@ class SolveResult:
     sphere_theta_deg: NDArray[np.float64] | None = None
     sphere_phi_deg: NDArray[np.float64] | None = None
 
+    # Time-averaged acoustic power delivered through prescribed-velocity
+    # boundary faces, shape (F,), in watts. Computed internally even when the
+    # optional surface traces are not retained on the result.
+    radiated_power_surface_w: NDArray[np.float64] | None = None
+
+    # Far-field power integrated over a frame-relative sphere_grid, shape
+    # (F,), in watts. Explicit sphere_points have no quadrature contract and
+    # therefore leave these fields unset. Coverage is the integrated solid
+    # angle in steradians (4*pi for a full sphere, 2*pi for a hemisphere).
+    radiated_power_sphere_w: NDArray[np.float64] | None = None
+    radiated_power_sphere_coverage_sr: float | None = None
+
     @property
     def spl_norm_db(self) -> NDArray[np.float64]:
         """Alias for normalized directivity in dB."""

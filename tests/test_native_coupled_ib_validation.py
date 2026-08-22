@@ -347,6 +347,57 @@ def test_native_coupled_ib_straight_circular_channel_matches_circsym(
     assert max_error_db < 0.05
 
 
+@pytest.mark.slow
+def test_native_coupled_channel_surface_and_hemisphere_power_agree():
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    radius = 0.04
+    depth = 0.003
+    frequencies_hz = np.array([800.0, 1200.0, 1600.0], dtype=np.float64)
+    observation = ObservationConfig(
+        distance_m=2.0,
+        angle_min_deg=0.0,
+        angle_max_deg=90.0,
+        angle_count=3,
+        planes=["horizontal"],
+        origin="mouth",
+        sphere_grid=(37, 72),
+        sphere_theta_max_deg=90.0,
+    )
+    config = SolveConfig(
+        velocity_sources={TAG_THROAT: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        aperture_tag=TAG_APERTURE,
+        observation=observation,
+        frame_override=_z_axis_frame(depth),
+        metal_native_assembly_mode="corrected",
+        dense_solve_dtype="float64",
+    )
+
+    result = metal_bem.solve_frequencies(
+        _straight_channel_mesh(radius, depth, rings=5, sectors=32),
+        frequencies_hz,
+        config,
+    )
+
+    assert result.radiated_power_surface_w is not None
+    assert result.radiated_power_sphere_w is not None
+    assert result.radiated_power_sphere_coverage_sr == pytest.approx(2.0 * np.pi)
+    assert np.all(np.isfinite(result.radiated_power_surface_w))
+    assert np.all(np.isfinite(result.radiated_power_sphere_w))
+    assert np.all(result.radiated_power_surface_w > 0.0)
+    assert np.all(result.radiated_power_sphere_w > 0.0)
+    agreement_db = 10.0 * np.log10(
+        result.radiated_power_sphere_w / result.radiated_power_surface_w
+    )
+    assert float(np.max(np.abs(agreement_db))) < 0.2
+
+
 def test_native_coupled_ib_deep_circular_channel_matches_circsym(
     monkeypatch: pytest.MonkeyPatch,
 ):

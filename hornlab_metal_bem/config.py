@@ -235,6 +235,14 @@ class ObservationConfig:
     sphere_grid: tuple[int, int] | None = None
     sphere_theta_max_deg: float = 180.0
 
+    # Evaluate only one point per native mirror-symmetry orbit, then scatter
+    # back to the complete sphere_grid. This affects frame-relative grids only;
+    # explicit sphere_points are always evaluated exactly as supplied. Set
+    # False for an in-process A/B. The environment variable
+    # HORNLAB_METAL_BEM_SPHERE_SYMMETRY_DEDUPE=0 is an equivalent process-wide
+    # escape hatch.
+    sphere_symmetry_dedupe: bool = True
+
     def __post_init__(self) -> None:
         if not self.planes:
             raise ValueError("observation planes must not be empty")
@@ -287,6 +295,8 @@ class ObservationConfig:
             self.sphere_grid = (n_theta, n_phi)
         if not (0.0 < float(self.sphere_theta_max_deg) <= 180.0):
             raise ValueError("sphere_theta_max_deg must be in (0, 180]")
+        if not isinstance(self.sphere_symmetry_dedupe, bool):
+            raise ValueError("sphere_symmetry_dedupe must be a bool")
 
 
 @dataclass
