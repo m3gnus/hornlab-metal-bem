@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import os
 from pathlib import Path
 import platform
@@ -49,10 +50,45 @@ def _counting_compiler(tmp_path: Path, *, delay_s: float = 0.0):
 
 
 def _kernel_library_path(cache_dir: Path) -> Path:
+    """Return the pre-generation canonical path used by old cache versions."""
+
     extension = ".dylib" if platform.system() == "Darwin" else ".so"
     return cache_dir / f"circsym_remainder_{_circsym_c_kernel_cache_key()}{extension}"
 
 
+def _kernel_selection_path(cache_dir: Path) -> Path:
+    return cache_dir / f"circsym_remainder_{_circsym_c_kernel_cache_key()}.current"
+
+
+def _generation_library_path(cache_dir: Path, generation: str) -> Path:
+    extension = ".dylib" if platform.system() == "Darwin" else ".so"
+    return cache_dir / (
+        f"circsym_remainder_{_circsym_c_kernel_cache_key()}.{generation}{extension}"
+    )
+
+
+def _selected_library_path(cache_dir: Path) -> Path:
+    return cache_dir / _kernel_selection_path(cache_dir).read_text(
+        encoding="ascii"
+    ).strip()
+
+
+def _compile_library_without_kernel_exports(output: Path, tmp_path: Path) -> None:
+    compiler = shutil.which(os.environ.get("CC", "cc"))
+    if compiler is None:
+        pytest.skip("runtime C compiler is unavailable")
+    source = tmp_path / f"wrong-{output.stem}.c"
+    source.write_text("int unrelated_export(void) { return 7; }\n", encoding="ascii")
+    command = [compiler, "-O2", "-fPIC"]
+    command.append("-dynamiclib" if platform.system() == "Darwin" else "-shared")
+    command.extend([str(source), "-o", str(output)])
+    subprocess.run(command, check=True, capture_output=True, text=True)
+    output.chmod(0o700)
+    _kernel_selection_path(output.parent).write_text(output.name + "\n", encoding="ascii")
+    _kernel_selection_path(output.parent).chmod(0o600)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the runtime C kernel is POSIX-only")
 def test_c_kernel_cache_uses_the_current_users_cache(monkeypatch, tmp_path: Path):
     monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
@@ -164,9 +200,10 @@ def test_c_kernel_cache_rebuilds_an_unsafe_planted_library(
         "compile"
     ]
     assert planted_load_attempts == []
-    assert not library_path.is_symlink()
-    assert stat.S_ISREG(library_path.lstat().st_mode)
-    assert stat.S_IMODE(library_path.stat().st_mode) == 0o700
+    assert not library_path.exists() and not library_path.is_symlink()
+    selected = _selected_library_path(cache_dir)
+    assert stat.S_ISREG(selected.lstat().st_mode)
+    assert stat.S_IMODE(selected.stat().st_mode) == 0o700
     assert stat.S_IMODE(cache_dir.stat().st_mode) == 0o700
 
 
@@ -177,29 +214,81 @@ def test_c_kernel_cache_recompiles_once_after_load_failure(
 ):
     compiler_wrapper, invocation_log = _counting_compiler(tmp_path)
     cache_home = tmp_path / "cache"
-    monkeypatch.setenv("CC", str(compiler_wrapper))
     monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
     cache_dir = Path(_circsym_c_kernel_cache_dir())
     _prepare_circsym_c_kernel_cache(str(cache_dir))
 
-    library_path = _kernel_library_path(cache_dir)
-    library_path.write_bytes(b"private but unloadable shared library")
-    library_path.chmod(0o700)
+    rejected_path = _generation_library_path(cache_dir, "missing-exports")
+    _compile_library_without_kernel_exports(rejected_path, tmp_path)
+    monkeypatch.setenv("CC", str(compiler_wrapper))
+    # Reproduce dyld/dlopen's pathname cache: the wrong image is already a
+    # valid loaded shared library, but it lacks the two required kernel exports.
+    preloaded = ctypes.CDLL(str(rejected_path))
+    assert not hasattr(preloaded, "circsym_eval_near_remainder")
 
     circsym._load_circsym_remainder_c_kernel.cache_clear()
     try:
-        assert circsym._load_circsym_remainder_c_kernel() is not None
+        kernel = circsym._load_circsym_remainder_c_kernel()
+        assert kernel is not None
     finally:
         circsym._load_circsym_remainder_c_kernel.cache_clear()
 
-    # The existing file passed ownership/type/mode validation, failed ctypes,
-    # and was then replaced by exactly one successful recompilation.
+    # Rebuilding at the rejected pathname would make CDLL return `preloaded`
+    # again. Publication selects a new generation pathname instead.
     assert invocation_log.read_text(encoding="utf-8").splitlines() == [
         "compile"
     ]
-    assert library_path.stat().st_size > len(
-        b"private but unloadable shared library"
+    selected = _selected_library_path(cache_dir)
+    assert selected != rejected_path
+    assert Path(kernel.library._name) == selected
+    assert hasattr(kernel.library, "circsym_eval_near_remainder")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the runtime C kernel is POSIX-only")
+def test_concurrent_processes_heal_one_missing_export_generation(tmp_path: Path):
+    cache_home = tmp_path / "cache"
+    cache_dir = cache_home / "hornlab-metal-bem" / "circsym"
+    _prepare_circsym_c_kernel_cache(str(cache_dir))
+    rejected_path = _generation_library_path(cache_dir, "missing-exports")
+    _compile_library_without_kernel_exports(rejected_path, tmp_path)
+    compiler_wrapper, invocation_log = _counting_compiler(tmp_path, delay_s=0.2)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "CC": str(compiler_wrapper),
+            "XDG_CACHE_HOME": str(cache_home),
+            "PYTHONPATH": os.pathsep.join(
+                filter(None, (str(ROOT), env.get("PYTHONPATH", "")))
+            ),
+        }
     )
+    probe = (
+        "from hornlab_metal_bem.circsym import "
+        "_load_circsym_remainder_c_kernel as load; "
+        "kernel = load(); assert kernel is not None; "
+        f"assert kernel.library._name != {str(rejected_path)!r}"
+    )
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", probe],
+            cwd=ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(6)
+    ]
+    failures = []
+    for process in processes:
+        stdout, stderr = process.communicate(timeout=60.0)
+        if process.returncode != 0:
+            failures.append((process.returncode, stdout, stderr))
+
+    assert failures == []
+    assert invocation_log.read_text(encoding="utf-8").splitlines() == ["compile"]
+    assert _selected_library_path(cache_dir) != rejected_path
 
 
 @pytest.mark.skipif(os.name != "posix", reason="the runtime C kernel is POSIX-only")

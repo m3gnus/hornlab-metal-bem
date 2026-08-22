@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import platform
+import secrets
 import stat
 import subprocess
 import sys
@@ -2292,6 +2293,68 @@ def _validated_private_cache_file(
     return None
 
 
+def _circsym_c_kernel_artifact_paths(
+    cache_dir: str,
+    cache_key: str,
+    platform_name: str,
+) -> tuple[str, str, str, str]:
+    """Return source, selection, legacy-library, and extension names."""
+
+    lib_ext = ".dylib" if platform_name == "darwin" else ".so"
+    stem = f"circsym_remainder_{cache_key}"
+    return (
+        os.path.join(cache_dir, f"{stem}.c"),
+        os.path.join(cache_dir, f"{stem}.current"),
+        os.path.join(cache_dir, f"{stem}{lib_ext}"),
+        lib_ext,
+    )
+
+
+def _selected_circsym_c_kernel_library(
+    *,
+    cache_dir: str,
+    cache_key: str,
+    platform_name: str,
+    selection_path: str,
+) -> tuple[str, tuple[int, int, int, int]] | None:
+    """Resolve a validated generation name from the private selection file."""
+
+    selection_stat = _validated_private_cache_file(
+        selection_path,
+        expected_mode=0o600,
+    )
+    if selection_stat is None:
+        return None
+    try:
+        with open(selection_path, encoding="ascii") as handle:
+            generation = handle.read(512).strip()
+    except (OSError, UnicodeError):
+        os.unlink(selection_path)
+        return None
+    extension = ".dylib" if platform_name == "darwin" else ".so"
+    prefix = f"circsym_remainder_{cache_key}."
+    valid_name = (
+        generation == os.path.basename(generation)
+        and generation.startswith(prefix)
+        and generation.endswith(extension)
+        and len(generation) > len(prefix) + len(extension)
+        and "/" not in generation
+        and "\\" not in generation
+    )
+    if not valid_name:
+        os.unlink(selection_path)
+        return None
+    library_path = os.path.join(cache_dir, generation)
+    library_stat = _validated_private_cache_file(
+        library_path,
+        expected_mode=0o700,
+    )
+    if library_stat is None:
+        os.unlink(selection_path)
+        return None
+    return library_path, _cache_file_identity(library_stat)
+
+
 def _compile_circsym_remainder_c_kernel(
     *,
     cache_dir: str,
@@ -2304,14 +2367,17 @@ def _compile_circsym_remainder_c_kernel(
 
     import fcntl
 
-    lib_ext = ".dylib" if platform_name == "darwin" else ".so"
-    source_path = os.path.join(cache_dir, f"circsym_remainder_{cache_key}.c")
-    library_path = os.path.join(
-        cache_dir, f"circsym_remainder_{cache_key}{lib_ext}"
+    source_path, selection_path, legacy_library_path, lib_ext = (
+        _circsym_c_kernel_artifact_paths(
+            cache_dir,
+            cache_key,
+            platform_name,
+        )
     )
     cache_fd = _open_private_cache_directory(cache_dir)
     source_temp: str | None = None
     library_temp: str | None = None
+    selection_temp: str | None = None
     try:
         # Lock the directory inode itself. This serializes validation and
         # publication without first having to trust a pre-existing lock file.
@@ -2339,22 +2405,29 @@ def _compile_circsym_remainder_c_kernel(
         # lock. In particular, never trust a hash-named library planted while
         # an older cache directory was group- or world-writable.
         _validated_private_cache_file(source_path, expected_mode=0o600)
-        library_stat = _validated_private_cache_file(
-            library_path,
+        legacy_library_stat = _validated_private_cache_file(
+            legacy_library_path,
             expected_mode=0o700,
         )
-        if library_stat is not None:
-            identity = _cache_file_identity(library_stat)
+        if legacy_library_stat is not None:
+            # Before generation names, a failed dlopen was healed by replacing
+            # this canonical pathname. Dynamic loaders cache handles by name,
+            # so the process could keep seeing the rejected image after the
+            # bytes changed. Never select that ambiguous legacy pathname.
+            os.unlink(legacy_library_path)
+        selected = _selected_circsym_c_kernel_library(
+            cache_dir=cache_dir,
+            cache_key=cache_key,
+            platform_name=platform_name,
+            selection_path=selection_path,
+        )
+        if selected is not None:
+            library_path, identity = selected
             if (
                 rejected_library_identity is None
                 or identity != rejected_library_identity
             ):
                 return library_path, identity
-            os.unlink(library_path)
-            try:
-                os.unlink(source_path)
-            except FileNotFoundError:
-                pass
 
         source_fd, source_temp = tempfile.mkstemp(
             prefix=f".circsym_remainder_{cache_key}.",
@@ -2384,29 +2457,47 @@ def _compile_circsym_remainder_c_kernel(
         subprocess.run(command, check=True, capture_output=True, text=True)
         os.chmod(library_temp, 0o700)
 
+        generation_path = os.path.join(
+            cache_dir,
+            f"circsym_remainder_{cache_key}.{secrets.token_hex(12)}{lib_ext}",
+        )
+
         # Both names become visible only after their contents are complete. The
-        # library replacement is the important one: a concurrent loader can
-        # observe either no file or a complete shared library, never the
-        # compiler's partially-written output.
+        # generation name is new on every build, so a dynamic loader can never
+        # return a cached handle for rejected bytes at an atomically-replaced
+        # canonical pathname. The selection file is published last and is the
+        # only route by which another process discovers this generation.
         os.replace(source_temp, source_path)
         source_temp = None
-        os.replace(library_temp, library_path)
+        os.replace(library_temp, generation_path)
         library_temp = None
+        selection_fd, selection_temp = tempfile.mkstemp(
+            prefix=f".circsym_remainder_{cache_key}.",
+            suffix=".current.tmp",
+            dir=cache_dir,
+        )
+        with os.fdopen(selection_fd, "w", encoding="ascii") as handle:
+            handle.write(os.path.basename(generation_path) + "\n")
+        os.chmod(selection_temp, 0o600)
+        os.replace(selection_temp, selection_path)
+        selection_temp = None
         final_source_stat = _validated_private_cache_file(
             source_path,
             expected_mode=0o600,
         )
-        final_library_stat = _validated_private_cache_file(
-            library_path,
-            expected_mode=0o700,
+        final_selection = _selected_circsym_c_kernel_library(
+            cache_dir=cache_dir,
+            cache_key=cache_key,
+            platform_name=platform_name,
+            selection_path=selection_path,
         )
-        if final_source_stat is None or final_library_stat is None:
+        if final_source_stat is None or final_selection is None:
             raise PermissionError(
                 "CircSym C-kernel cache publication failed validation"
             )
-        return library_path, _cache_file_identity(final_library_stat)
+        return final_selection
     finally:
-        for temporary in (source_temp, library_temp):
+        for temporary in (source_temp, library_temp, selection_temp):
             if temporary is not None:
                 try:
                     os.unlink(temporary)
