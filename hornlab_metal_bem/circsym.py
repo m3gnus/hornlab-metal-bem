@@ -2139,6 +2139,114 @@ class _CircsymRemainderKernel:
     implementation: Any
 
 
+def _circsym_c_kernel_cache_dir() -> str:
+    """Return a per-user cache directory for the runtime C kernel.
+
+    The former cache lived directly under ``tempfile.gettempdir()``.  Besides
+    being shared by every account on a machine, that let unrelated processes
+    compile to the same final library path at the same time.  Follow the host's
+    user-cache convention instead; an absolute XDG override is honoured on all
+    POSIX hosts so containers and test runners can keep their caches isolated.
+    """
+
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache and os.path.isabs(xdg_cache):
+        base = xdg_cache
+    elif platform.system() == "Darwin":
+        base = os.path.expanduser("~/Library/Caches")
+    else:
+        base = os.path.expanduser("~/.cache")
+    return os.path.join(base, "hornlab-metal-bem", "circsym")
+
+
+def _prepare_circsym_c_kernel_cache(cache_dir: str) -> None:
+    """Create and permission-check the private runtime-kernel cache."""
+
+    os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+    cache_stat = os.stat(cache_dir)
+    if hasattr(os, "geteuid") and cache_stat.st_uid != os.geteuid():
+        raise PermissionError(
+            "CircSym C-kernel cache is not owned by the current user: "
+            f"{cache_dir}"
+        )
+    # ``mode`` only applies when makedirs creates the leaf.  Tighten a reused
+    # user-owned directory too so the source, lock, and library are not exposed
+    # through an old permissive umask.
+    os.chmod(cache_dir, 0o700)
+
+
+def _compile_circsym_remainder_c_kernel(
+    *,
+    cache_dir: str,
+    source_hash: str,
+    platform_name: str,
+    compiler: str,
+) -> str:
+    """Compile once across processes and publish the library atomically."""
+
+    import fcntl
+
+    lib_ext = ".dylib" if platform_name == "darwin" else ".so"
+    source_path = os.path.join(cache_dir, f"circsym_remainder_{source_hash}.c")
+    library_path = os.path.join(
+        cache_dir, f"circsym_remainder_{source_hash}{lib_ext}"
+    )
+    lock_path = os.path.join(cache_dir, f"circsym_remainder_{source_hash}.lock")
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    source_temp: str | None = None
+    library_temp: str | None = None
+    try:
+        with os.fdopen(lock_fd, "rb+", closefd=True) as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            if os.path.exists(library_path):
+                return library_path
+
+            source_fd, source_temp = tempfile.mkstemp(
+                prefix=f".circsym_remainder_{source_hash}.",
+                # Keep the language-bearing extension last so clang and gcc
+                # recognize this as C without relying on a compiler-specific
+                # command-line override.
+                suffix=".tmp.c",
+                dir=cache_dir,
+            )
+            with os.fdopen(source_fd, "w", encoding="utf-8") as handle:
+                handle.write(_CIRCSYM_REMAINDER_C_SOURCE)
+
+            library_fd, library_temp = tempfile.mkstemp(
+                prefix=f".circsym_remainder_{source_hash}.",
+                suffix=f"{lib_ext}.tmp",
+                dir=cache_dir,
+            )
+            os.close(library_fd)
+            command = [compiler, "-O3", "-fPIC"]
+            if platform_name == "darwin":
+                command.append("-dynamiclib")
+            else:
+                command.append("-shared")
+            command.extend(
+                [source_temp, "-o", library_temp, "-lm", "-pthread"]
+            )
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            os.chmod(library_temp, 0o700)
+
+            # Both names become visible only after their contents are complete.
+            # The library replacement is the important one: a concurrent loader
+            # can observe either no file or a complete shared library, never the
+            # compiler's partially-written output.
+            os.replace(source_temp, source_path)
+            source_temp = None
+            os.replace(library_temp, library_path)
+            library_temp = None
+            return library_path
+    finally:
+        for temporary in (source_temp, library_temp):
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+
+
 @lru_cache(maxsize=1)
 def _load_circsym_remainder_c_kernel() -> _CircsymRemainderCKernel | None:
     global _circsym_c_kernel_failure
@@ -2152,31 +2260,19 @@ def _load_circsym_remainder_c_kernel() -> _CircsymRemainderCKernel | None:
         return None
     cc = os.environ.get("CC", "cc")
     source_hash = hashlib.sha256(_CIRCSYM_REMAINDER_C_SOURCE.encode("utf-8")).hexdigest()[:16]
-    cache_dir = os.path.join(tempfile.gettempdir(), "hornlab-metal-bem-circsym")
+    cache_dir = _circsym_c_kernel_cache_dir()
     try:
-        os.makedirs(cache_dir, exist_ok=True)
-    except OSError as exc:
-        _circsym_c_kernel_failure = f"could not create the kernel cache: {exc}"
+        _prepare_circsym_c_kernel_cache(cache_dir)
+        library_path = _compile_circsym_remainder_c_kernel(
+            cache_dir=cache_dir,
+            source_hash=source_hash,
+            platform_name=platform.system().lower(),
+            compiler=cc,
+        )
+    except Exception as exc:
+        _circsym_c_kernel_failure = str(exc)
+        logger.debug("CircSym C remainder kernel unavailable: %s", exc)
         return None
-    platform_name = platform.system().lower()
-    lib_ext = ".dylib" if platform_name == "darwin" else ".so"
-    source_path = os.path.join(cache_dir, f"circsym_remainder_{source_hash}.c")
-    library_path = os.path.join(cache_dir, f"circsym_remainder_{source_hash}{lib_ext}")
-    if not os.path.exists(library_path):
-        try:
-            with open(source_path, "w", encoding="utf-8") as handle:
-                handle.write(_CIRCSYM_REMAINDER_C_SOURCE)
-            command = [cc, "-O3", "-fPIC"]
-            if platform_name == "darwin":
-                command.append("-dynamiclib")
-            else:
-                command.append("-shared")
-            command.extend([source_path, "-o", library_path, "-lm", "-pthread"])
-            subprocess.run(command, check=True, capture_output=True, text=True)
-        except Exception as exc:
-            _circsym_c_kernel_failure = str(exc)
-            logger.debug("CircSym C remainder kernel unavailable: %s", exc)
-            return None
     try:
         kernel = _CircsymRemainderCKernel(library_path)
         _circsym_c_kernel_failure = None
