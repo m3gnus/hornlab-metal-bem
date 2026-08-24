@@ -23,6 +23,23 @@ _POINTS = np.array(
 )
 
 
+def _swift_complex32_multiply(lhs, rhs):
+    return np.complex64(
+        complex(
+            float(np.float32(lhs.real * rhs.real - lhs.imag * rhs.imag)),
+            float(np.float32(lhs.real * rhs.imag + lhs.imag * rhs.real)),
+        )
+    )
+
+
+def _swift_complex32_average(values):
+    real = np.float32(values[0].real + values[1].real)
+    real = np.float32(real + values[2].real) / np.float32(3.0)
+    imag = np.float32(values[0].imag + values[1].imag)
+    imag = np.float32(imag + values[2].imag) / np.float32(3.0)
+    return np.complex64(complex(float(real), float(imag)))
+
+
 def _require_native() -> None:
     from hornlab_metal_bem.metal import discover_native_runtime
 
@@ -152,16 +169,64 @@ def test_total_neumann_reconstruction_adds_only_robin_face_correction():
     expected_robin = []
     pressure_f32 = pressure.astype(np.complex64)
     for index in range(2):
-        p_avg = (
-            pressure_f32[index, 1] + pressure_f32[index, 2] + pressure_f32[index, 3]
-        ) / np.float32(3.0)
+        p_avg = _swift_complex32_average(pressure_f32[index, 1:4])
         i_k = np.complex64(complex(-float(k_imag[index]), float(k_real[index])))
+        correction = _swift_complex32_multiply(
+            _swift_complex32_multiply(i_k, np.complex64(betas[index][8])),
+            p_avg,
+        )
         expected_robin.append(
-            driver[index, 1] + i_k * np.complex64(betas[index][8]) * p_avg
+            np.complex64(
+                complex(
+                    float(np.float32(driver[index, 1].real + correction.real)),
+                    float(np.float32(driver[index, 1].imag + correction.imag)),
+                )
+            )
         )
     np.testing.assert_array_equal(
         total[:, 1], np.asarray(expected_robin, dtype=np.complex128)
     )
+
+
+def test_total_neumann_reconstruction_matches_swift_complex32_rounding():
+    driver = np.array([[3.0 + 4.0j, -2.0 + 1.5j]], dtype=np.complex64)
+    pressure = np.array(
+        [[2.0 + 2.0j, 4.0 + 4.0j, 8.0 + 8.0j, 1.0 - 3.0j, 5.0 + 7.0j, 9.0 - 2.0j]],
+        dtype=np.complex128,
+    )
+    local2global = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int32)
+    tags = np.array([8, 8], dtype=np.int32)
+    k_real = np.array([2.0], dtype=np.float32)
+    k_imag = np.array([0.1], dtype=np.float32)
+    beta = np.complex64(0.25 + 0.5j)
+
+    total = _total_neumann_from_surface_pressure(
+        driver,
+        pressure,
+        local2global,
+        tags,
+        k_real,
+        k_imag,
+        {8: complex(beta)},
+    )
+
+    i_k = np.complex64(complex(-float(k_imag[0]), float(k_real[0])))
+    coupling = _swift_complex32_multiply(i_k, beta)
+    expected = []
+    pressure_f32 = pressure.astype(np.complex64)
+    for face_index, dofs in enumerate(local2global):
+        p_average = _swift_complex32_average(pressure_f32[0, dofs])
+        correction = _swift_complex32_multiply(coupling, p_average)
+        expected.append(
+            np.complex64(
+                complex(
+                    float(np.float32(driver[0, face_index].real + correction.real)),
+                    float(np.float32(driver[0, face_index].imag + correction.imag)),
+                )
+            )
+        )
+
+    np.testing.assert_array_equal(total[0], np.asarray(expected, dtype=np.complex128))
 
 
 @pytest.mark.slow
