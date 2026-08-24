@@ -13,9 +13,12 @@ import pytest
 from hornlab_metal_bem.config import ObservationConfig
 from hornlab_metal_bem.observation import (
     ObservationFrame,
+    build_mirror_evaluation_classes,
     build_observation_points,
     build_sphere_grid_points,
     infer_frame,
+    integrate_sphere_radiated_power,
+    sphere_grid_solid_angle_weights,
 )
 
 
@@ -831,3 +834,127 @@ class TestBuildSphereGridPoints:
         idx_h = 1 * 4 + 0
         assert theta_deg[idx_h] == pytest.approx(90.0)
         np.testing.assert_allclose(points[idx_h], [0.0, 0.0, 2.0], atol=1e-12)
+
+
+class TestSphereGridIntegration:
+    @pytest.mark.parametrize(
+        ("theta_max_deg", "expected_coverage"),
+        [(180.0, 4.0 * np.pi), (90.0, 2.0 * np.pi)],
+    )
+    def test_cos_edge_weights_have_exact_coverage(
+        self,
+        theta_max_deg,
+        expected_coverage,
+    ):
+        weights = sphere_grid_solid_angle_weights(37, 72, theta_max_deg)
+
+        assert weights.shape == (37 * 72,)
+        assert np.all(weights > 0.0)
+        assert float(np.sum(weights)) == pytest.approx(
+            expected_coverage,
+            rel=2.0e-15,
+        )
+
+    def test_omnidirectional_pressure_integrates_exactly(self):
+        pressure_amplitude = 3.25
+        radius = 2.4
+        rho = 1.21
+        sound_speed = 344.0
+        weights = sphere_grid_solid_angle_weights(37, 72)
+        pressure = np.full((2, weights.size), pressure_amplitude + 0.0j)
+
+        actual = integrate_sphere_radiated_power(
+            pressure,
+            distance_m=radius,
+            solid_angle_weights_sr=weights,
+            air_density=rho,
+            speed_of_sound=sound_speed,
+        )
+        expected = (
+            4.0
+            * np.pi
+            * radius**2
+            * pressure_amplitude**2
+            / (2.0 * rho * sound_speed)
+        )
+
+        np.testing.assert_allclose(actual, [expected, expected], rtol=2.0e-15)
+
+
+class TestMirrorEvaluationClasses:
+    def test_yz_and_yz_xz_build_two_and_four_member_classes(self):
+        points = np.array(
+            [
+                [1.0, 2.0, 3.0],
+                [-1.0, 2.0, 3.0],
+                [1.0, -2.0, 3.0],
+                [-1.0, -2.0, 3.0],
+            ]
+        )
+
+        yz_points, yz_inverse = build_mirror_evaluation_classes(points, "yz")
+        quarter_points, quarter_inverse = build_mirror_evaluation_classes(
+            points,
+            "yz+xz",
+        )
+
+        assert yz_points.shape == (2, 3)
+        assert sorted(np.bincount(yz_inverse).tolist()) == [2, 2]
+        assert quarter_points.shape == (1, 3)
+        assert np.bincount(quarter_inverse).tolist() == [4]
+
+    def test_quantisation_tolerance_merges_roundoff_scale_images(self):
+        points = np.array([[1.0, 2.0, 3.0], [-1.0 + 2.0e-10, 2.0, 3.0]])
+
+        representatives, inverse = build_mirror_evaluation_classes(
+            points,
+            "yz",
+            tolerance=1.0e-8,
+        )
+
+        assert representatives.shape == (1, 3)
+        np.testing.assert_array_equal(inverse, [0, 0])
+
+    def test_incomplete_non_aligned_orbit_stays_unmerged(self):
+        # The first two points happen to share |x|, but their XZ-plane images
+        # are absent. Under the two-plane contract all four stay singletons.
+        points = np.array(
+            [
+                [1.0, 2.0, 3.0],
+                [-1.0, 2.0, 3.0],
+                [0.25, 0.75, 4.0],
+                [-0.5, -0.125, 5.0],
+            ]
+        )
+
+        representatives, inverse = build_mirror_evaluation_classes(
+            points,
+            "yz+xz",
+        )
+
+        np.testing.assert_array_equal(representatives, points)
+        np.testing.assert_array_equal(inverse, np.arange(points.shape[0]))
+
+    def test_non_aligned_observation_frame_grid_has_no_classes(self):
+        axis = np.array([1.0, 2.0, 3.0])
+        axis /= np.linalg.norm(axis)
+        u = np.cross(axis, [0.0, 0.0, 1.0])
+        u /= np.linalg.norm(u)
+        v = np.cross(axis, u)
+        frame = _make_frame(axis=axis, u=u, v=v)
+        points, _theta, _phi = build_sphere_grid_points(
+            frame,
+            ObservationConfig(
+                distance_m=2.0,
+                sphere_grid=(7, 12),
+                sphere_theta_max_deg=83.0,
+            ),
+        )
+
+        representatives, inverse = build_mirror_evaluation_classes(
+            points,
+            "yz+xz",
+        )
+
+        np.testing.assert_array_equal(representatives, points)
+        np.testing.assert_array_equal(inverse, np.arange(points.shape[0]))

@@ -471,3 +471,64 @@ def compute_surface_pressure_avg(
             result[tag] = complex(np.sum(p_avg_per_elem * elem_areas) / total_area)
 
     return result
+
+
+def normal_velocity_from_driver_neumann(
+    driver_neumann: NDArray,
+    omega: float | NDArray[np.float64],
+    air_density: float,
+) -> NDArray[np.complex128]:
+    """Recover the exact prescribed normal velocity from ``q=i*rho*omega*v``.
+
+    The input is the output of the same driver-Neumann builder sent to the
+    solver, so acceleration mode, callbacks, multi-tag weights, Robin skips,
+    and every per-face source profile are already resolved. This algebraic
+    inverse intentionally avoids a second, potentially drifting BC derivation.
+    """
+    q = np.asarray(driver_neumann, dtype=np.complex128)
+    omega_arr = np.asarray(omega, dtype=np.float64)
+    if omega_arr.ndim == 0:
+        denominator = 1j * float(air_density) * float(omega_arr)
+    else:
+        if q.ndim < 2 or q.shape[0] != omega_arr.size:
+            raise ValueError("omega rows must match driver_neumann rows")
+        denominator = 1j * float(air_density) * omega_arr.reshape(
+            (-1,) + (1,) * (q.ndim - 1)
+        )
+    return np.divide(
+        q,
+        denominator,
+        out=np.zeros_like(q, dtype=np.complex128),
+        where=np.asarray(denominator) != 0.0,
+    )
+
+
+def integrate_driven_surface_power(
+    face_pressure_complex: NDArray,
+    normal_velocity_complex: NDArray,
+    face_areas_m2: NDArray[np.float64],
+    *,
+    symmetry_multiplier: float = 1.0,
+) -> NDArray[np.float64]:
+    r"""Integrate time-averaged outward acoustic power over driven faces.
+
+    Under the package's :math:`e^{-i\omega t}` convention the outward intensity
+    is ``0.5*Re(p*conj(v_n))``. Zero normal velocity makes rigid and skipped
+    Robin faces contribute exactly zero, so callers may pass complete face
+    arrays without constructing an active-face mask.
+    """
+    pressure = np.asarray(face_pressure_complex, dtype=np.complex128)
+    velocity = np.asarray(normal_velocity_complex, dtype=np.complex128)
+    areas = np.asarray(face_areas_m2, dtype=np.float64).reshape(-1)
+    if pressure.shape != velocity.shape:
+        raise ValueError("face pressure and normal velocity shapes must match")
+    if pressure.ndim < 1 or pressure.shape[-1] != areas.size:
+        raise ValueError("face array final dimension must match face areas")
+    multiplier = float(symmetry_multiplier)
+    if not (np.isfinite(multiplier) and multiplier > 0.0):
+        raise ValueError("symmetry_multiplier must be finite and positive")
+    power = 0.5 * multiplier * np.sum(
+        np.real(pressure * np.conj(velocity)) * areas,
+        axis=-1,
+    )
+    return np.asarray(power, dtype=np.float64)

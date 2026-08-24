@@ -113,6 +113,32 @@ def _pulsating_sphere_mesh(radius: float, *, subdivisions: int = 3) -> LoadedMes
     )
 
 
+def _quarter_capped_sphere_mesh() -> LoadedMesh:
+    """Positive-X/Y quarter sphere with a driven +Z cap."""
+    vertices, triangles = _octasphere(2)
+    centroids = vertices[triangles].mean(axis=1)
+    keep = (centroids[:, 0] >= -1.0e-12) & (centroids[:, 1] >= -1.0e-12)
+    triangles = triangles[keep]
+    used = np.unique(triangles)
+    remap = np.full(vertices.shape[0], -1, dtype=np.int32)
+    remap[used] = np.arange(used.size, dtype=np.int32)
+    vertices = vertices[used]
+    triangles = remap[triangles]
+    centroids = vertices[triangles].mean(axis=1)
+    tags = np.ones(triangles.shape[0], dtype=np.int32)
+    tags[centroids[:, 2] > 0.55] = 2
+    return LoadedMesh(
+        grid=make_pure_grid(vertices, triangles),
+        physical_tags=tags,
+        info=MeshInfo(
+            n_vertices=vertices.shape[0],
+            n_triangles=triangles.shape[0],
+            physical_groups={1: "rigid", 2: "cap"},
+            bounding_box_m=(vertices.min(axis=0), vertices.max(axis=0)),
+        ),
+    )
+
+
 def _pulsating_sphere_meridian(radius: float, *, segments: int = 64) -> MeridianMesh:
     theta = np.linspace(0.0, np.pi, segments + 1)
     return MeridianMesh.from_polyline(
@@ -242,6 +268,118 @@ def test_native_sphere_grid_matches_coincident_arc_points():
     )
 
 
+@pytest.mark.slow
+def test_native_pulsating_sphere_surface_and_balloon_power_match_analytic():
+    _require_native()
+    radius = 0.05
+    ka = np.array([0.5, 1.0], dtype=np.float64)
+    frequencies_hz = ka * SPEED_OF_SOUND / (2.0 * np.pi * radius)
+    velocity = 0.75
+    observation = ObservationConfig(
+        planes=["horizontal"],
+        angle_count=3,
+        distance_m=2.0,
+        sphere_grid=(37, 72),
+    )
+    config = SolveConfig(
+        velocity_sources={2: velocity},
+        velocity_mode=VelocityMode.VELOCITY,
+        observation=observation,
+        frame_override=_sphere_frame(),
+        dense_solve_dtype="float64",
+    )
+
+    # 2048 faces: the inscribed octasphere's area deficit is 0.3% (1.3% at
+    # 512 faces), which keeps the mesh error well inside the 2% analytic gate.
+    result = metal_bem.solve_frequencies(
+        _pulsating_sphere_mesh(radius, subdivisions=4),
+        frequencies_hz,
+        config,
+    )
+    expected = (
+        0.5
+        * config.air_density
+        * SPEED_OF_SOUND
+        * velocity**2
+        * 4.0
+        * np.pi
+        * radius**2
+        * ka**2
+        / (1.0 + ka**2)
+    )
+
+    assert result.surface_pressure_complex is None
+    assert result.radiated_power_surface_w is not None
+    assert result.radiated_power_sphere_w is not None
+    assert result.radiated_power_sphere_coverage_sr == pytest.approx(4.0 * np.pi)
+    np.testing.assert_allclose(
+        result.radiated_power_surface_w,
+        expected,
+        rtol=0.02,
+    )
+    agreement_db = 10.0 * np.log10(
+        result.radiated_power_sphere_w / result.radiated_power_surface_w
+    )
+    assert float(np.max(np.abs(agreement_db))) < 0.1
+    assert np.all(result.radiated_power_surface_w > 0.0)
+    assert np.all(result.radiated_power_sphere_w > 0.0)
+
+
+@pytest.mark.slow
+def test_native_yz_xz_balloon_dedupe_matches_full_evaluation():
+    _require_native()
+    mesh = _quarter_capped_sphere_mesh()
+    common = dict(
+        planes=["horizontal"],
+        angle_count=3,
+        distance_m=2.0,
+        sphere_grid=(19, 36),
+    )
+    deduped = metal_bem.solve_frequencies(
+        mesh,
+        [320.0, 640.0],
+        SolveConfig(
+            velocity_sources={2: 1.0},
+            velocity_mode=VelocityMode.VELOCITY,
+            native_symmetry_plane="yz+xz",
+            observation=ObservationConfig(**common),
+            frame_override=_sphere_frame(),
+            native_check_open_edges=True,
+        ),
+    )
+    full = metal_bem.solve_frequencies(
+        mesh,
+        [320.0, 640.0],
+        SolveConfig(
+            velocity_sources={2: 1.0},
+            velocity_mode=VelocityMode.VELOCITY,
+            native_symmetry_plane="yz+xz",
+            observation=ObservationConfig(
+                **common,
+                sphere_symmetry_dedupe=False,
+            ),
+            frame_override=_sphere_frame(),
+            native_check_open_edges=True,
+        ),
+    )
+
+    assert deduped.sphere_pressure_complex is not None
+    assert full.sphere_pressure_complex is not None
+    np.testing.assert_allclose(
+        deduped.sphere_pressure_complex,
+        full.sphere_pressure_complex,
+        rtol=5.0e-4,
+        atol=1.0e-7,
+    )
+    total = 19 * 36
+    diagnostics = deduped.native_diagnostics[0]
+    assert diagnostics["sphere_targets"] == total
+    assert diagnostics["sphere_evaluation_targets"] <= int(0.27 * total)
+    assert diagnostics["sphere_symmetry_dedupe"] is True
+    assert full.native_diagnostics[0]["sphere_evaluation_targets"] == total
+    assert full.native_diagnostics[0]["sphere_symmetry_dedupe"] is False
+
+
 def test_circsym_sphere_grid_matches_arcs_and_point_source_decay():
     meridian = metal_bem.MeridianMesh.from_polyline(
         np.column_stack(
@@ -267,6 +405,18 @@ def test_circsym_sphere_grid_matches_arcs_and_point_source_decay():
     n_points = 7 * 12
     assert result.sphere_pressure_complex is not None
     assert result.sphere_pressure_complex.shape == (1, n_points)
+    assert result.radiated_power_surface_w is not None
+    assert result.radiated_power_sphere_w is not None
+    assert result.radiated_power_sphere_coverage_sr == pytest.approx(4.0 * np.pi)
+    assert result.radiated_power_surface_w[0] > 0.0
+    assert result.radiated_power_sphere_w[0] > 0.0
+    assert abs(
+        10.0
+        * np.log10(
+            result.radiated_power_sphere_w[0]
+            / result.radiated_power_surface_w[0]
+        )
+    ) < 0.1
     diagnostics = result.native_diagnostics[0]
     assert diagnostics["sphere_targets"] == n_points
     assert diagnostics["sphere_evaluation_targets"] == 7

@@ -145,6 +145,14 @@ def _assert_results_match(multi, sequential):
         rtol=2.0e-4,
         atol=1.0e-6,
     )
+    assert multi.radiated_power_surface_w is not None
+    assert sequential.radiated_power_surface_w is not None
+    np.testing.assert_allclose(
+        multi.radiated_power_surface_w,
+        sequential.radiated_power_surface_w,
+        rtol=2.0e-4,
+        atol=1.0e-8,
+    )
 
 
 def _configs(**overrides) -> metal_bem.SolveConfig:

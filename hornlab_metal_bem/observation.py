@@ -10,6 +10,8 @@ from .config import ObservationConfig
 
 logger = logging.getLogger(__name__)
 
+_MIRROR_CLASS_TOLERANCE = 1.0e-7
+
 
 @dataclass
 class ObservationFrame:
@@ -340,4 +342,150 @@ def build_sphere_grid_points(
         np.ascontiguousarray(points, dtype=np.float64),
         np.rad2deg(theta_rad),
         np.rad2deg(phi_rad),
+    )
+
+
+def sphere_grid_solid_angle_weights(
+    n_theta: int,
+    n_phi: int,
+    theta_max_deg: float = 180.0,
+) -> NDArray[np.float64]:
+    """Return exact cell solid angles for a theta/phi balloon grid.
+
+    Theta samples include both endpoints. Each sample owns the band bounded by
+    the midpoints to its neighbours, clipped to ``0`` and ``theta_max_deg``;
+    integrating ``sin(theta)`` over those bands gives the exact cos-edge
+    weights. Phi is periodic, so every column owns exactly ``2*pi/n_phi``.
+    The flattened result is theta-major, matching
+    :func:`build_sphere_grid_points`.
+    """
+    n_theta = int(n_theta)
+    n_phi = int(n_phi)
+    theta_max = float(theta_max_deg)
+    if n_theta < 2 or n_phi < 3:
+        raise ValueError("sphere grid requires n_theta >= 2 and n_phi >= 3")
+    if not np.isfinite(theta_max) or not (0.0 < theta_max <= 180.0):
+        raise ValueError("theta_max_deg must be finite and in (0, 180]")
+
+    theta = np.linspace(0.0, np.deg2rad(theta_max), n_theta)
+    edges = np.empty(n_theta + 1, dtype=np.float64)
+    edges[0] = 0.0
+    edges[-1] = np.deg2rad(theta_max)
+    edges[1:-1] = 0.5 * (theta[:-1] + theta[1:])
+    band_weights = np.cos(edges[:-1]) - np.cos(edges[1:])
+    phi_width = 2.0 * np.pi / n_phi
+    return np.repeat(band_weights * phi_width, n_phi).astype(
+        np.float64,
+        copy=False,
+    )
+
+
+def integrate_sphere_radiated_power(
+    pressure_complex: NDArray[np.complexfloating],
+    *,
+    distance_m: float,
+    solid_angle_weights_sr: NDArray[np.float64],
+    air_density: float,
+    speed_of_sound: float,
+) -> NDArray[np.float64]:
+    """Integrate far-field acoustic intensity over a sampled sphere.
+
+    ``pressure_complex`` may have any leading dimensions; its final dimension
+    must match the solid-angle weights. The returned array has those leading
+    dimensions and units of watts.
+    """
+    pressure = np.asarray(pressure_complex)
+    weights = np.asarray(solid_angle_weights_sr, dtype=np.float64).reshape(-1)
+    if pressure.ndim < 1 or pressure.shape[-1] != weights.size:
+        raise ValueError(
+            "pressure final dimension must match solid_angle_weights_sr"
+        )
+    radius = float(distance_m)
+    rho = float(air_density)
+    sound_speed = float(speed_of_sound)
+    if not (np.isfinite(radius) and radius > 0.0):
+        raise ValueError("distance_m must be finite and positive")
+    if not (np.isfinite(rho) and rho > 0.0):
+        raise ValueError("air_density must be finite and positive")
+    if not (np.isfinite(sound_speed) and sound_speed > 0.0):
+        raise ValueError("speed_of_sound must be finite and positive")
+    intensity = np.square(np.abs(pressure), dtype=np.float64) / (
+        2.0 * rho * sound_speed
+    )
+    return np.asarray(
+        radius * radius * np.sum(intensity * weights, axis=-1),
+        dtype=np.float64,
+    )
+
+
+def build_mirror_evaluation_classes(
+    points: NDArray[np.float64],
+    symmetry_plane: str,
+    *,
+    tolerance: float = _MIRROR_CLASS_TOLERANCE,
+) -> tuple[NDArray[np.float64], NDArray[np.intp]]:
+    """Return mirror-orbit representatives and a full-grid scatter inverse.
+
+    Classes are constructed solely from absolute coordinates. Coordinates are
+    quantised at ``tolerance`` before active components are canonicalised with
+    ``abs``. A class is merged only when every distinct reflected coordinate in
+    its requested orbit is present in the input. Consequently a grid whose
+    observation frame is not aligned to the native planes remains exact: any
+    missing mirror makes those samples singleton classes instead of assuming a
+    theta/phi relationship that the coordinates do not have.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError("points must have shape (N, 3)")
+    if not np.all(np.isfinite(pts)):
+        raise ValueError("points must be finite")
+    tol = float(tolerance)
+    if not (np.isfinite(tol) and tol > 0.0):
+        raise ValueError("tolerance must be finite and positive")
+
+    plane = str(symmetry_plane).strip().lower()
+    if plane == "yz":
+        components = (0,)
+    elif plane == "xz":
+        components = (1,)
+    elif plane == "yz+xz":
+        components = (0, 1)
+    else:
+        raise ValueError("symmetry_plane must be 'yz', 'xz', or 'yz+xz'")
+
+    quantized = np.rint(pts / tol).astype(np.int64)
+    coordinate_keys = [tuple(row.tolist()) for row in quantized]
+    available_keys = set(coordinate_keys)
+
+    canonical_groups: dict[tuple[int, int, int], list[int]] = {}
+    for index, row in enumerate(quantized):
+        canonical = row.copy()
+        for component in components:
+            canonical[component] = abs(canonical[component])
+        canonical_groups.setdefault(tuple(canonical.tolist()), []).append(index)
+
+    representatives: list[int] = []
+    inverse = np.empty(pts.shape[0], dtype=np.intp)
+    for members in canonical_groups.values():
+        seed = quantized[members[0]]
+        expected: set[tuple[int, int, int]] = set()
+        for mask in range(1 << len(components)):
+            reflected = seed.copy()
+            for bit, component in enumerate(components):
+                if mask & (1 << bit):
+                    reflected[component] = -reflected[component]
+            expected.add(tuple(reflected.tolist()))
+
+        if expected.issubset(available_keys):
+            representative_index = len(representatives)
+            representatives.append(members[0])
+            inverse[np.asarray(members, dtype=np.intp)] = representative_index
+        else:
+            for member in members:
+                inverse[member] = len(representatives)
+                representatives.append(member)
+
+    return (
+        np.ascontiguousarray(pts[np.asarray(representatives, dtype=np.intp)]),
+        inverse,
     )

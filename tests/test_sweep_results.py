@@ -35,6 +35,26 @@ def test_system_field_splits_arc_and_sphere():
     assert arc_only.shape == (n_planes, n_angles)
 
 
+def test_system_field_scatters_deduped_sphere_values():
+    arc_values = np.array([10.0 + 1.0j, 20.0 + 2.0j])
+    unique_sphere = np.array([1.0 + 3.0j, 2.0 + 4.0j])
+    flat = np.concatenate([arc_values, unique_sphere])
+    inverse = np.array([0, 1, 1, 0], dtype=np.intp)
+    system = SimpleNamespace(field_row_index=0)
+
+    arc, sphere = sweep._system_field(
+        system,
+        1,
+        2,
+        2,
+        np.asarray([flat]),
+        inverse,
+    )
+
+    np.testing.assert_array_equal(arc, arc_values.reshape(1, 2))
+    np.testing.assert_array_equal(sphere, unique_sphere[inverse])
+
+
 def test_read_complex_f32_constructs_requested_dtype_exactly(tmp_path):
     real_values = np.asarray([0.0, -0.0, 1.25, -2.5], dtype="<f4")
     imag_values = np.asarray([0.0, -0.0, -3.5, 4.75], dtype="<f4")
@@ -344,3 +364,39 @@ def test_sphere_pressure_from_log_stacks_and_guards():
         )
         is None
     )
+
+
+def test_native_sphere_dedupe_config_and_environment_escape_hatches(monkeypatch):
+    from hornlab_metal_bem.config import ObservationConfig, SolveConfig
+
+    frame = _sphere_test_frame()
+    observation = ObservationConfig(distance_m=2.0, sphere_grid=(7, 12))
+    points, _theta, _phi = sweep._resolve_sphere_observation(frame, observation)
+    config = SolveConfig(
+        observation=observation,
+        native_symmetry_plane="yz+xz",
+    )
+
+    evaluated, inverse = sweep._native_sphere_evaluation_targets(points, config)
+    assert inverse is not None
+    assert evaluated.shape[0] < points.shape[0]
+
+    config_disabled = SolveConfig(
+        observation=ObservationConfig(
+            distance_m=2.0,
+            sphere_grid=(7, 12),
+            sphere_symmetry_dedupe=False,
+        ),
+        native_symmetry_plane="yz+xz",
+    )
+    evaluated, inverse = sweep._native_sphere_evaluation_targets(
+        points,
+        config_disabled,
+    )
+    assert evaluated is points
+    assert inverse is None
+
+    monkeypatch.setenv("HORNLAB_METAL_BEM_SPHERE_SYMMETRY_DEDUPE", "0")
+    evaluated, inverse = sweep._native_sphere_evaluation_targets(points, config)
+    assert evaluated is points
+    assert inverse is None

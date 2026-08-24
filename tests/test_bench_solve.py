@@ -7,6 +7,24 @@ import pytest
 from scripts import bench_solve
 
 
+def test_bench_solve_parses_sphere_grid_and_symmetry_ab_controls():
+    args = bench_solve._parse_args(
+        [
+            "--sphere-grid",
+            "37,72",
+            "--native-symmetry-plane",
+            "yz+xz",
+            "--disable-sphere-symmetry-dedupe",
+            "--native-allow-open-rim",
+        ]
+    )
+
+    assert args.sphere_grid == (37, 72)
+    assert args.native_symmetry_plane == "yz+xz"
+    assert args.disable_sphere_symmetry_dedupe is True
+    assert args.native_allow_open_rim is True
+
+
 def test_bench_solve_builtin_fixture_json_smoke(capsys):
     from hornlab_metal_bem.metal import discover_native_runtime
 

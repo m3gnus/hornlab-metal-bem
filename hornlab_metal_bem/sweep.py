@@ -20,6 +20,8 @@ from .bie import (
     _compute_impedance,
     _face_indices_for_tags,
     compute_surface_pressure_avg,
+    integrate_driven_surface_power,
+    normal_velocity_from_driver_neumann,
 )
 from .config import (
     BIEFormulation,
@@ -33,12 +35,20 @@ from .field_traces import (
     _total_neumann_from_surface_pressure,
 )
 from .mesh import LoadedMesh, make_pure_function_spaces
-from .observation import ObservationFrame, build_observation_points, build_sphere_grid_points
+from .observation import (
+    ObservationFrame,
+    build_mirror_evaluation_classes,
+    build_observation_points,
+    build_sphere_grid_points,
+    integrate_sphere_radiated_power,
+    sphere_grid_solid_angle_weights,
+)
 from .result import SolveResult
 
 logger = logging.getLogger(__name__)
 
 _SMOKE_VALIDATED_HELPERS: dict[tuple[str, float], bool] = {}
+_SPHERE_SYMMETRY_DEDUPE_ENV = "HORNLAB_METAL_BEM_SPHERE_SYMMETRY_DEDUPE"
 
 
 def _discover_runtime_smoke_cached():
@@ -368,6 +378,147 @@ def _sphere_pressure_from_log(
     return np.stack([np.asarray(row, dtype=np.complex128) for row in rows], axis=0)
 
 
+def _sphere_symmetry_dedupe_enabled(observation) -> bool:
+    """Resolve the per-config setting plus the process-wide A/B escape hatch."""
+    if not observation.sphere_symmetry_dedupe:
+        return False
+    raw = os.environ.get(_SPHERE_SYMMETRY_DEDUPE_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _native_sphere_evaluation_targets(
+    sphere_points: NDArray[np.float64] | None,
+    config: SolveConfig,
+) -> tuple[NDArray[np.float64] | None, NDArray[np.intp] | None]:
+    """Dedupe frame-relative native balloons across active mirror planes."""
+    if sphere_points is None:
+        return None, None
+    observation = config.observation
+    plane = config.native_symmetry_plane
+    if (
+        observation.sphere_grid is None
+        or plane not in {"yz", "xz", "yz+xz"}
+        or not _sphere_symmetry_dedupe_enabled(observation)
+    ):
+        return sphere_points, None
+    return build_mirror_evaluation_classes(sphere_points, plane)
+
+
+def _sphere_power_from_log(
+    solver_log: list[dict],
+    config: SolveConfig,
+    n_sphere: int,
+) -> tuple[NDArray[np.float64] | None, float | None]:
+    """Integrate a frame-relative balloon; explicit points have no weights."""
+    observation = config.observation
+    if observation.sphere_grid is None:
+        return None, None
+    pressure = _sphere_pressure_from_log(solver_log, n_sphere)
+    if pressure is None:
+        return None, None
+    n_theta, n_phi = observation.sphere_grid
+    weights = sphere_grid_solid_angle_weights(
+        n_theta,
+        n_phi,
+        observation.sphere_theta_max_deg,
+    )
+    power = integrate_sphere_radiated_power(
+        pressure,
+        distance_m=observation.distance_m,
+        solid_angle_weights_sr=weights,
+        air_density=config.air_density,
+        speed_of_sound=SPEED_OF_SOUND,
+    )
+    return power, float(np.sum(weights))
+
+
+def _native_symmetry_surface_multiplier(symmetry_plane: str | None) -> float:
+    if symmetry_plane == "yz+xz":
+        return 4.0
+    if symmetry_plane in {"yz", "xz", "xy"}:
+        return 2.0
+    return 1.0
+
+
+def _surface_power_from_pressure_rows(
+    *,
+    surface_pressure_rows: list[NDArray[np.complex128]],
+    driver_neumann_rows: NDArray[np.complex64],
+    completed_frequencies_hz: list[float],
+    p1_local2global: NDArray[np.int32],
+    face_areas_m2: NDArray[np.float32],
+    config: SolveConfig,
+) -> NDArray[np.float64] | None:
+    """Compute source power from internal P1 pressure and the exact BC rows."""
+    count = len(surface_pressure_rows)
+    if count == 0:
+        return None
+    pressure = np.stack(surface_pressure_rows, axis=0)
+    local2global = np.asarray(p1_local2global, dtype=np.intp)
+    face_pressure = np.mean(pressure[:, local2global], axis=2)
+    omega = 2.0 * np.pi * np.asarray(
+        completed_frequencies_hz,
+        dtype=np.float64,
+    )
+    velocity = normal_velocity_from_driver_neumann(
+        driver_neumann_rows[:count],
+        omega,
+        config.air_density,
+    )
+    return integrate_driven_surface_power(
+        face_pressure,
+        velocity,
+        face_areas_m2,
+        symmetry_multiplier=_native_symmetry_surface_multiplier(
+            config.native_symmetry_plane
+        ),
+    )
+
+
+def _surface_power_from_tag_averages(
+    *,
+    surface_pressure_avg: dict[int, NDArray[np.complex128]],
+    source_tags: list[int],
+    driver_neumann_rows: NDArray[np.complex64],
+    completed_frequencies_hz: list[float],
+    physical_tags: NDArray[np.int32],
+    face_areas_m2: NDArray[np.float32],
+    config: SolveConfig,
+) -> NDArray[np.float64]:
+    """Fast exact reduction when each source tag has one uniform velocity."""
+    count = len(completed_frequencies_hz)
+    omega = 2.0 * np.pi * np.asarray(
+        completed_frequencies_hz,
+        dtype=np.float64,
+    )
+    velocity = normal_velocity_from_driver_neumann(
+        driver_neumann_rows[:count],
+        omega,
+        config.air_density,
+    )
+    areas = np.asarray(face_areas_m2, dtype=np.float64)
+    power = np.zeros(count, dtype=np.float64)
+    for tag in source_tags:
+        indices = np.flatnonzero(physical_tags == int(tag))
+        if indices.size == 0:
+            continue
+        tag_velocity = velocity[:, indices]
+        reference_velocity = tag_velocity[:, :1]
+        if not np.allclose(tag_velocity, reference_velocity, rtol=1.0e-7, atol=0.0):
+            raise RuntimeError(
+                "uniform source-power reduction received non-uniform face velocity"
+            )
+        tag_area = float(np.sum(areas[indices]))
+        power += 0.5 * np.real(
+            surface_pressure_avg[int(tag)][:count]
+            * np.conj(reference_velocity[:, 0])
+        ) * tag_area
+    power *= _native_symmetry_surface_multiplier(config.native_symmetry_plane)
+    return power
+
+
 def _mesh_vertices_elements(
     mesh: LoadedMesh,
 ) -> tuple[NDArray[np.float64], NDArray[np.int32]]:
@@ -526,6 +677,7 @@ def _system_field(
     n_angles: int,
     n_sphere: int = 0,
     field_batch_complex: NDArray[np.complex128] | None = None,
+    sphere_evaluation_inverse: NDArray[np.intp] | None = None,
 ) -> tuple[NDArray[np.complex128], NDArray[np.complex128] | None]:
     """Return (arc_pressure, sphere_pressure).
 
@@ -549,6 +701,8 @@ def _system_field(
     arc_count = n_planes * n_angles
     arc = flat[:arc_count].reshape(n_planes, n_angles)
     sphere = flat[arc_count : arc_count + n_sphere] if n_sphere else None
+    if sphere is not None and sphere_evaluation_inverse is not None:
+        sphere = sphere[sphere_evaluation_inverse]
     return arc, sphere
 
 
@@ -623,6 +777,8 @@ def _append_system_result(
     on_axis_idx: int,
     field_batch_complex: NDArray[np.complex128] | None,
     n_sphere: int = 0,
+    sphere_total: int = 0,
+    sphere_evaluation_inverse: NDArray[np.intp] | None = None,
     surface_pavg: dict[int, list[complex]],
     pressure_rows: list[NDArray[np.complex128]],
     spl_rows: list[NDArray[np.float64]],
@@ -646,7 +802,12 @@ def _append_system_result(
         surface_pavg[tag].append(pavg[tag])
 
     pressure, sphere_pressure = _system_field(
-        system, n_planes, n_angles, n_sphere, field_batch_complex
+        system,
+        n_planes,
+        n_angles,
+        n_sphere,
+        field_batch_complex,
+        sphere_evaluation_inverse,
     )
     directivity = _directivity_from_pressure(pressure, on_axis_idx)
     native_diagnostics = dict(getattr(system, "diagnostics", {}) or {})
@@ -659,6 +820,11 @@ def _append_system_result(
         frequency_hz=frequency_hz,
         mesh_max_edge_m=mesh_max_edge_m,
         elements_per_wavelength_min=mesh_elements_per_wavelength_min,
+    )
+    native_diagnostics["sphere_targets"] = int(sphere_total)
+    native_diagnostics["sphere_evaluation_targets"] = int(n_sphere)
+    native_diagnostics["sphere_symmetry_dedupe"] = bool(
+        sphere_evaluation_inverse is not None
     )
     log_entry = {
         "frequency_hz": frequency_hz,
@@ -775,8 +941,14 @@ def run_sweep_native_metal(
     retain_surface_pressure = (
         config.return_surface_pressure or config.return_surface_traces
     )
+    # Uniform normal velocity can use the helper's exact area-weighted tag
+    # pressure reductions. A varying face profile needs the P1 trace; retain it
+    # internally for that reduction without exposing it on SolveResult.
+    needs_surface_pressure_for_power = source_face_scale is not None
     surface_pressure_rows: list[NDArray[np.complex128]] | None = (
-        [] if retain_surface_pressure else None
+        []
+        if retain_surface_pressure or needs_surface_pressure_for_power
+        else None
     )
     native_diagnostics_rows: list[dict] = []
     solver_log: list[dict] = []
@@ -787,8 +959,12 @@ def run_sweep_native_metal(
     sphere_points_arr, sphere_theta_deg, sphere_phi_deg = _resolve_sphere_observation(
         frame, config.observation
     )
-    field_points, n_sphere = _append_sphere_field_points(
-        _field_points_3xn(obs_points), sphere_points_arr
+    n_sphere = 0 if sphere_points_arr is None else int(sphere_points_arr.shape[0])
+    sphere_evaluation_points, sphere_evaluation_inverse = (
+        _native_sphere_evaluation_targets(sphere_points_arr, config)
+    )
+    field_points, n_sphere_evaluation = _append_sphere_field_points(
+        _field_points_3xn(obs_points), sphere_evaluation_points
     )
 
     with MetalNativeStandardSession.create_session(
@@ -827,7 +1003,9 @@ def run_sweep_native_metal(
                 operation_id="assembly-solve-field-resident-batch",
                 source_tags=source_tags,
                 impedance_source_tag=impedance_source_tag,
-                write_surface_pressure=retain_surface_pressure,
+                write_surface_pressure=(
+                    retain_surface_pressure or needs_surface_pressure_for_power
+                ),
                 write_batched_field=True,
                 dense_solve_dtype=config.dense_solve_dtype,
                 chief_points=chief_points_3xm,
@@ -865,7 +1043,9 @@ def run_sweep_native_metal(
                     n_angles=n_angles,
                     on_axis_idx=on_axis_idx,
                     field_batch_complex=field_batch_complex,
-                    n_sphere=n_sphere,
+                    n_sphere=n_sphere_evaluation,
+                    sphere_total=n_sphere,
+                    sphere_evaluation_inverse=sphere_evaluation_inverse,
                     surface_pavg=surface_pavg,
                     pressure_rows=pressure_rows,
                     spl_rows=spl_rows,
@@ -927,7 +1107,9 @@ def run_sweep_native_metal(
                     n_angles=n_angles,
                     on_axis_idx=on_axis_idx,
                     field_batch_complex=None,
-                    n_sphere=n_sphere,
+                    n_sphere=n_sphere_evaluation,
+                    sphere_total=n_sphere,
+                    sphere_evaluation_inverse=sphere_evaluation_inverse,
                     surface_pavg=surface_pavg,
                     pressure_rows=pressure_rows,
                     spl_rows=spl_rows,
@@ -972,7 +1154,9 @@ def run_sweep_native_metal(
                 operation_id="assembly-solve-field-resident-stream",
                 source_tags=source_tags,
                 impedance_source_tag=impedance_source_tag,
-                write_surface_pressure=retain_surface_pressure,
+                write_surface_pressure=(
+                    retain_surface_pressure or needs_surface_pressure_for_power
+                ),
                 on_case_result=_on_case_result,
                 dense_solve_dtype=config.dense_solve_dtype,
                 chief_points=chief_points_3xm,
@@ -992,7 +1176,7 @@ def run_sweep_native_metal(
     }
 
     surface_pressure_complex, surface_neumann_complex = _retained_surface_traces(
-        surface_pressure_rows=surface_pressure_rows,
+        surface_pressure_rows=(surface_pressure_rows if retain_surface_pressure else None),
         driver_neumann_rows=neumann_rows,
         p1_local2global=geometry_buffers.p1_local2global_i32,
         physical_tags=mesh.physical_tags,
@@ -1000,6 +1184,31 @@ def run_sweep_native_metal(
         k_imag=k_imag_values,
         impedance_sources=impedance_sources_arg,
         return_surface_traces=config.return_surface_traces,
+    )
+    if surface_pressure_rows is None:
+        radiated_power_surface_w = _surface_power_from_tag_averages(
+            surface_pressure_avg=sp_avg,
+            source_tags=source_tags,
+            driver_neumann_rows=neumann_rows,
+            completed_frequencies_hz=completed_freqs,
+            physical_tags=mesh.physical_tags,
+            face_areas_m2=geometry_buffers.triangle_areas_f32,
+            config=config,
+        )
+    else:
+        radiated_power_surface_w = _surface_power_from_pressure_rows(
+            surface_pressure_rows=surface_pressure_rows,
+            driver_neumann_rows=neumann_rows,
+            completed_frequencies_hz=completed_freqs,
+            p1_local2global=geometry_buffers.p1_local2global_i32,
+            face_areas_m2=geometry_buffers.triangle_areas_f32,
+            config=config,
+        )
+    sphere_pressure_complex = _sphere_pressure_from_log(solver_log, n_sphere)
+    radiated_power_sphere_w, sphere_coverage_sr = _sphere_power_from_log(
+        solver_log,
+        config,
+        n_sphere,
     )
 
     return SolveResult(
@@ -1018,10 +1227,13 @@ def run_sweep_native_metal(
         surface_pressure_complex=surface_pressure_complex,
         surface_neumann_complex=surface_neumann_complex,
         native_diagnostics=native_diagnostics_rows,
-        sphere_pressure_complex=_sphere_pressure_from_log(solver_log, n_sphere),
+        sphere_pressure_complex=sphere_pressure_complex,
         sphere_points=sphere_points_arr,
         sphere_theta_deg=sphere_theta_deg,
         sphere_phi_deg=sphere_phi_deg,
+        radiated_power_surface_w=radiated_power_surface_w,
+        radiated_power_sphere_w=radiated_power_sphere_w,
+        radiated_power_sphere_coverage_sr=sphere_coverage_sr,
     )
 
 
@@ -1180,8 +1392,12 @@ def run_sweep_native_metal_multi_source(
     retain_surface_pressure = (
         config.return_surface_pressure or config.return_surface_traces
     )
+    needs_surface_pressure_for_power = source_face_scale is not None
     surface_pressure_rows: list[list[NDArray[np.complex128]] | None] = [
-        [] if retain_surface_pressure else None for _ in range(n_sources)
+        []
+        if retain_surface_pressure or needs_surface_pressure_for_power
+        else None
+        for _ in range(n_sources)
     ]
     native_diagnostics_rows: list[list[dict]] = [[] for _ in range(n_sources)]
     solver_logs: list[list[dict]] = [[] for _ in range(n_sources)]
@@ -1191,8 +1407,12 @@ def run_sweep_native_metal_multi_source(
     sphere_points_arr, sphere_theta_deg, sphere_phi_deg = _resolve_sphere_observation(
         frame, config.observation
     )
-    field_points, n_sphere = _append_sphere_field_points(
-        _field_points_3xn(obs_points), sphere_points_arr
+    n_sphere = 0 if sphere_points_arr is None else int(sphere_points_arr.shape[0])
+    sphere_evaluation_points, sphere_evaluation_inverse = (
+        _native_sphere_evaluation_targets(sphere_points_arr, config)
+    )
+    field_points, n_sphere_evaluation = _append_sphere_field_points(
+        _field_points_3xn(obs_points), sphere_evaluation_points
     )
 
     freq_values = np.asarray(frequencies, dtype=np.float64)
@@ -1253,7 +1473,9 @@ def run_sweep_native_metal_multi_source(
                 n_angles=n_angles,
                 on_axis_idx=on_axis_idx,
                 field_batch_complex=field_batch_complex,
-                n_sphere=n_sphere,
+                n_sphere=n_sphere_evaluation,
+                sphere_total=n_sphere,
+                sphere_evaluation_inverse=sphere_evaluation_inverse,
                 surface_pavg=surface_pavg[source_index],
                 pressure_rows=pressure_rows[source_index],
                 spl_rows=spl_rows[source_index],
@@ -1311,7 +1533,14 @@ def run_sweep_native_metal_multi_source(
             if config.progress_callback is not None:
                 config.progress_callback(i, len(freq_values), frequency_hz)
             if config.on_frequency_result is not None:
-                if config.on_frequency_result(i, frequency_hz, _multi_source_callback_entry()) is False:
+                if (
+                    config.on_frequency_result(
+                        i,
+                        frequency_hz,
+                        _multi_source_callback_entry(),
+                    )
+                    is False
+                ):
                     logger.info("Early stop requested after %.1f Hz", frequency_hz)
                     return False
             return None
@@ -1327,7 +1556,9 @@ def run_sweep_native_metal_multi_source(
             operation_id="assembly-solve-field-resident-batch-multi-source",
             source_tags=source_tags,
             impedance_source_tag=impedance_source_tags[0],
-            write_surface_pressure=retain_surface_pressure,
+            write_surface_pressure=(
+                retain_surface_pressure or needs_surface_pressure_for_power
+            ),
             write_batched_field=config.on_frequency_result is None,
             on_case_result=_on_case_result if config.on_frequency_result is not None else None,
             dense_solve_dtype=config.dense_solve_dtype,
@@ -1383,7 +1614,11 @@ def run_sweep_native_metal_multi_source(
             "total_s": total_s if source_index == 0 else 0.0,
         }
         surface_pressure_complex, surface_neumann_complex = _retained_surface_traces(
-            surface_pressure_rows=surface_pressure_rows[source_index],
+            surface_pressure_rows=(
+                surface_pressure_rows[source_index]
+                if retain_surface_pressure
+                else None
+            ),
             driver_neumann_rows=per_source_neumann[source_index],
             p1_local2global=geometry_buffers.p1_local2global_i32,
             physical_tags=mesh.physical_tags,
@@ -1391,6 +1626,32 @@ def run_sweep_native_metal_multi_source(
             k_imag=k_imag_values,
             impedance_sources=impedance_sources_arg,
             return_surface_traces=config.return_surface_traces,
+        )
+        power_pressure_rows = surface_pressure_rows[source_index]
+        if power_pressure_rows is None:
+            radiated_power_surface_w = _surface_power_from_tag_averages(
+                surface_pressure_avg=sp_avg,
+                source_tags=source_tags,
+                driver_neumann_rows=per_source_neumann[source_index],
+                completed_frequencies_hz=completed_freqs[source_index],
+                physical_tags=mesh.physical_tags,
+                face_areas_m2=geometry_buffers.triangle_areas_f32,
+                config=per_source_configs[source_index],
+            )
+        else:
+            radiated_power_surface_w = _surface_power_from_pressure_rows(
+                surface_pressure_rows=power_pressure_rows,
+                driver_neumann_rows=per_source_neumann[source_index],
+                completed_frequencies_hz=completed_freqs[source_index],
+                p1_local2global=geometry_buffers.p1_local2global_i32,
+                face_areas_m2=geometry_buffers.triangle_areas_f32,
+                config=per_source_configs[source_index],
+            )
+        sphere_pressure_complex = _sphere_pressure_from_log(solver_log, n_sphere)
+        radiated_power_sphere_w, sphere_coverage_sr = _sphere_power_from_log(
+            solver_log,
+            per_source_configs[source_index],
+            n_sphere,
         )
         results.append(
             SolveResult(
@@ -1413,12 +1674,13 @@ def run_sweep_native_metal_multi_source(
                 surface_pressure_complex=surface_pressure_complex,
                 surface_neumann_complex=surface_neumann_complex,
                 native_diagnostics=native_diagnostics_rows[source_index],
-                sphere_pressure_complex=_sphere_pressure_from_log(
-                    solver_log, n_sphere
-                ),
+                sphere_pressure_complex=sphere_pressure_complex,
                 sphere_points=sphere_points_arr,
                 sphere_theta_deg=sphere_theta_deg,
                 sphere_phi_deg=sphere_phi_deg,
+                radiated_power_surface_w=radiated_power_surface_w,
+                radiated_power_sphere_w=radiated_power_sphere_w,
+                radiated_power_sphere_coverage_sr=sphere_coverage_sr,
             )
         )
     return results
