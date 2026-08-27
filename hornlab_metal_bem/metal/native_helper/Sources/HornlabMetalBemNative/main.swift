@@ -3611,7 +3611,10 @@ inline float2 helmholtz_g(float3 delta, float k, float kImag) {
     if (kImag != 0.0f) {
         scale *= exp(-kImag * r);
     }
-    return float2(cos(phase) * scale, sin(phase) * scale);
+    // One argument reduction for both, rather than two.
+    float cosPhase;
+    float sinPhase = sincos(phase, cosPhase);
+    return float2(cosPhase * scale, sinPhase * scale);
 }
 
 inline float2 helmholtz_dlp(float3 delta, float3 normal, float k, float kImag) {
@@ -3625,8 +3628,11 @@ inline float2 helmholtz_dlp(float3 delta, float3 normal, float k, float kImag) {
     if (kImag != 0.0f) {
         scale *= exp(-kImag * r);
     }
-    float gre = cos(phase) * scale;
-    float gim = sin(phase) * scale;
+    // One argument reduction for both, rather than two.
+    float cosPhase;
+    float sinPhase = sincos(phase, cosPhase);
+    float gre = cosPhase * scale;
+    float gim = sinPhase * scale;
     float projection = dot(delta, normal) / r;
     float fre = -1.0f / r;
     if (kImag != 0.0f) {
@@ -3765,13 +3771,19 @@ inline float2 regular_slp_entry(
 ) {
     float jac = (2.0f * areas[testTri]) * (2.0f * areas[trialTri]);
     float2 acc = float2(0.0f, 0.0f);
+    // Six distinct trial points, previously recomputed 36 times. See the same
+    // hoist in assemble_matrix_pair_atomic for why the compiler cannot do it.
+    float3 trialPoints[6];
+    for (int b = 0; b < 6; ++b) {
+        trialPoints[b] = point_on_triangle(
+            px, py, pz, triangles, nTriangles, trialTri, qx[b], qy[b]);
+    }
     for (int a = 0; a < 6; ++a) {
         float3 testPoint = point_on_triangle(
             px, py, pz, triangles, nTriangles, testTri, qx[a], qy[a]);
         float tb = basis_value(qx[a], qy[a], testLocal);
         for (int b = 0; b < 6; ++b) {
-            float3 trialPoint = point_on_triangle(
-                px, py, pz, triangles, nTriangles, trialTri, qx[b], qy[b]);
+            float3 trialPoint = trialPoints[b];
             float weight = tb * qw[a] * qw[b] * jac;
             // Coincident self-point excluded by index; see
             // assemble_matrix_pair_atomic for why the r2 guard is not enough.
@@ -4193,6 +4205,16 @@ kernel void assemble_matrix_pair_atomic(
         beta = float2(robinBetaRe[trialTri], robinBetaIm[trialTri]);
         pairHasRobin = (beta.x != 0.0f || beta.y != 0.0f);
     }
+    // The trial quadrature points depend only on `b`, but the compiler cannot
+    // hoist them out of the `a` loop itself: point_on_triangle reads `device`
+    // memory and this kernel stores through `device atomic_float *`, so without
+    // aliasing guarantees every iteration must re-load the trial vertices. Six
+    // distinct points were being recomputed 36 times per pair.
+    float3 trialPoints[6];
+    for (int b = 0; b < 6; ++b) {
+        trialPoints[b] = point_on_triangle(
+            px, py, pz, triangles, params.nTriangles, trialTri, qx[b], qy[b]);
+    }
     for (int a = 0; a < 6; ++a) {
         float3 testPoint = point_on_triangle(
             px, py, pz, triangles, params.nTriangles, testTri, qx[a], qy[a]);
@@ -4202,8 +4224,7 @@ kernel void assemble_matrix_pair_atomic(
             basis_value(qx[a], qy[a], 2)
         };
         for (int b = 0; b < 6; ++b) {
-            float3 trialPoint = point_on_triangle(
-                px, py, pz, triangles, params.nTriangles, trialTri, qx[b], qy[b]);
+            float3 trialPoint = trialPoints[b];
             float sb[3] = {
                 basis_value(qx[b], qy[b], 0),
                 basis_value(qx[b], qy[b], 1),
