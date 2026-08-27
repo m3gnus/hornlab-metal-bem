@@ -1,0 +1,24 @@
+formula = "OSSE"
+mode = "freestanding"
+
+[profile]
+L_mm = 120.0
+r0_mm = 12.7
+a_deg = 60.0
+a0_deg = 15.5
+k = 1.0
+n = 4.0
+q = 0.995
+s = 0.0
+
+[cross_section]
+exponent = 2.0
+aspect_ratio = 1.0
+
+[mesh]
+angular_segments = 64
+length_segments = 32
+wall_thickness_mm = 6.0
+throat_res_mm = 4.0
+mouth_res_mm = 26.0
+rear_res_mm = 25.0
