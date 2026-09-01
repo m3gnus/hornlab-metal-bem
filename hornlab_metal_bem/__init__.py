@@ -18,6 +18,12 @@ from .config import (
     TaperProfile,
     VelocityMode,
 )
+from .assembly import (
+    BodyPlacement,
+    CombinedMesh,
+    combine_bodies,
+    rotation_matrix,
+)
 from .circsym import CircSymCancelled, MeridianMesh
 from .field_traces import evaluate_exterior_from_traces
 from .mesh import LoadedMesh, MeshError, load_mesh
@@ -31,6 +37,10 @@ __all__ = [
     "solve_circsym",
     "solve_circsym_frequencies",
     "solve_multi_source",
+    "combine_bodies",
+    "rotation_matrix",
+    "BodyPlacement",
+    "CombinedMesh",
     "evaluate_exterior_from_traces",
     "load_mesh",
     "MeridianMesh",
