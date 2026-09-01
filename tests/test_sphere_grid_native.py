@@ -535,3 +535,80 @@ def test_native_full3d_pulsating_sphere_matches_circsym_through_16khz():
         rtol=1.0e-10,
         atol=1.0e-10,
     )
+
+
+def _assembly_session(vertices, triangles, tags):
+    """Open a native session over a small closed mesh, for assembly-only ops."""
+    from hornlab_metal_bem.metal.geometry import (
+        _build_metal_geometry_buffers_with_max_edge,
+    )
+    from hornlab_metal_bem.metal.native import MetalNativeStandardSession
+    from hornlab_metal_bem.mesh import make_pure_function_spaces
+    from hornlab_metal_bem.metal import discover_native_runtime
+
+    grid = make_pure_grid(vertices, triangles)
+    p1, dp0 = make_pure_function_spaces(grid)
+    buffers, _ = _build_metal_geometry_buffers_with_max_edge(grid, tags, p1, dp0)
+    return MetalNativeStandardSession.create_session(
+        geometry_buffers=buffers,
+        symmetry_plane=None,
+        aperture_tag=None,
+        velocity_source_tags=[2],
+        check_open_edges=False,
+        runtime_status=discover_native_runtime(run_smoke_test=True),
+    )
+
+
+def _dense_matrix(result) -> np.ndarray:
+    n = result.matrix_shape[0]
+    real = np.fromfile(result.matrix_real_f32, dtype=np.float32)
+    imag = np.fromfile(result.matrix_imag_f32, dtype=np.float32)
+    return (real.astype(np.complex64) + 1j * imag).reshape(n, n)
+
+
+def test_assembly_op_complex_k_shift_damps_the_operator():
+    """``assemble_standard_neumann`` must honour a complex-k shift.
+
+    The op used to accept ``k_real`` only, so every operator it returned was the
+    undamped ``standard`` one. On a closed body that operator carries uncured
+    interior resonances, and a conditioning or compressibility study run against
+    it silently describes something production need not solve.
+
+    Three things are asserted: the default still assembles the real-k operator,
+    a positive shift actually changes it, and the shift reduces the condition
+    number -- which is the whole reason the shift exists.
+    """
+    _require_native()
+    vertices, triangles = _octasphere(3)
+    tags = np.full(triangles.shape[0], 2, dtype=np.int32)
+    k_real = 25.0
+    shift = 0.005
+
+    with _assembly_session(vertices, triangles, tags) as session:
+        neumann = np.ones(session.geometry_payload.dp0_dof_count, dtype=np.complex64)
+        real_k = _dense_matrix(
+            session.assemble_standard_neumann(
+                1000.0, k_real, neumann, operation_id="parity-real-k"
+            )
+        )
+        complex_k = _dense_matrix(
+            session.assemble_standard_neumann(
+                1000.0,
+                k_real,
+                neumann,
+                k_imag=k_real * shift,
+                operation_id="parity-complex-k",
+            )
+        )
+        with pytest.raises(ValueError, match="finite and non-negative"):
+            session.assemble_standard_neumann(
+                1000.0, k_real, neumann, k_imag=-1.0, operation_id="parity-negative"
+            )
+
+    assert not np.array_equal(real_k, complex_k)
+    scale = np.abs(real_k).max()
+    assert np.abs(complex_k - real_k).max() / scale > 1e-4
+
+    cond_real = np.linalg.cond(real_k.astype(np.complex128), 1)
+    cond_complex = np.linalg.cond(complex_k.astype(np.complex128), 1)
+    assert cond_complex < cond_real

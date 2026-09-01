@@ -8834,6 +8834,14 @@ func assembleStandardNeumann(
         try fail("expected assemble_standard_neumann op")
     }
     let k = Float(try requireDouble(payload, "k_real_f32"))
+    // Optional so pre-existing manifests keep assembling the real-k operator
+    // byte-for-byte. Positive kImag is the same complex-k damping the fused
+    // solve batch applies; it is what makes this op usable for studying the
+    // operator production actually solves.
+    let kImag = Float((payload["k_imag_f32"] as? NSNumber)?.doubleValue ?? 0.0)
+    if !(kImag >= 0.0) || !kImag.isFinite {
+        try fail("k_imag_f32 must be finite and non-negative")
+    }
     let neumann = try readComplexVector(
         root: geom.root,
         descriptors: try requireObject(payload, "neumann_dp0"),
@@ -8844,7 +8852,7 @@ func assembleStandardNeumann(
     let aImDesc = try requireObject(outputs, "A_imag_f32")
     let rhsReDesc = try requireObject(outputs, "rhs_real_f32")
     let rhsImDesc = try requireObject(outputs, "rhs_imag_f32")
-    let run = try assembleRegular(geom: geom, neumann: neumann, k: k)
+    let run = try assembleRegular(geom: geom, neumann: neumann, k: k, kImag: kImag)
     try writeF32(try descriptorPath(root: geom.root, descriptor: aReDesc), run.arrays.aRe)
     try writeF32(try descriptorPath(root: geom.root, descriptor: aImDesc), run.arrays.aIm)
     try writeF32(try descriptorPath(root: geom.root, descriptor: rhsReDesc), run.arrays.rhsRe)
@@ -8878,6 +8886,10 @@ func assembleStandardNeumann(
         "duffy_corrections": duffyReport,
         "session_id": try requireString(payload, "session_id"),
         "frequency_hz": (payload["frequency_hz"] as? NSNumber)?.doubleValue ?? 0,
+        // Echoed so Python can assert the helper honoured the shift rather than
+        // silently ignoring it, matching the fused batch's acknowledgement rule.
+        "k_imag_f32": Double(kImag),
+        "complex_k": kImag != 0.0,
         "matrix_layout": "row_major_c",
         "matrix_shape": [geom.p1DofCount, geom.p1DofCount],
         "rhs_shape": [geom.p1DofCount],

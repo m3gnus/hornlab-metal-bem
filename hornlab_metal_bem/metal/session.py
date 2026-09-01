@@ -113,6 +113,10 @@ class AssemblyPayload:
     k_real_f32: float
     neumann_dp0: dict[str, BinaryArrayDescriptor]
     outputs: dict[str, BinaryArrayDescriptor]
+    # Non-negative imaginary wavenumber part. Zero keeps the real-k `standard`
+    # operator this op has always assembled; positive damps interior resonances
+    # the same way the fused solve batch's `complex_k` formulation does.
+    k_imag_f32: float = 0.0
     schema: str = METAL_STANDARD_SCHEMA
     op: str = "assemble_standard_neumann"
     index_base: int = INDEX_BASE
@@ -125,6 +129,7 @@ class AssemblyPayload:
             "session_id": self.session_id,
             "frequency_hz": float(self.frequency_hz),
             "k_real_f32": float(np.float32(self.k_real_f32)),
+            "k_imag_f32": float(np.float32(self.k_imag_f32)),
             "index_base": self.index_base,
             "neumann_dp0": {
                 key: descriptor.to_manifest()
