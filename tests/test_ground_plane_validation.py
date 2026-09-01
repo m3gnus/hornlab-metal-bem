@@ -140,3 +140,18 @@ def test_wall_planes_check_their_own_axis():
 def test_disabled_ground_plane_validates_nothing():
     vertices, triangles = _tetra(offset_z=-10.0)
     assert validate_native_ground_plane(_buffers(vertices, triangles), None) is None
+
+
+def test_boundary_lab_ground_token_refuses_with_a_signpost():
+    """Not mapped is not the same as not supported; say which."""
+    from hornlab_metal_bem.boundary_lab import (
+        BoundaryLabSolverError,
+        _coerce_symmetry_plane,
+    )
+
+    with pytest.raises(BoundaryLabSolverError, match="ground_plane"):
+        _coerce_symmetry_plane("ground")
+    # The mapped tokens are untouched.
+    assert _coerce_symmetry_plane("x") == "yz"
+    assert _coerce_symmetry_plane("xy") == "yz+xz"
+    assert _coerce_symmetry_plane("off") is None
