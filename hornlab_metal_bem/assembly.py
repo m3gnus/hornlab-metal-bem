@@ -25,7 +25,13 @@ from dataclasses import dataclass, field
 import numpy as np
 from numpy.typing import NDArray
 
-from .mesh import LoadedMesh, MeshError, make_pure_grid
+from .mesh import (
+    LoadedMesh,
+    MeshError,
+    _is_closed_two_manifold,
+    _signed_mesh_volume_indicator,
+    make_pure_grid,
+)
 from .result import MeshInfo
 
 __all__ = ["BodyPlacement", "CombinedMesh", "combine_bodies", "rotation_matrix"]
@@ -125,12 +131,43 @@ def _validated_rotation(rotation: object, name: str) -> NDArray[np.float64] | No
     return matrix
 
 
+def _validate_body_winding(
+    vertices: NDArray[np.float64],
+    triangles: NDArray[np.int32],
+    name: str,
+) -> None:
+    """Check each body's winding BEFORE it is merged with its neighbours.
+
+    The loader's winding test sums one signed volume over the whole mesh, and
+    that sum is additive over bodies -- so one inverted cabinet among three
+    correct ones still totals positive and passes. Checking per body is the
+    only place the question can still be answered, which is why it happens here
+    and not after the merge. An inverted body does not fail; it radiates with
+    the wrong sign.
+
+    Open shells are skipped, exactly as the loader skips them: the signed
+    volume indicator is translation invariant only for a closed two-manifold,
+    so for a bare horn it says nothing.
+    """
+    if not _is_closed_two_manifold(triangles):
+        return
+    if _signed_mesh_volume_indicator(vertices, triangles) >= 0.0:
+        return
+    raise MeshError(
+        f"{name} is a closed surface wound inward (negative signed volume). "
+        "Merged with correctly wound neighbours its sign would be hidden in "
+        "the combined signed volume, so it is rejected here. Load it with "
+        "repair_normals=True, or reverse its triangle winding."
+    )
+
+
 def combine_bodies(placements: list[BodyPlacement]) -> CombinedMesh:
     """Merge placed bodies into one mesh for a single exterior solve.
 
-    Raises :class:`MeshError` if two bodies would end up sharing a physical tag
-    without being asked to. Silent tag collision is the failure that matters
-    here: it does not crash, it just drives the wrong cabinet.
+    Raises :class:`MeshError` for the failures that would otherwise be silent:
+    two bodies sharing a physical tag without being asked to (which does not
+    crash, it just drives the wrong cabinet), and a closed body wound inward
+    (whose sign disappears into the combined signed volume once merged).
     """
     if not placements:
         raise MeshError("combine_bodies requires at least one placement")
@@ -151,6 +188,8 @@ def combine_bodies(placements: list[BodyPlacement]) -> CombinedMesh:
         vertices, triangles = _mesh_arrays(placement.mesh)
         if vertices.shape[0] == 0 or triangles.shape[0] == 0:
             raise MeshError(f"{name} contributes no geometry")
+
+        _validate_body_winding(vertices, triangles, name)
 
         rotation = _validated_rotation(placement.rotation, name)
         if rotation is not None:

@@ -277,6 +277,18 @@ def run_sweep_circsym(
         raise ValueError(
             "return_surface_traces is available only for full-3D native Metal solves"
         )
+    if config.ground_plane is not None:
+        # The axisymmetric path has its own image plane, circsym_baffle_z, and
+        # accepts only one normal to the axis of revolution. Silently ignoring
+        # ground_plane here would return free-field physics for a half-space
+        # request -- the same failure this module already refuses to make for a
+        # mis-tagged infinite-baffle solve below.
+        raise ValueError(
+            f"ground_plane={config.ground_plane!r} is a full-3D native Metal "
+            "option; the axisymmetric solver takes a same-sign rigid image "
+            "plane through circsym_baffle_z instead, which must be normal to "
+            "the axis of revolution"
+        )
     if config.circsym_aperture_tag is not None:
         # Dispatch to the coupled infinite-baffle solve whenever an aperture tag
         # is requested. run_sweep_coupled_ib validates that the tag is present and

@@ -142,12 +142,31 @@ or vertex is otherwise allowed, and the existing Duffy correction covers the
 coincident and adjacent real-vs-image element pairs it produces. For a body
 very close to but not touching the plane, the real-vs-image pairs become
 near-singular; the opt-in near-quadrature correction
-(`HORNLAB_METAL_BEM_NATIVE_NEAR_QUADRATURE=auto`, default off) covers those.
-Measured on a 100 mm sphere with a 57.7 mm max edge at 2 kHz, enabling it moved
-the far field by 0.012 dB at 2 mm clearance (0.03 of an element edge) and by
-0.0001 dB at 20 mm, and moved the surface-pressure impedance by 2.9e-4 and
-5.6e-6 relative. It is worth enabling for near-field and impedance work, not
-for polar sweeps.
+(`HORNLAB_METAL_BEM_NATIVE_NEAR_QUADRATURE=auto`, default off) covers those,
+and its pair list already enumerates image masks on both test and trial.
+
+Measured on a 100 mm sphere meshed to 2048 triangles, 15.2 mm max edge, whose
+6-elements-per-wavelength limit is 3749 Hz, comparing the correction off
+against an aggressive `2:3.0`:
+
+|  | 500 Hz | 2 kHz | 3.5 kHz | max rel &#124;Z&#124; |
+|---|---|---|---|---|
+| free field, no ground | 0.0000 | 0.0000 | 0.0001 dB | 2.8e-06 |
+| ground, 2 mm clearance | 0.0000 | 0.0002 | 0.0011 dB | 1.4e-05 |
+| ground, 20 mm clearance | 0.0000 | 0.0000 | 0.0004 dB | 2.9e-06 |
+| ground, 200 mm clearance | 0.0000 | 0.0000 | 0.0001 dB | 2.7e-06 |
+
+So the ground plane does raise what the correction is worth — 2 mm clearance is
+an order of magnitude above the free-field control — but the absolute figure
+stays at 0.001 dB and 1e-5 relative impedance, which is why it remains off by
+default. This measures far-field pressure and driven-surface impedance only; it
+says nothing about true near-field points or thin walls, where the correction is
+expected to matter more.
+
+The first version of this table was taken on a 57.7 mm mesh whose own limit is
+991 Hz, and it read 0.29 dB at 3.5-5 kHz. That number was the two quadrature
+rules disagreeing about an already-unconverged solution, not an effect. Run this
+comparison inside the mesh's resolution limit or it measures nothing.
 
 `ground_plane` does not currently compose with `native_symmetry_plane` (the
 native session carries one image-plane set) or with the coupled

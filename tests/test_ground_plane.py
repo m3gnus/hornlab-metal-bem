@@ -361,3 +361,97 @@ def test_observation_points_inside_the_ground_are_flagged():
             ),
         )
     assert not [w for w in caught if "solid" in str(w.message)]
+
+
+@pytest.mark.slow
+def test_retained_traces_re_evaluate_only_when_told_about_the_plane():
+    """The trap: omitting the plane re-evaluates the free-field trace.
+
+    ``return_surface_traces`` composes with ``ground_plane``, so the traces
+    exist -- but ``evaluate_exterior_from_traces`` builds its own session and
+    has no way to know the solve had an image plane unless it is told. Without
+    it the answer is wrong by more than 10 dB and looks entirely reasonable.
+    """
+    _require_native()
+    vertices, triangles, tags = _capped_sphere(RADIUS, (0.0, 0.0, HEIGHT))
+    mesh = _loaded(vertices, triangles, tags, {1: "rigid", 2: "cap"})
+    points = np.array(
+        [[2.0, 0.0, HEIGHT], [1.5, 0.0, 1.0], [0.0, 2.0, 0.6]], dtype=np.float64
+    )
+    observation = metal_bem.ObservationConfig(
+        planes=["probe"], angle_count=points.shape[0],
+        custom_points={"probe": points},
+    )
+    frequency = 800.0
+    result = metal_bem.solve_frequencies(
+        mesh, [frequency],
+        metal_bem.native_config(
+            ground_plane="xy", observation=observation,
+            frame_override=_frame(HEIGHT), return_surface_traces=True,
+        ),
+    )
+    k_real = 2.0 * np.pi * frequency / SPEED_OF_SOUND
+    args = (
+        mesh, frequency, k_real,
+        result.surface_pressure_complex[0], result.surface_neumann_complex[0],
+        points,
+    )
+    truth = result.pressure_complex[0, 0, :]
+
+    # The documented idiom: carry both plane fields straight off the config.
+    told = metal_bem.evaluate_exterior_from_traces(
+        *args,
+        ground_plane=result.config.ground_plane,
+        symmetry_plane=result.config.native_symmetry_plane,
+    )
+    np.testing.assert_allclose(told, truth, rtol=2.0e-4, atol=1.0e-12)
+
+    # Omitting it is wrong, and wrong by a lot -- pinned so the trap cannot
+    # quietly become a small error that nobody notices.
+    untold = metal_bem.evaluate_exterior_from_traces(*args)
+    assert np.max(np.abs(20.0 * np.log10(np.abs(untold) / np.abs(truth)))) > 5.0
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        metal_bem.evaluate_exterior_from_traces(
+            *args, ground_plane="xy", symmetry_plane="xy"
+        )
+
+
+@pytest.mark.slow
+def test_multi_source_matches_sequential_solves_under_a_ground_plane():
+    """The shared-factorization path carries the image plane too."""
+    _require_native()
+    vertices, triangles, tags = _capped_sphere(RADIUS, (0.0, 0.0, HEIGHT))
+    mesh = _loaded(vertices, triangles, tags, {1: "rigid", 2: "cap"})
+    sources = [{2: 1.0, 1: 0.0}, {1: 1.0, 2: 0.0}]
+
+    multi = metal_bem.solve_multi_source(
+        mesh, sources, _probe_config(ground_plane="xy"), FREQUENCIES
+    )
+    for index, source in enumerate(sources):
+        sequential = metal_bem.solve_frequencies(
+            mesh, FREQUENCIES,
+            _probe_config(ground_plane="xy", velocity_sources=source),
+        )
+        np.testing.assert_allclose(
+            multi[index].pressure_complex,
+            sequential.pressure_complex,
+            rtol=2.0e-4, atol=1.0e-12,
+        )
+
+
+def test_axisymmetric_solves_refuse_a_ground_plane_instead_of_ignoring_it():
+    from hornlab_metal_bem.circsym import MeridianMesh, run_sweep_circsym
+
+    nodes = np.array([[0.0, 0.0], [0.1, 0.0], [0.1, 0.1]], dtype=np.float64)
+    segments = np.array([[0, 1], [1, 2]], dtype=np.int32)
+    meridian = MeridianMesh(
+        nodes=nodes,
+        segments=segments,
+        physical_tags=np.array([2, 1], dtype=np.int32),
+    )
+    with pytest.raises(ValueError, match="circsym_baffle_z"):
+        run_sweep_circsym(
+            meridian, np.array([500.0]),
+            metal_bem.SolveConfig(ground_plane="xy"),
+        )

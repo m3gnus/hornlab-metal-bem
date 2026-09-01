@@ -250,3 +250,50 @@ def test_rigidly_moving_the_whole_scene_moves_the_field_with_it():
     at_origin = run(scene.mesh, base_points, np.array([1.0, 0.0, 0.0]), np.zeros(3))
     displaced = run(moved.mesh, moved_points, rotation @ np.array([1.0, 0.0, 0.0]), shift)
     np.testing.assert_allclose(at_origin, displaced, rtol=3.0e-4, atol=1.0e-12)
+
+
+def _inverted_body() -> LoadedMesh:
+    vertices, triangles, tags = _capped_sphere(RADIUS, (0.0, 0.0, 0.0))
+    return _loaded(vertices, triangles[:, [0, 2, 1]].copy(), tags,
+                   {1: "rigid", 2: "cap"})
+
+
+def test_an_inverted_body_is_caught_before_the_merge_hides_it():
+    """The whole-mesh winding test cannot see this once the bodies are summed."""
+    from hornlab_metal_bem.mesh import _signed_mesh_volume_indicator
+
+    good = _body()
+    bad = _inverted_body()
+    good_v = np.asarray(good.grid.vertices).T
+    good_t = np.asarray(good.grid.elements).T
+    bad_t = np.asarray(bad.grid.elements).T
+
+    # Three correct bodies plus one inverted still total a positive signed
+    # volume, so a check applied after merging would pass the whole mesh.
+    vertices = np.vstack([good_v + [i * 0.5, 0.0, 0.0] for i in range(4)])
+    triangles = np.vstack([
+        (good_t if index < 3 else bad_t) + index * good_v.shape[0]
+        for index in range(4)
+    ])
+    assert _signed_mesh_volume_indicator(vertices, triangles) > 0.0
+
+    with pytest.raises(MeshError, match="wound inward"):
+        metal_bem.combine_bodies([
+            metal_bem.BodyPlacement(good, name="ok"),
+            metal_bem.BodyPlacement(
+                bad, translation_m=(0.5, 0.0, 0.0),
+                tag_map={1: 11, 2: 12}, name="inverted",
+            ),
+        ])
+
+
+def test_open_shells_are_not_judged_on_signed_volume():
+    """A bare horn is legitimately open; the indicator says nothing about it."""
+    vertices, triangles, tags = _capped_sphere(RADIUS, (0.0, 0.0, 0.0))
+    keep = triangles[:-8]
+    shell = _loaded(vertices, keep, tags[:-8], {1: "rigid", 2: "cap"})
+    assert not _is_closed_two_manifold(keep)
+    combined = metal_bem.combine_bodies(
+        [metal_bem.BodyPlacement(shell, name="shell")]
+    )
+    assert combined.body_names == ("shell",)
