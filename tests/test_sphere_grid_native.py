@@ -612,3 +612,99 @@ def test_assembly_op_complex_k_shift_damps_the_operator():
     cond_real = np.linalg.cond(real_k.astype(np.complex128), 1)
     cond_complex = np.linalg.cond(complex_k.astype(np.complex128), 1)
     assert cond_complex < cond_real
+
+
+def test_gmres_dense_solve_matches_the_direct_solve():
+    """Block-Jacobi GMRES must reproduce the LU answer, not merely converge.
+
+    An iterative solver that stops early returns a plausible-looking wrong
+    field, so the gate is agreement with the direct solve rather than a residual
+    the solver reports about itself. The tolerance is the float32 assembly's own
+    noise floor: measured agreement on real horn meshes is ~3e-6 relative.
+    """
+    _require_native()
+    vertices, triangles = _octasphere(3)
+    tags = np.full(triangles.shape[0], 2, dtype=np.int32)
+    grid = make_pure_grid(vertices, triangles)
+    mesh = LoadedMesh(
+        grid=grid,
+        physical_tags=tags,
+        info=MeshInfo(
+            n_vertices=grid.vertices.shape[1],
+            n_triangles=tags.size,
+            physical_groups={2: "source"},
+            bounding_box_m=(
+                grid.vertices.min(axis=1),
+                grid.vertices.max(axis=1),
+            ),
+        ),
+    )
+    frequencies = [900.0, 4000.0]
+
+    def solve_with(implementation):
+        config = metal_bem.native_config(
+            velocity_sources={2: 1.0},
+            formulation="complex_k",
+            dense_solve_implementation=implementation,
+        )
+        return metal_bem.solve_frequencies(mesh, frequencies, config=config)
+
+    direct = solve_with("cgesv")
+    iterative = solve_with("gmres")
+
+    assert iterative.native_diagnostics[0]["solve_implementation"] == (
+        "gmres_block_jacobi"
+    )
+    iterations = iterative.native_diagnostics[0]["dense_solve_refine_iterations"]
+    counts = iterations if isinstance(iterations, list) else [iterations]
+    assert all(1 <= int(c) <= 150 for c in counts), counts
+
+    a = direct.pressure_complex
+    b = iterative.pressure_complex
+    assert np.abs(b - a).max() / np.abs(a).max() < 1e-4
+
+
+def test_gmres_warns_about_the_undamped_formulation(caplog):
+    """`standard` + GMRES is correct but ~6x slower on an enclosing body.
+
+    It is a performance trap rather than a wrong answer, so it warns rather than
+    refusing -- and it warns on the configuration alone, because no cheap mesh
+    test distinguishes a body that traps interior resonances from one that only
+    encloses its own wall thickness.
+    """
+    from hornlab_metal_bem.config import SolveConfig
+    from hornlab_metal_bem.sweep import _warn_iterative_solve_formulation
+
+    with caplog.at_level("WARNING"):
+        _warn_iterative_solve_formulation(
+            SolveConfig(
+                velocity_sources={2: 1.0},
+                formulation="standard",
+                dense_solve_implementation="gmres",
+            )
+        )
+    assert "complex_k" in caplog.text
+    caplog.clear()
+
+    with caplog.at_level("WARNING"):
+        for config in (
+            SolveConfig(
+                velocity_sources={2: 1.0},
+                formulation="complex_k",
+                dense_solve_implementation="gmres",
+            ),
+            SolveConfig(velocity_sources={2: 1.0}, formulation="standard"),
+        ):
+            _warn_iterative_solve_formulation(config)
+    assert caplog.text == ""
+
+
+def test_gmres_rejects_float64_rather_than_silently_downgrading():
+    from hornlab_metal_bem.config import SolveConfig
+
+    with pytest.raises(ValueError, match="no float64 path"):
+        SolveConfig(
+            velocity_sources={2: 1.0},
+            dense_solve_implementation="gmres",
+            dense_solve_dtype="float64",
+        )

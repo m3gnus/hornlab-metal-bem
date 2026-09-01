@@ -80,6 +80,21 @@ state and evaluates one retained `(pressure_p1, neumann_dp0)` pair at arbitrary
 `(N, 3)` exterior points. It selects optimized field mode through per-process
 environment overrides and gives every helper invocation a unique operation id.
 
+`SolveConfig(dense_solve_implementation="gmres")` replaces the direct dense LU
+with block-Jacobi preconditioned GMRES over the same assembled operator. The
+preconditioner is built once per frequency from a median-split cluster tree over
+P1 dof positions and reused across channel drives, so multi-source stays nearly
+free. It trades the LU's O(N^3) for O(iterations * N^2); measured on real horn
+and enclosure operators it needs 20-35 iterations across kD 5-202 and stays flat
+as the mesh refines. It agrees with `cgesv` to within float32 assembly noise and
+is opt-in. Only the plain square boundary solve routes to it -- the CHIEF path
+solves an overdetermined least-squares system and the coupled-IB path a Schur
+complement, and both keep the direct factorisation. Pair it with
+`formulation="complex_k"`: the undamped `standard` operator carries interior
+resonances that cost roughly 6x the iterations on a body enclosing a sizeable
+volume, and `sweep.py` warns about both the configuration and the measured
+iteration count.
+
 `SolveConfig(formulation="complex_k")` is experimental and opt-in. It follows
 the canonical bempp convention `k = k_real * (1 + i*complex_k_shift)` for
 assembly only; exterior field evaluation still uses the real acoustic
