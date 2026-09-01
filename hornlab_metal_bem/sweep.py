@@ -25,6 +25,7 @@ from .bie import (
 )
 from .config import (
     BIEFormulation,
+    NATIVE_GROUND_PLANES,
     NATIVE_SYMMETRY_PLANES,
     SolveConfig,
     _validated_impedance_sources,
@@ -92,6 +93,14 @@ def should_route_native_metal(config: SolveConfig) -> bool:
         raise AssemblyBackendUnavailable(
             "native_symmetry_plane must be None or one of "
             + ", ".join(repr(p) for p in NATIVE_SYMMETRY_PLANES)
+        )
+    if (
+        config.ground_plane is not None
+        and config.ground_plane not in NATIVE_GROUND_PLANES
+    ):
+        raise AssemblyBackendUnavailable(
+            "ground_plane must be None or one of "
+            + ", ".join(repr(p) for p in NATIVE_GROUND_PLANES)
         )
     return True
 
@@ -434,7 +443,17 @@ def _sphere_power_from_log(
     return power, float(np.sum(weights))
 
 
-def _native_symmetry_surface_multiplier(symmetry_plane: str | None) -> float:
+def _native_symmetry_surface_multiplier(config: SolveConfig) -> float:
+    """How many physical copies of the modelled surface the solve stands for.
+
+    A mirror-reduced symmetry mesh is a fraction of a real body, so its driven
+    faces must be counted once per copy. A rigid ground plane's image is not a
+    real radiator -- the mesh is already the whole body -- so it counts once,
+    however many images the kernel sums.
+    """
+    if config.ground_plane is not None:
+        return 1.0
+    symmetry_plane = config.native_symmetry_plane
     if symmetry_plane == "yz+xz":
         return 4.0
     if symmetry_plane in {"yz", "xz", "xy"}:
@@ -471,9 +490,7 @@ def _surface_power_from_pressure_rows(
         face_pressure,
         velocity,
         face_areas_m2,
-        symmetry_multiplier=_native_symmetry_surface_multiplier(
-            config.native_symmetry_plane
-        ),
+        symmetry_multiplier=_native_symmetry_surface_multiplier(config),
     )
 
 
@@ -515,7 +532,7 @@ def _surface_power_from_tag_averages(
             surface_pressure_avg[int(tag)][:count]
             * np.conj(reference_velocity[:, 0])
         ) * tag_area
-    power *= _native_symmetry_surface_multiplier(config.native_symmetry_plane)
+    power *= _native_symmetry_surface_multiplier(config)
     return power
 
 
@@ -970,6 +987,8 @@ def run_sweep_native_metal(
     with MetalNativeStandardSession.create_session(
         geometry_buffers=geometry_buffers,
         symmetry_plane=config.native_symmetry_plane,
+        ground_plane=config.ground_plane,
+        ground_plane_min_clearance_m=config.ground_plane_min_clearance_m,
         aperture_tag=config.aperture_tag,
         velocity_source_tags=source_tags,
         check_open_edges=config.native_check_open_edges,
@@ -1513,6 +1532,8 @@ def run_sweep_native_metal_multi_source(
     with MetalNativeStandardSession.create_session(
         geometry_buffers=geometry_buffers,
         symmetry_plane=config.native_symmetry_plane,
+        ground_plane=config.ground_plane,
+        ground_plane_min_clearance_m=config.ground_plane_min_clearance_m,
         aperture_tag=config.aperture_tag,
         velocity_source_tags=source_tags,
         check_open_edges=config.native_check_open_edges,

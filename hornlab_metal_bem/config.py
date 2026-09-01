@@ -93,12 +93,24 @@ class BIEFormulation:
 
 
 NativeSymmetryPlane = Literal["yz", "xz", "xy", "yz+xz"]
+GroundPlane = Literal["xy", "yz", "xz"]
 MetalNativeAssemblyMode = Literal["corrected", "optimized", "reference", "parity"]
 
 # Single source of truth for the supported native symmetry planes. Used by
 # config validation, native routing, and geometry validation so the lists
 # cannot drift apart.
 NATIVE_SYMMETRY_PLANES: tuple[str, ...] = ("yz", "xz", "xy", "yz+xz")
+
+# Rigid half-space ground planes. Named for the coordinate plane the rigid
+# boundary lies in, matching NATIVE_SYMMETRY_PLANES: "xy" is the Z=0 plane,
+# "yz" the X=0 plane, "xz" the Y=0 plane. Only single planes are meaningful --
+# two rigid half-spaces would bound a wedge, not a half space.
+NATIVE_GROUND_PLANES: tuple[str, ...] = ("xy", "yz", "xz")
+
+# The axis normal to each plane, shared by config validation and the geometry
+# validator so the two cannot disagree about which coordinate must stay
+# non-negative.
+GROUND_PLANE_NORMAL_AXIS: dict[str, int] = {"yz": 0, "xz": 1, "xy": 2}
 _MAX_SPHERE_POINTS = 100_000
 
 
@@ -400,6 +412,41 @@ class SolveConfig:
     # for the flush z=0 aperture triangles. Independent of circsym_aperture_tag.
     aperture_tag: int | None = None
     native_symmetry_plane: NativeSymmetryPlane | None = None
+    # Rigid (Neumann) infinite half-space boundary, named for the coordinate
+    # plane it lies in: "xy" is a rigid floor at Z=0, "yz" a rigid wall at X=0,
+    # "xz" a rigid wall at Y=0. The modelled mesh is the COMPLETE radiating
+    # body and must lie entirely on the non-negative side of that plane; the
+    # solver adds one mirror image of it and returns the pressure in the open
+    # half space. Reflection coefficient is +1 (rigid); there is no finite
+    # impedance ground.
+    #
+    # This is NOT native_symmetry_plane. Both use the same image kernel, but
+    # they say different things about the mesh you supplied:
+    #
+    #   native_symmetry_plane -- the mesh is HALF of a mirror-symmetric body,
+    #     cut on the plane, and the image completes the physical radiator. The
+    #     rim must lie on the plane, and radiated surface power is multiplied
+    #     by the number of copies.
+    #   ground_plane -- the mesh is the WHOLE body standing next to a rigid
+    #     wall it need not touch. The image is fictitious, so radiated surface
+    #     power is NOT multiplied, and the observation frame is not projected
+    #     onto the plane.
+    #
+    # A cabinet resting flat on the ground with its contact face removed (rim
+    # on the plane) is expressible either way, and native_symmetry_plane has
+    # always solved that geometry correctly -- but it reports twice the
+    # radiated surface power, because it believes the image is real. Use
+    # ground_plane for anything standing on, or flown above, a rigid boundary.
+    #
+    # None (the default) leaves every existing solve bit-for-bit unchanged.
+    # Does not currently compose with native_symmetry_plane or aperture_tag.
+    ground_plane: GroundPlane | None = None
+    # Minimum clearance, in metres, required between the mesh and the ground
+    # plane when the mesh does not touch it. Purely a guard against a body
+    # placed so close to its own image that the fixed-order quadrature between
+    # the real and image faces loses accuracy; it does not change the solve.
+    # Faces that touch the plane exactly are rejected separately.
+    ground_plane_min_clearance_m: float = 0.0
     # When True (default), a reduced-domain symmetry mesh must have every open
     # boundary edge on a requested symmetry plane: a closed surface reduced by
     # mirror cuts has its whole rim on the cut planes, so an off-plane open edge
@@ -560,6 +607,29 @@ class SolveConfig:
         ):
             raise ValueError(
                 "native_symmetry_plane must be None, 'yz', 'xz', 'xy', or 'yz+xz'"
+            )
+        if self.ground_plane is not None:
+            if self.ground_plane not in NATIVE_GROUND_PLANES:
+                raise ValueError(
+                    "ground_plane must be None, 'xy', 'yz', or 'xz'"
+                )
+            if self.native_symmetry_plane is not None:
+                raise ValueError(
+                    "ground_plane does not yet compose with "
+                    "native_symmetry_plane; solve the full body against the "
+                    "ground, or drop the ground plane"
+                )
+            if self.aperture_tag is not None:
+                raise ValueError(
+                    "ground_plane does not compose with the coupled "
+                    "infinite-baffle aperture_tag mode"
+                )
+        if not (
+            math.isfinite(self.ground_plane_min_clearance_m)
+            and self.ground_plane_min_clearance_m >= 0.0
+        ):
+            raise ValueError(
+                "ground_plane_min_clearance_m must be finite and non-negative"
             )
         if self.metal_native_assembly_mode not in {
             "corrected",

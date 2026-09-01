@@ -544,6 +544,8 @@ class MetalNativeStandardSession:
         duffy_1d_order: int = 4,
         precision: str = "complex64",
         symmetry_plane: str | None = None,
+        ground_plane: str | None = None,
+        ground_plane_min_clearance_m: float = 0.0,
         aperture_tag: int | None = None,
         velocity_source_tags: Any | None = None,
         check_open_edges: bool = True,
@@ -560,8 +562,17 @@ class MetalNativeStandardSession:
         plane. Pass ``False`` for open shells whose rim is a real free edge of
         the full (reduced + mirrored) geometry; see
         :func:`validate_native_symmetry_plane`.
+
+        ``ground_plane`` names a rigid half-space boundary instead. It uses the
+        SAME image kernel as ``symmetry_plane`` -- the helper is told about one
+        mirror plane either way -- but the mesh contract is different: the body
+        is complete and need not touch the plane, so it is checked by
+        :func:`validate_native_ground_plane`. The two are mutually exclusive;
+        the caller's ``SolveConfig`` already refuses the combination, and this
+        repeats the check because the session is a public entry point.
         """
         from .geometry import build_metal_geometry_buffers
+        from .geometry import validate_native_ground_plane
         from .geometry import validate_native_infinite_baffle_aperture
         from .geometry import validate_native_symmetry_plane
         from .session import GeometryPayload, write_geometry_buffers, write_json_manifest
@@ -601,11 +612,30 @@ class MetalNativeStandardSession:
                 p1_space,
                 dp0_space,
             )
+        if symmetry_plane is not None and ground_plane is not None:
+            raise ValueError(
+                "symmetry_plane and ground_plane are mutually exclusive; the "
+                "native helper carries one mirror-plane set per session"
+            )
         symmetry_plane = validate_native_symmetry_plane(
             geometry_buffers,
             symmetry_plane,
             check_open_edges=check_open_edges,
         )
+        ground_plane = validate_native_ground_plane(
+            geometry_buffers,
+            ground_plane,
+            min_clearance_m=ground_plane_min_clearance_m,
+        )
+        if ground_plane is not None:
+            # The manifest carries a single image-plane field. A rigid ground
+            # plane and a mirror-reduced symmetry plane produce the identical
+            # image sum -- reflect the trial point and its normal, add the
+            # kernel -- so the helper needs no new mode. Everything that DOES
+            # differ (surface-power scaling, frame projection, sphere dedupe,
+            # mesh validation) is resolved on the Python side before this
+            # point.
+            symmetry_plane = ground_plane
         aperture_tag = validate_native_infinite_baffle_aperture(
             geometry_buffers,
             aperture_tag,
