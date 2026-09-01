@@ -17,6 +17,8 @@ Three independent checks, in increasing order of independence:
 """
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -317,3 +319,45 @@ def test_ground_plane_wall_reflects_about_its_own_axis():
     np.testing.assert_allclose(
         floor.pressure_complex, wall.pressure_complex, rtol=2.0e-4, atol=1.0e-12
     )
+
+
+@pytest.mark.slow
+def test_observation_points_inside_the_ground_are_flagged():
+    """The image method answers everywhere; below the plane it answers nothing."""
+    _require_native()
+    vertices, triangles, tags = _capped_sphere(RADIUS, (0.0, 0.0, 0.5))
+    mesh = _loaded(vertices, triangles, tags, {1: "rigid", 2: "cap"})
+
+    def solve_with(points):
+        observation = metal_bem.ObservationConfig(
+            planes=["probe"], angle_count=points.shape[0],
+            custom_points={"probe": points},
+        )
+        with pytest.warns(RuntimeWarning, match="solid") as record:
+            metal_bem.solve_frequencies(
+                mesh, [800.0],
+                metal_bem.native_config(
+                    ground_plane="xy", observation=observation,
+                    frame_override=_frame(0.5),
+                ),
+            )
+        return record
+
+    record = solve_with(np.array([[2.0, 0.0, 0.5], [2.0, 0.0, -0.4]]))
+    assert any("1 of 2 observation points" in str(w.message) for w in record)
+
+    # Entirely above the plane: no warning at all.
+    observation = metal_bem.ObservationConfig(
+        planes=["probe"], angle_count=2,
+        custom_points={"probe": np.array([[2.0, 0.0, 0.5], [2.0, 0.0, 1.4]])},
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        metal_bem.solve_frequencies(
+            mesh, [800.0],
+            metal_bem.native_config(
+                ground_plane="xy", observation=observation,
+                frame_override=_frame(0.5),
+            ),
+        )
+    assert not [w for w in caught if "solid" in str(w.message)]
