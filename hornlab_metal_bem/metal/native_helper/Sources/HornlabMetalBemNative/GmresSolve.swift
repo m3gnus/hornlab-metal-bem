@@ -10,7 +10,10 @@ import Foundation
 // already dominates the wall clock. It agreed with the LU solution to 1e-8
 // relative, which is below this path's own float32 assembly noise.
 //
-// Opt in with HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_IMPL=gmres.
+// Opt in with SolveConfig(dense_solve_implementation="gmres"). The helper reads
+// HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_IMPL, but the Python sweep sets that
+// variable from the config field on every solve, so a value placed in the
+// process environment never reaches a Python-driven solve.
 //
 // One caveat is load-bearing. On a CLOSED body the real-k `standard` formulation
 // carries uncured interior resonances whose modal density above ~6 kHz is high

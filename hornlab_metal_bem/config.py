@@ -423,8 +423,12 @@ class SolveConfig:
     # "gmres" is block-Jacobi preconditioned GMRES: measured at 20-35 iterations
     # across kD 5-202 and flat as the mesh refines, so it trades the LU's O(N^3)
     # for O(iterations * N^2) and agrees with the LU to within float32 noise.
-    # It is opt-in, and `standard` + "gmres" on a closed body is refused --
-    # see the validation in sweep.py for why.
+    # It is opt-in. `standard` + "gmres" is not refused -- the answer is still
+    # correct, just ~6x the iterations on a closed body -- so sweep.py warns on
+    # that configuration and again when a measured iteration count crosses the
+    # gate the path was accepted against. This field is the only way to select
+    # it from Python: the helper env var is overwritten from this field on
+    # every solve (see _native_env_overrides in sweep.py).
     dense_solve_implementation: Literal[
         "cgesv", "cgetrf_cgetrs", "gmres"
     ] = "cgesv"
