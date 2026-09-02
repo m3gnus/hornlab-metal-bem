@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import time
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,6 +26,8 @@ from .bie import (
 )
 from .config import (
     BIEFormulation,
+    GROUND_PLANE_NORMAL_AXIS,
+    NATIVE_GROUND_PLANES,
     NATIVE_SYMMETRY_PLANES,
     SolveConfig,
     _validated_impedance_sources,
@@ -92,6 +95,14 @@ def should_route_native_metal(config: SolveConfig) -> bool:
         raise AssemblyBackendUnavailable(
             "native_symmetry_plane must be None or one of "
             + ", ".join(repr(p) for p in NATIVE_SYMMETRY_PLANES)
+        )
+    if (
+        config.ground_plane is not None
+        and config.ground_plane not in NATIVE_GROUND_PLANES
+    ):
+        raise AssemblyBackendUnavailable(
+            "ground_plane must be None or one of "
+            + ", ".join(repr(p) for p in NATIVE_GROUND_PLANES)
         )
     return True
 
@@ -434,7 +445,58 @@ def _sphere_power_from_log(
     return power, float(np.sum(weights))
 
 
-def _native_symmetry_surface_multiplier(symmetry_plane: str | None) -> float:
+def _warn_observation_points_inside_the_ground(
+    config: SolveConfig,
+    obs_points: NDArray[np.float64],
+    sphere_points: NDArray[np.float64] | None,
+) -> None:
+    """Say so when observation points fall inside the rigid half space.
+
+    The image method returns a number everywhere, including on the far side of
+    the plane, but that number is the analytic continuation of the exterior
+    field into a region the model says is solid. A default 0-180 degree polar
+    arc around a body standing on a floor sweeps straight through it, so this
+    is the normal way to get meaningless values, not an exotic one. It warns
+    rather than raises because the points are legal to ask for -- a caller
+    reconstructing the full free-field pair may want exactly them -- and
+    because refusing would break the default observation config outright.
+    """
+    plane = config.ground_plane
+    if plane is None:
+        return
+    axis = GROUND_PLANE_NORMAL_AXIS[plane]
+    axis_name = "XYZ"[axis]
+    values = [np.asarray(obs_points, dtype=np.float64).reshape(-1, 3)[:, axis]]
+    if sphere_points is not None:
+        values.append(np.asarray(sphere_points, dtype=np.float64)[:, axis])
+    stacked = np.concatenate(values)
+    below = int(np.count_nonzero(stacked < 0.0))
+    if below == 0:
+        return
+    warnings.warn(
+        f"ground_plane={plane!r} makes {axis_name} < 0 solid, but "
+        f"{below} of {stacked.size} observation points lie there. Their "
+        "pressure is the analytic continuation of the half-space field, not a "
+        "physical result. Restrict the observation arc or sphere to "
+        f"{axis_name} >= 0 (for example sphere_theta_max_deg=90 with the frame "
+        "axis along the plane), or ignore this if you meant to sample the "
+        "mirrored free-field pair.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
+def _native_symmetry_surface_multiplier(config: SolveConfig) -> float:
+    """How many physical copies of the modelled surface the solve stands for.
+
+    A mirror-reduced symmetry mesh is a fraction of a real body, so its driven
+    faces must be counted once per copy. A rigid ground plane's image is not a
+    real radiator -- the mesh is already the whole body -- so it counts once,
+    however many images the kernel sums.
+    """
+    if config.ground_plane is not None:
+        return 1.0
+    symmetry_plane = config.native_symmetry_plane
     if symmetry_plane == "yz+xz":
         return 4.0
     if symmetry_plane in {"yz", "xz", "xy"}:
@@ -471,9 +533,7 @@ def _surface_power_from_pressure_rows(
         face_pressure,
         velocity,
         face_areas_m2,
-        symmetry_multiplier=_native_symmetry_surface_multiplier(
-            config.native_symmetry_plane
-        ),
+        symmetry_multiplier=_native_symmetry_surface_multiplier(config),
     )
 
 
@@ -515,7 +575,7 @@ def _surface_power_from_tag_averages(
             surface_pressure_avg[int(tag)][:count]
             * np.conj(reference_velocity[:, 0])
         ) * tag_area
-    power *= _native_symmetry_surface_multiplier(config.native_symmetry_plane)
+    power *= _native_symmetry_surface_multiplier(config)
     return power
 
 
@@ -960,6 +1020,9 @@ def run_sweep_native_metal(
         frame, config.observation
     )
     n_sphere = 0 if sphere_points_arr is None else int(sphere_points_arr.shape[0])
+    _warn_observation_points_inside_the_ground(
+        config, obs_points, sphere_points_arr
+    )
     sphere_evaluation_points, sphere_evaluation_inverse = (
         _native_sphere_evaluation_targets(sphere_points_arr, config)
     )
@@ -970,6 +1033,8 @@ def run_sweep_native_metal(
     with MetalNativeStandardSession.create_session(
         geometry_buffers=geometry_buffers,
         symmetry_plane=config.native_symmetry_plane,
+        ground_plane=config.ground_plane,
+        ground_plane_min_clearance_m=config.ground_plane_min_clearance_m,
         aperture_tag=config.aperture_tag,
         velocity_source_tags=source_tags,
         check_open_edges=config.native_check_open_edges,
@@ -1408,6 +1473,9 @@ def run_sweep_native_metal_multi_source(
         frame, config.observation
     )
     n_sphere = 0 if sphere_points_arr is None else int(sphere_points_arr.shape[0])
+    _warn_observation_points_inside_the_ground(
+        config, obs_points, sphere_points_arr
+    )
     sphere_evaluation_points, sphere_evaluation_inverse = (
         _native_sphere_evaluation_targets(sphere_points_arr, config)
     )
@@ -1513,6 +1581,8 @@ def run_sweep_native_metal_multi_source(
     with MetalNativeStandardSession.create_session(
         geometry_buffers=geometry_buffers,
         symmetry_plane=config.native_symmetry_plane,
+        ground_plane=config.ground_plane,
+        ground_plane_min_clearance_m=config.ground_plane_min_clearance_m,
         aperture_tag=config.aperture_tag,
         velocity_source_tags=source_tags,
         check_open_edges=config.native_check_open_edges,

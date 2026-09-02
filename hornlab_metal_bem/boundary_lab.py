@@ -969,6 +969,20 @@ def _coerce_symmetry_plane(symmetry: Any) -> str | None:
         return "yz+xz"
     if mode in {"yz", "xz", "yz+xz"}:
         return mode
+    if mode == "ground":
+        # SolveConfig.ground_plane can express a rigid half space, so this is a
+        # mapping gap rather than a missing capability. It is deliberately not
+        # mapped here: a ground token names the axis that points UP, this
+        # adapter already documents that the two vocabularies disagree about
+        # axis-versus-plane naming, and guessing wrong swaps a floor for a side
+        # wall silently. Refuse until the wire contract states the axis.
+        raise BoundaryLabSolverError(
+            "Boundary Lab 'ground' symmetry is not mapped by this adapter. "
+            "The native solver does support a rigid half space -- set "
+            "SolveConfig.ground_plane to 'xy' (floor at Z=0), 'xz' (Y=0) or "
+            "'yz' (X=0) directly -- but this adapter will not guess which axis "
+            "the request calls up."
+        )
     raise BoundaryLabSolverError(f"Unsupported Boundary Lab symmetry mode for Metal: {symmetry!r}")
 
 

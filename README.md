@@ -110,6 +110,102 @@ reduced solves report the same frame as the full model. Callers that use a
 symmetry plane as a rigid-baffle image method around a full mesh must pass
 `frame_override` instead.
 
+## Rigid Half Space
+
+`ground_plane` puts one rigid, infinite, perfectly reflecting boundary in the
+domain and solves the open half space above it: `"xy"` is a floor at Z=0,
+`"yz"` a wall at X=0, `"xz"` a wall at Y=0. The mesh is the **complete**
+radiating body and must lie at or above zero on that axis.
+
+It shares the image kernel with `native_symmetry_plane` but not its contract,
+and the difference is what the mesh means:
+
+| | `native_symmetry_plane` | `ground_plane` |
+|---|---|---|
+| the mesh is | half/quarter of a mirror-symmetric body | the whole body |
+| must reach the plane | yes, its rim lies on the cut | no, it may float clear |
+| a face lying in the plane | rejected | rejected |
+| the image is | part of the real radiator | fictitious |
+| radiated surface power | multiplied by the copy count | counted once |
+| observation frame | projected onto the plane | left where it is |
+
+So a cabinet flown above a stage, or standing on a floor with a gap under it,
+is a `ground_plane` solve and is not expressible as a symmetry plane at all —
+the reduced-domain validator requires a vertex on the plane. A cabinet resting
+flat with its contact face deleted (rim on the plane) is expressible either
+way; `native_symmetry_plane="xy"` gives the correct field for it but reports
+twice the radiated surface power, because that mode believes the mirrored body
+is a second real radiator.
+
+`ground_plane_min_clearance_m` optionally demands a gap. Contact along an edge
+or vertex is otherwise allowed, and the existing Duffy correction covers the
+coincident and adjacent real-vs-image element pairs it produces. For a body
+very close to but not touching the plane, the real-vs-image pairs become
+near-singular; the opt-in near-quadrature correction
+(`HORNLAB_METAL_BEM_NATIVE_NEAR_QUADRATURE=auto`, default off) covers those,
+and its pair list already enumerates image masks on both test and trial.
+
+Measured on a 100 mm sphere meshed to 2048 triangles, 15.2 mm max edge, whose
+6-elements-per-wavelength limit is 3749 Hz, comparing the correction off
+against an aggressive `2:3.0`:
+
+|  | 500 Hz | 2 kHz | 3.5 kHz | max rel &#124;Z&#124; |
+|---|---|---|---|---|
+| free field, no ground | 0.0000 | 0.0000 | 0.0001 dB | 2.8e-06 |
+| ground, 2 mm clearance | 0.0000 | 0.0002 | 0.0011 dB | 1.4e-05 |
+| ground, 20 mm clearance | 0.0000 | 0.0000 | 0.0004 dB | 2.9e-06 |
+| ground, 200 mm clearance | 0.0000 | 0.0000 | 0.0001 dB | 2.7e-06 |
+
+So the ground plane does raise what the correction is worth — 2 mm clearance is
+an order of magnitude above the free-field control — but the absolute figure
+stays at 0.001 dB and 1e-5 relative impedance, which is why it remains off by
+default. This measures far-field pressure and driven-surface impedance only; it
+says nothing about true near-field points or thin walls, where the correction is
+expected to matter more.
+
+The first version of this table was taken on a 57.7 mm mesh whose own limit is
+991 Hz, and it read 0.29 dB at 3.5-5 kHz. That number was the two quadrature
+rules disagreeing about an already-unconverged solution, not an effect. Run this
+comparison inside the mesh's resolution limit or it measures nothing.
+
+`ground_plane` does not currently compose with `native_symmetry_plane` (the
+native session carries one image-plane set) or with the coupled
+infinite-baffle `aperture_tag`; both combinations refuse in `SolveConfig`.
+
+## Several Bodies In One Domain
+
+`combine_bodies()` places multiple closed bodies into a single exterior domain,
+where they couple through the kernel like any other elements — a boundary
+integral operator pairs elements, not connected components.
+
+```python
+from hornlab_metal_bem import BodyPlacement, combine_bodies, rotation_matrix
+
+scene = combine_bodies([
+    BodyPlacement(top, name="top"),
+    BodyPlacement(
+        sub,
+        translation_m=(0.0, 0.0, -0.9),
+        rotation=rotation_matrix([0.0, 0.0, 1.0], 12.0),
+        tag_map={1: 11, 2: 12},          # keep this body's tags distinct
+        name="sub",
+    ),
+])
+result = solve(scene.mesh, native_config(
+    ground_plane="xy", velocity_sources={2: 1.0, 12: 1.0}))
+```
+
+`tag_map` is what keeps `velocity_sources` able to address one body rather than
+both: two cabinets that each arrive tagged `{1: rigid, 2: throat}` would
+otherwise merge into one indistinguishable pair of tags. A collision between
+bodies is an error rather than a silent merge. Improper (reflecting) rotations
+are refused because they invert outward winding, which the loader cannot detect
+once several bodies are summed into one signed volume. Vertices are never
+merged between bodies, so touching cabinets stay two closed surfaces.
+
+`CombinedMesh` carries `body_ids` (per triangle), `tag_maps`, `body_names`, and
+`tags_for(body)` back out.
+
 ## Configuration
 
 Use `native_config(**overrides)` to create a supported Metal configuration.
@@ -140,6 +236,9 @@ Common fields:
 - `mesh_scale`
 - `air_density`
 - `native_symmetry_plane`, one of `None`, `"yz"`, `"xz"`, `"xy"`, or `"yz+xz"`
+- `ground_plane`, one of `None` (default), `"xy"`, `"yz"`, or `"xz"` — a
+  rigid half-space boundary the complete mesh stands next to, with
+  `ground_plane_min_clearance_m` as an optional minimum gap
 - `return_surface_pressure`, opt-in full solved P1 surface pressure output
 - `return_surface_traces`, opt-in P1 pressure plus total DP0 Neumann traces for
   post-solve exterior-field evaluation

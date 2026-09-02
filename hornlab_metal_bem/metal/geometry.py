@@ -16,7 +16,11 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from ..config import NATIVE_SYMMETRY_PLANES
+from ..config import (
+    GROUND_PLANE_NORMAL_AXIS,
+    NATIVE_GROUND_PLANES,
+    NATIVE_SYMMETRY_PLANES,
+)
 from ..mesh import open_boundary_edges
 
 
@@ -273,6 +277,86 @@ def validate_native_symmetry_plane(
         _validate_axis(2, "z", "Z=0")
     if check_open_edges:
         _validate_open_edges_on_symmetry_planes(coords, triangles, plane)
+    return plane
+
+
+def validate_native_ground_plane(
+    buffers: MetalGeometryBuffers,
+    ground_plane: str | None,
+    *,
+    tolerance: float = 1.0e-7,
+    min_clearance_m: float = 0.0,
+) -> str | None:
+    """Validate the rigid half-space contract and return the normalized plane.
+
+    Unlike :func:`validate_native_symmetry_plane`, the mesh here is the whole
+    radiating body standing next to a rigid boundary, so it is NOT required to
+    reach the plane and its rim is not constrained. What is required is that
+    the body lies wholly in the open half space:
+
+    * every vertex used by a triangle is on the non-negative side, and
+    * no triangle lies flat on the plane.
+
+    A triangle flat on the plane is exactly coincident with its own image, so
+    the real and image surfaces would occupy the same place and the boundary
+    integral would be singular there. Remove that face -- an acoustically rigid
+    boundary in contact with a rigid floor is not part of the radiating surface
+    -- or lift the body clear.
+
+    ``min_clearance_m`` optionally requires a positive gap between the body and
+    the plane. Zero (the default) permits contact along an edge or vertex,
+    which is geometrically legal and quadrature-safe because the image kernel's
+    Duffy correction handles coincident and adjacent pairs.
+    """
+    if ground_plane is None:
+        return None
+    plane = str(ground_plane).strip().lower()
+    if plane not in NATIVE_GROUND_PLANES:
+        raise MetalGeometryError(
+            "ground_plane currently supports 'xy', 'yz', and 'xz'"
+        )
+    if not (np.isfinite(min_clearance_m) and min_clearance_m >= 0.0):
+        raise MetalGeometryError(
+            "ground_plane min_clearance_m must be finite and non-negative"
+        )
+
+    coords = np.asarray(buffers.vertices_3xn_f32, dtype=np.float64)
+    if coords.shape[1] == 0:
+        raise MetalGeometryError(f"ground_plane={plane!r} requires vertices")
+
+    axis = GROUND_PLANE_NORMAL_AXIS[plane]
+    axis_name = "XYZ"[axis]
+    triangles = buffers.triangles_nx3_i32
+    used_vertices = np.unique(triangles.reshape(-1))
+    values = coords[axis]
+    used_values = values[used_vertices]
+
+    min_value = float(np.min(used_values))
+    if min_value < -tolerance:
+        raise MetalGeometryError(
+            f"ground_plane={plane!r} is a rigid half-space boundary: the whole "
+            f"mesh must lie at {axis_name} >= 0, but the minimum {axis_name} is "
+            f"{min_value:.6g}. Translate the body above the plane; the solver "
+            "will not clip it."
+        )
+
+    tri_values = values[triangles]
+    flat_faces = np.all(np.abs(tri_values) <= tolerance, axis=1)
+    if np.any(flat_faces):
+        first = int(np.flatnonzero(flat_faces)[0])
+        raise MetalGeometryError(
+            f"ground_plane={plane!r} treats {axis_name}=0 as an image plane, "
+            f"not a physical boundary; triangle {first} lies flat on it and "
+            "would coincide with its own image. Delete the ground-contact "
+            "faces, or lift the body clear of the plane."
+        )
+
+    if min_clearance_m > 0.0 and min_value < min_clearance_m:
+        raise MetalGeometryError(
+            f"ground_plane={plane!r} requires at least "
+            f"{min_clearance_m:.6g} m of clearance, but the mesh reaches "
+            f"{axis_name}={min_value:.6g}"
+        )
     return plane
 
 
