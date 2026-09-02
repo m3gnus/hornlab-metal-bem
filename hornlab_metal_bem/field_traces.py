@@ -10,7 +10,7 @@ from uuid import uuid4
 import numpy as np
 from numpy.typing import NDArray
 
-from .config import NATIVE_SYMMETRY_PLANES
+from .config import NATIVE_GROUND_PLANES, NATIVE_SYMMETRY_PLANES
 from .mesh import LoadedMesh, make_pure_function_spaces
 
 
@@ -118,6 +118,8 @@ def evaluate_exterior_from_traces(
     points_xyz: NDArray[Any],
     *,
     symmetry_plane: str | None = None,
+    ground_plane: str | None = None,
+    ground_plane_min_clearance_m: float = 0.0,
     check_open_edges: bool = True,
 ) -> NDArray[np.complex128]:
     r"""Evaluate complex exterior pressure from one frequency's surface traces.
@@ -139,8 +141,19 @@ def evaluate_exterior_from_traces(
     symmetry_plane:
         The solve's native symmetry plane: ``None``, ``"yz"``, ``"xz"``,
         ``"xy"``, or ``"yz+xz"``.
+    ground_plane:
+        The solve's rigid half-space plane: ``None``, ``"xy"``, ``"yz"``, or
+        ``"xz"``. Pass whichever of these two the solve used -- they are
+        mutually exclusive, and passing NEITHER for a solve that had one
+        re-evaluates the free-field trace, which is a wrong answer that looks
+        entirely plausible. ``SolveResult.config`` carries both fields, so the
+        safe idiom is
+        ``ground_plane=result.config.ground_plane,
+        symmetry_plane=result.config.native_symmetry_plane``.
     check_open_edges:
         Apply the same reduced-mesh open-edge validation used by solves.
+        Ignored under ``ground_plane``, whose mesh is a complete body with no
+        reduced-domain rim to check.
 
     Returns
     -------
@@ -156,6 +169,13 @@ def evaluate_exterior_from_traces(
         )
     if symmetry_plane is not None and symmetry_plane not in NATIVE_SYMMETRY_PLANES:
         raise ValueError("symmetry_plane must be None, 'yz', 'xz', 'xy', or 'yz+xz'")
+    if ground_plane is not None and ground_plane not in NATIVE_GROUND_PLANES:
+        raise ValueError("ground_plane must be None, 'xy', 'yz', or 'xz'")
+    if symmetry_plane is not None and ground_plane is not None:
+        raise ValueError(
+            "symmetry_plane and ground_plane are mutually exclusive; pass the "
+            "one the solve used"
+        )
     if not (math.isfinite(float(frequency_hz)) and float(frequency_hz) > 0.0):
         raise ValueError("frequency_hz must be finite and positive")
     if not (math.isfinite(float(k_real)) and float(k_real) > 0.0):
@@ -190,6 +210,8 @@ def evaluate_exterior_from_traces(
     with MetalNativeStandardSession.create_session(
         geometry_buffers=geometry_buffers,
         symmetry_plane=symmetry_plane,
+        ground_plane=ground_plane,
+        ground_plane_min_clearance_m=ground_plane_min_clearance_m,
         check_open_edges=check_open_edges,
         runtime_status=runtime,
         extra_env=_native_field_env_overrides(),
