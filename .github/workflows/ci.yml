@@ -21,44 +21,60 @@ jobs:
       - name: Install package
         run: python -m pip install -e ".[dev]"
 
-      # This job collects tests/ in full. It used to name six files explicitly,
-      # which meant a new test file joined CI only if someone remembered to add
-      # it -- and for three files added with the half-space work, nobody did.
-      # Collecting everything and subtracting deliberately is the only version
-      # of this that stays true as the suite grows.
+      # This job collects tests/ in full. It used to name six files
+      # explicitly, which meant a new test file joined CI only if someone
+      # remembered to add it -- and for the three files that came with the
+      # half-space work, nobody did. Collecting everything and subtracting
+      # deliberately is the only version of this that stays true as the suite
+      # grows.
       #
-      # Nothing is subtracted today. Measured on an M-series Mac with the
-      # native helper made undiscoverable, so the run matches a GPU-free
-      # runner: the old six-file list was 78 tests in 29 s, the whole suite is
-      # 610 tests in 40 s. 455 more passing tests for 11 s is not a tradeoff
-      # worth deliberating over, so there is no --ignore list to justify.
+      # Nothing is subtracted. Every file either passes without a GPU or skips
+      # itself through discover_native_runtime(run_smoke_test=True); none needs
+      # licensed data, and the only fixture in the repository is one JSON
+      # golden. So there is no --ignore list here, and the reason is that no
+      # file earned a place on one -- not that nobody looked.
       #
-      # What this job still does not cover, and why it is a skip rather than an
-      # exclusion:
+      # Measured on run 33679469356, whole suite vs the old six-file list:
       #
-      #   Swift/Metal GPU paths -- every test that needs the helper calls
-      #     discover_native_runtime(run_smoke_test=True) and skips itself when
-      #     it is unavailable, so these files contribute their portable tests
-      #     (test_metal_native.py alone contributes 25) and skip the rest. On
-      #     ubuntu/windows the helper cannot exist. On macos-latest Swift is on
-      #     PATH and discovery *compiles the helper on demand*, so this job may
-      #     genuinely exercise Metal there -- see the -rs output for which.
-      #     Real GPU coverage is a separate question from this job; do not read
-      #     a green macOS run as a claim that the Metal kernels were tested.
+      #   ubuntu-latest    559 passed,  86 skipped   38.9 s   (job 1m00s)
+      #   windows-latest   539 passed, 106 skipped   38.2 s   (job 1m28s)
+      #   macos-latest     641 passed,   4 skipped   95.4 s   (job 3m28s)
+      #
+      # The old list ran 78 tests in 29 s on a GPU-free runner. The extra
+      # coverage costs about 10 s on ubuntu and windows.
+      #
+      # macos-latest is the expensive one and it is worth saying why, because
+      # the reason is not obvious from this file: Swift is on PATH there, and
+      # discovery *compiles the native helper on demand*, so the macOS job
+      # builds the Swift/Metal helper (~60 s) and then runs the GPU tests for
+      # real. It reported four skips, none of them Metal. This is the first
+      # CI coverage the Metal kernels have ever had.
+      #
+      # That coverage is incidental rather than asserted, which is its weak
+      # point: if a future runner image drops Swift or the Metal device, every
+      # GPU test would skip itself and the job would stay green while covering
+      # far less. Read the -rs output, not the check mark. Making that a hard
+      # failure on macOS is a deliberate policy choice and has not been made.
+      #
+      # What is skipped rather than excluded, on the GPU-free runners:
+      #
+      #   Swift/Metal GPU paths -- unavailable on ubuntu/windows, so these
+      #     files contribute their portable tests (test_metal_native.py alone
+      #     contributes 25) and skip the rest.
       #
       #   tests/test_bempp_feature_parity.py -- skips unless bempp_cl imports.
       #     Bempp is a comparison oracle, not a dependency, and installing it
-      #     here would cost far more than the parity check is worth in CI.
+      #     here would cost more than the parity check is worth in CI.
       #
       #   tests/test_coupled_ib_mesh_load.py -- importorskip on hornlab_mesher,
       #     a sibling package this repository does not depend on.
       #
-      #   POSIX-only runtime C kernel tests -- skipif os.name != "posix", so
-      #     roughly a dozen of them do not run on windows-latest.
+      #   The runtime C kernel tests -- skipif os.name != "posix", which is
+      #     most of the 20 extra skips windows-latest reports over ubuntu.
       #
-      # -rs prints every skip and its reason, so the above stays visible in the
-      # log instead of being something you have to know. --durations flags a
-      # file that starts costing real time before anyone learns to ignore the
-      # job.
+      # -rs prints every skip with its reason, so the above stays visible in
+      # the log instead of being something you have to already know.
+      # --durations flags a file that starts costing real time before anyone
+      # learns to ignore the job.
       - name: Run the test suite
         run: python -m pytest tests/ -q -rs --durations=10
