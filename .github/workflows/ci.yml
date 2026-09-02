@@ -21,14 +21,21 @@ jobs:
       - name: Install package
         run: python -m pip install -e ".[dev]"
 
-      # macOS is the only runner that can cover the Metal kernels, and it does
-      # so incidentally: discovery compiles the helper on demand, so the GPU
-      # tests run without anyone asking them to. Incidental coverage fails
-      # quietly -- drop Swift or the Metal device from the image and every GPU
-      # test skips itself while the job stays green over much less. Assert it
-      # instead, before the suite, so the loss is one legible error rather than
-      # a pile of skips nobody reads. This step also absorbs the one-time
-      # ~60 s Swift build, which is why the test step below is not the slow one.
+      # macOS is the only runner that covers the Metal kernels, and the GPU
+      # tests get there without anything in this file asking them to: setup.py
+      # has a build_py hook that runs `swift build -c release` on Darwin
+      # arm64, so `pip install -e` above builds the helper (that is the ~60 s
+      # separating the macOS install step from ubuntu's 17 s), and every GPU
+      # test then finds it instead of skipping.
+      #
+      # That hook already fails loudly if Swift is missing. What it cannot
+      # catch is a helper that builds but cannot run -- no usable Metal device,
+      # a failing smoke test, or someone setting
+      # HORNLAB_METAL_BEM_SKIP_NATIVE_HELPER=1. In every one of those cases the
+      # GPU tests skip themselves through their own guard and this job stays
+      # green over far less than it appears to test. So assert the runtime, not
+      # just the build, and do it before the suite so the loss reads as one
+      # error rather than as a pile of skips nobody reads.
       - name: Require the Swift/Metal helper on macOS
         if: runner.os == 'macOS'
         run: python scripts/assert_native_runtime.py
@@ -55,17 +62,13 @@ jobs:
       # The old list ran 78 tests in 29 s on a GPU-free runner. The extra
       # coverage costs about 10 s on ubuntu and windows.
       #
-      # macos-latest is the expensive one and it is worth saying why, because
-      # the reason is not obvious from this file: Swift is on PATH there, and
-      # discovery *compiles the native helper on demand*, so the macOS job
-      # builds the Swift/Metal helper (~60 s) and then runs the GPU tests for
-      # real. It reported four skips, none of them Metal. This is the first
-      # CI coverage the Metal kernels have ever had.
-      #
-      # That coverage would otherwise be incidental, so the step above asserts
-      # it: on macOS the job fails if the helper is unavailable rather than
-      # quietly skipping every GPU test. On ubuntu and windows the same skips
-      # are correct and expected, which is why the assertion is macOS-only.
+      # macos-latest is the expensive one because it is the only one doing the
+      # Metal work: it builds the helper during install and then runs the GPU
+      # tests for real, reporting four skips with no Metal skip among them.
+      # This is the first CI coverage the Metal kernels have ever had, and the
+      # step above is what keeps it from silently going away. On ubuntu and
+      # windows the Metal skips are correct and expected, which is why that
+      # assertion is macOS-only.
       #
       # What is skipped rather than excluded, on the GPU-free runners:
       #

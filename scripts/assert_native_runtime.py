@@ -3,9 +3,14 @@
 Every GPU test in this repository guards itself with
 ``discover_native_runtime(run_smoke_test=True)`` and skips when the Swift/Metal
 helper is unavailable. That is right for ubuntu and windows, where the helper
-cannot exist -- but on macOS it turns a lost toolchain into a green run over
-far less code rather than into a failure. CI calls this first on macOS so the
-loss is one legible error instead of a pile of skips nobody reads.
+cannot exist. On macOS it is not: it turns a lost GPU into a green run over far
+less code rather than into a failure.
+
+``setup.py`` already fails the install when Swift is missing on Apple Silicon,
+so this is deliberately a check on the *runtime* rather than the build -- the
+cases it catches are a helper that compiles but cannot run, a failing smoke
+test, and ``HORNLAB_METAL_BEM_SKIP_NATIVE_HELPER=1``. CI calls it before the
+suite so the loss is one legible error instead of a pile of skips nobody reads.
 """
 
 from __future__ import annotations
