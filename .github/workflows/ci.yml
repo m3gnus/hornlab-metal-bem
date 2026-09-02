@@ -5,8 +5,8 @@ on:
   pull_request:
 
 jobs:
-  portable-circsym:
-    name: CircSym physics (${{ matrix.os }})
+  tests:
+    name: Test suite (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -20,13 +20,45 @@ jobs:
           cache: pip
       - name: Install package
         run: python -m pip install -e ".[dev]"
-      - name: Run portable CircSym physics suite
-        run: >-
-          python -m pytest
-          tests/test_circsym.py
-          tests/test_circsym_c_kernel_cache.py
-          tests/test_circsym_ib.py
-          tests/test_circsym_cross_os_golden.py
-          tests/test_native_coupled_ib_validation.py
-          tests/test_sphere_grid_native.py
-          -q
+
+      # This job collects tests/ in full. It used to name six files explicitly,
+      # which meant a new test file joined CI only if someone remembered to add
+      # it -- and for three files added with the half-space work, nobody did.
+      # Collecting everything and subtracting deliberately is the only version
+      # of this that stays true as the suite grows.
+      #
+      # Nothing is subtracted today. Measured on an M-series Mac with the
+      # native helper made undiscoverable, so the run matches a GPU-free
+      # runner: the old six-file list was 78 tests in 29 s, the whole suite is
+      # 610 tests in 40 s. 455 more passing tests for 11 s is not a tradeoff
+      # worth deliberating over, so there is no --ignore list to justify.
+      #
+      # What this job still does not cover, and why it is a skip rather than an
+      # exclusion:
+      #
+      #   Swift/Metal GPU paths -- every test that needs the helper calls
+      #     discover_native_runtime(run_smoke_test=True) and skips itself when
+      #     it is unavailable, so these files contribute their portable tests
+      #     (test_metal_native.py alone contributes 25) and skip the rest. On
+      #     ubuntu/windows the helper cannot exist. On macos-latest Swift is on
+      #     PATH and discovery *compiles the helper on demand*, so this job may
+      #     genuinely exercise Metal there -- see the -rs output for which.
+      #     Real GPU coverage is a separate question from this job; do not read
+      #     a green macOS run as a claim that the Metal kernels were tested.
+      #
+      #   tests/test_bempp_feature_parity.py -- skips unless bempp_cl imports.
+      #     Bempp is a comparison oracle, not a dependency, and installing it
+      #     here would cost far more than the parity check is worth in CI.
+      #
+      #   tests/test_coupled_ib_mesh_load.py -- importorskip on hornlab_mesher,
+      #     a sibling package this repository does not depend on.
+      #
+      #   POSIX-only runtime C kernel tests -- skipif os.name != "posix", so
+      #     roughly a dozen of them do not run on windows-latest.
+      #
+      # -rs prints every skip and its reason, so the above stays visible in the
+      # log instead of being something you have to know. --durations flags a
+      # file that starts costing real time before anyone learns to ignore the
+      # job.
+      - name: Run the test suite
+        run: python -m pytest tests/ -q -rs --durations=10
