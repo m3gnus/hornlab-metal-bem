@@ -34,7 +34,9 @@ from numpy.typing import NDArray
 from scipy import linalg
 from scipy.special import ellipe, ellipk
 
-from ._constants import SPEED_OF_SOUND
+# Re-exported, not used here: harnesses read the shipped default off this
+# module. The solve itself takes c from SolveConfig.speed_of_sound.
+from ._constants import SPEED_OF_SOUND  # noqa: F401
 from .bie import (
     _taper_values,
     integrate_driven_surface_power,
@@ -552,7 +554,7 @@ def run_sweep_circsym(
                 "lapack_gecon_1norm" if dense_solve_rcond is not None else None
             ),
             "mesh_max_edge_m": mesh_max_segment,
-            "mesh_elements_per_wavelength": SPEED_OF_SOUND
+            "mesh_elements_per_wavelength": float(config.speed_of_sound)
             / (frequency * mesh_max_segment)
             if mesh_max_segment > 0.0
             else math.inf,
@@ -1069,7 +1071,7 @@ def solve_circsym_frequencies(
 
 
 def _complex_wavenumber(frequency_hz: float, config: SolveConfig) -> complex:
-    k_real = 2.0 * np.pi * float(frequency_hz) / SPEED_OF_SOUND
+    k_real = 2.0 * np.pi * float(frequency_hz) / float(config.speed_of_sound)
     if config.formulation == BIEFormulation.COMPLEX_K:
         return complex(k_real, k_real * float(config.complex_k_shift))
     return complex(k_real, 0.0)

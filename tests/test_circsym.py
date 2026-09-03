@@ -65,8 +65,11 @@ def _freq_for_ka(ka: float, radius: float = 0.1) -> float:
 
 
 def _pulsating_sphere_impedance(ka: np.ndarray) -> np.ndarray:
-    # With this package's e^(+ikR), q=+i*rho*omega*v convention, the textbook
-    # e^(-iwt) impedance ika/(1+ika) appears conjugated.
+    # The textbook form ika/(1+ika) is written in the e^(+iwt) convention
+    # (Green's kernel e^(-ikR)). This package solves the conjugate one --
+    # e^(-iwt), kernel e^(+ikR), q = +i*rho*omega*v -- so the expected
+    # impedance is conjugated here. The reactance being negative is the
+    # signature of that convention, not an error.
     return np.conjugate(1j * ka / (1.0 + 1j * ka))
 
 

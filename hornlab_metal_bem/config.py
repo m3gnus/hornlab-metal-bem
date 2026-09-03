@@ -5,6 +5,8 @@ import math
 from numbers import Integral
 from typing import TYPE_CHECKING, Callable, Literal
 
+from ._constants import AIR_DENSITY, SPEED_OF_SOUND
+
 if TYPE_CHECKING:
     import numpy as np
     from numpy.typing import NDArray
@@ -492,7 +494,16 @@ class SolveConfig:
     mesh_repair_normals: bool = False
 
     # Air density (kg/m^3). Default 1.2041 matches standard air at 20 C.
-    air_density: float = 1.2041
+    air_density: float = AIR_DENSITY
+
+    # Speed of sound (m/s). Default 343.0 matches standard air at 20 C and is
+    # the value every result published before 2026-09-03 was solved with, so
+    # leaving it alone reproduces those bit-for-bit. Set it when matching an
+    # external reference that assumes a different value -- ABEC3 defaults to
+    # 343.32 m/s, a 0.093% offset that is a fixed bias in every comparison
+    # against it. It scales the wavenumber (k = 2*pi*f/c), so it also moves the
+    # mesh-resolution diagnostics and the radiated-power reduction.
+    speed_of_sound: float = SPEED_OF_SOUND
 
     # Progress callback: called after each frequency solve.
     # Signature: (freq_index: int, total_freqs: int, frequency_hz: float) -> None
@@ -527,6 +538,8 @@ class SolveConfig:
             raise ValueError("mesh_merge_tol must be finite")
         if not (math.isfinite(self.air_density) and self.air_density > 0):
             raise ValueError("air_density must be finite and positive")
+        if not (math.isfinite(self.speed_of_sound) and self.speed_of_sound > 0):
+            raise ValueError("speed_of_sound must be finite and positive")
         if not (
             math.isfinite(self.dense_solve_rcond_warning_threshold)
             and self.dense_solve_rcond_warning_threshold >= 0
