@@ -18,6 +18,12 @@ from .config import (
     TaperProfile,
     VelocityMode,
 )
+from .assembly import (
+    BodyPlacement,
+    CombinedMesh,
+    combine_bodies,
+    rotation_matrix,
+)
 from .circsym import CircSymCancelled, MeridianMesh
 from .field_traces import evaluate_exterior_from_traces
 from .mesh import LoadedMesh, MeshError, load_mesh
@@ -31,6 +37,10 @@ __all__ = [
     "solve_circsym",
     "solve_circsym_frequencies",
     "solve_multi_source",
+    "combine_bodies",
+    "rotation_matrix",
+    "BodyPlacement",
+    "CombinedMesh",
     "evaluate_exterior_from_traces",
     "load_mesh",
     "MeridianMesh",
@@ -172,6 +182,12 @@ def _resolve_frame(loaded: LoadedMesh, config: SolveConfig) -> ObservationFrame:
     if config.frame_override is not None:
         return config.frame_override
 
+    # A ground plane is deliberately NOT passed here. ``infer_frame`` projects
+    # the axis and the origin onto a symmetry plane because a mirror-reduced
+    # mesh is half a body whose acoustic centre lies on the cut. A body
+    # standing next to a rigid wall is complete and off the plane, so its
+    # frame is its own; projecting would drag the observation origin onto the
+    # floor.
     frame = infer_frame(
         loaded.grid,
         loaded.physical_tags,

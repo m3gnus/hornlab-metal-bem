@@ -23,7 +23,16 @@ class SolveResult:
 
     Array dimensions use ``F`` for frequency count, ``P`` for observation
     plane count, and ``N`` for points or angles per plane. Complex values use
-    the solver's :math:`e^{-i\omega t}` phase convention.
+    the solver's :math:`e^{-i\omega t}` phase convention, whose Green's
+    function is therefore the outgoing :math:`e^{+ikr}/4{\pi}r` (verified in
+    ``circsym._evaluate_near_remainder`` and the C/Metal kernels beside it).
+
+    A reference documenting an :math:`e^{-jkr}` kernel -- ABEC3 among them --
+    uses the opposite :math:`e^{+j{\omega}t}` time factor and returns the
+    complex conjugate of these arrays. The two statements are consistent, not
+    contradictory: conjugate before comparing anything phase-bearing, and
+    expect a mass-like reactance to read negative-imaginary here where such a
+    reference reads it positive.
 
     ``surface_pressure_complex`` is the optional P1 pressure trace with shape
     ``(F, n_p1_dofs)``. ``surface_neumann_complex`` is the optional *total*
