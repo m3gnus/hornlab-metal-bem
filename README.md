@@ -235,6 +235,7 @@ Common fields:
 - `observation`, an `ObservationConfig`
 - `mesh_scale`
 - `air_density`
+- `speed_of_sound`, in m/s (default `343.0`)
 - `native_symmetry_plane`, one of `None`, `"yz"`, `"xz"`, `"xy"`, or `"yz+xz"`
 - `ground_plane`, one of `None` (default), `"xy"`, `"yz"`, or `"xz"` — a
   rigid half-space boundary the complete mesh stands next to, with
@@ -358,6 +359,23 @@ Key result fields:
 
 `directivity_db` is not absolute SPL. Use `pressure_complex` for absolute
 complex pressure and derive SPL explicitly when needed.
+
+### Phase and time convention
+
+This solver uses the `e^{-i omega t}` time factor, so its free-space Green's
+function is the **outgoing** `e^{+ikr} / (4*pi*r)` and the Neumann coefficient
+is `q = +i*rho*omega*v_n`. Both halves are stated together on purpose: a time
+factor and a Green's kernel are different objects, and quoting only one of them
+is what makes two consistent solvers look like they disagree.
+
+The corollary, because it costs an hour every time somebody rediscovers it:
+a reference that documents an `e^{-jkr}` Green's kernel — ABEC3 among them —
+is using the opposite `e^{+j omega t}` time factor, and its results are the
+complex conjugate of these. That is not a contradiction between the two
+documents and neither is wrong; **conjugate before comparing anything that
+carries phase.** Reactances flip sign with it: a mass-like radiation load reads
+negative-imaginary here and positive-imaginary there. Magnitudes, SPL and
+patterns are unaffected.
 
 Retained traces use the solver's `e^{-i omega t}` phase convention. Evaluate
 one frequency at arbitrary `(N, 3)` exterior points with

@@ -190,7 +190,9 @@ def _k_values_for_native(
     frequencies: NDArray[np.float64],
     config: SolveConfig,
 ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-    k_real = (2.0 * np.pi * frequencies / SPEED_OF_SOUND).astype(np.float32)
+    k_real = (
+        2.0 * np.pi * frequencies / float(config.speed_of_sound)
+    ).astype(np.float32)
     if config.formulation == BIEFormulation.COMPLEX_K:
         k_imag = (k_real.astype(np.float64) * config.complex_k_shift).astype(
             np.float32,
@@ -440,7 +442,7 @@ def _sphere_power_from_log(
         distance_m=observation.distance_m,
         solid_angle_weights_sr=weights,
         air_density=config.air_density,
-        speed_of_sound=SPEED_OF_SOUND,
+        speed_of_sound=float(config.speed_of_sound),
     )
     return power, float(np.sum(weights))
 
@@ -670,6 +672,7 @@ def _apply_mesh_resolution_policy(
     frequency_hz: float,
     mesh_max_edge_m: float,
     elements_per_wavelength_min: float,
+    speed_of_sound: float = SPEED_OF_SOUND,
 ) -> None:
     diagnostics["mesh_max_edge_m"] = float(mesh_max_edge_m)
     diagnostics["mesh_elements_per_wavelength_min"] = float(
@@ -680,9 +683,9 @@ def _apply_mesh_resolution_policy(
         diagnostics["mesh_max_valid_frequency_hz"] = math.inf
         diagnostics["mesh_resolution_suspect"] = False
         return
-    wavelength_m = SPEED_OF_SOUND / float(frequency_hz)
+    wavelength_m = float(speed_of_sound) / float(frequency_hz)
     elements_per_wavelength = wavelength_m / float(mesh_max_edge_m)
-    max_valid_frequency_hz = SPEED_OF_SOUND / (
+    max_valid_frequency_hz = float(speed_of_sound) / (
         float(elements_per_wavelength_min) * float(mesh_max_edge_m)
     )
     diagnostics["mesh_elements_per_wavelength"] = float(elements_per_wavelength)
@@ -850,6 +853,7 @@ def _append_system_result(
     dense_solve_rcond_warning_threshold: float = 0.0,
     mesh_max_edge_m: float = 0.0,
     mesh_elements_per_wavelength_min: float = 6.0,
+    speed_of_sound: float = SPEED_OF_SOUND,
 ) -> dict:
     impedance, pavg = _system_reductions(
         system,
@@ -880,6 +884,7 @@ def _append_system_result(
         frequency_hz=frequency_hz,
         mesh_max_edge_m=mesh_max_edge_m,
         elements_per_wavelength_min=mesh_elements_per_wavelength_min,
+        speed_of_sound=speed_of_sound,
     )
     native_diagnostics["sphere_targets"] = int(sphere_total)
     native_diagnostics["sphere_evaluation_targets"] = int(n_sphere)
@@ -1126,6 +1131,7 @@ def run_sweep_native_metal(
                     mesh_elements_per_wavelength_min=(
                         config.mesh_elements_per_wavelength_min
                     ),
+                    speed_of_sound=config.speed_of_sound,
                 )
                 if config.progress_callback is not None:
                     config.progress_callback(i, len(freq_values), frequency_hz)
@@ -1190,6 +1196,7 @@ def run_sweep_native_metal(
                     mesh_elements_per_wavelength_min=(
                         config.mesh_elements_per_wavelength_min
                     ),
+                    speed_of_sound=config.speed_of_sound,
                 )
                 if config.progress_callback is not None:
                     config.progress_callback(i, len(freq_values), frequency_hz)
@@ -1559,6 +1566,7 @@ def run_sweep_native_metal_multi_source(
                 mesh_elements_per_wavelength_min=(
                     config.mesh_elements_per_wavelength_min
                 ),
+                speed_of_sound=config.speed_of_sound,
             )
         return frequency_hz
 
