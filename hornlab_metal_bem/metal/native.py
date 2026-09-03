@@ -704,12 +704,23 @@ class MetalNativeStandardSession:
         k_real: float,
         neumann_dp0: NDArray[Any],
         *,
+        k_imag: float = 0.0,
         operation_id: str | None = None,
     ) -> Any:
         """Assemble a standard-Neumann system through the native helper.
 
         This remains an experimental helper route for promotion validation. It
         is not wired into production solve routing.
+
+        ``k_imag`` is the non-negative imaginary wavenumber part, following the
+        same convention as the fused solve batch: ``k = k_real * (1 + i*shift)``
+        means ``k_imag = k_real * shift``. The default of zero assembles the
+        real-k ``standard`` operator this op has always produced, byte for byte.
+
+        Pass a positive value to obtain the ``complex_k`` operator instead. That
+        matters for anything studying conditioning or compressibility: on a
+        closed body the real-k operator carries uncured interior resonances, and
+        measurements taken on it do not describe what a ``complex_k`` solve sees.
         """
         from .session import (
             AssemblyPayload,
@@ -719,6 +730,9 @@ class MetalNativeStandardSession:
         )
 
         self._ensure_open()
+        k_imag_value = float(np.float32(k_imag))
+        if not np.isfinite(k_imag_value) or k_imag_value < 0.0:
+            raise ValueError("k_imag must be finite and non-negative")
         neumann = _require_complex_vector(
             "neumann_dp0",
             neumann_dp0,
@@ -754,6 +768,7 @@ class MetalNativeStandardSession:
             session_id=self.info.session_id,
             frequency_hz=frequency_hz,
             k_real_f32=float(np.float32(k_real)),
+            k_imag_f32=k_imag_value,
             neumann_dp0=neumann_desc,
             outputs=outputs,
         )
@@ -766,6 +781,19 @@ class MetalNativeStandardSession:
         )
         result = read_json_manifest(result_path)
         _warn_if_zero_image_duffy_pairs(result)
+        # Fail loudly rather than silently returning a real-k operator when a
+        # shift was requested: an older helper simply ignores the new field, and
+        # a conditioning study run against the wrong operator looks entirely
+        # plausible while measuring nothing it claims to.
+        if k_imag_value != 0.0:
+            acknowledged = result.get("k_imag_f32")
+            if acknowledged is None or float(acknowledged) != k_imag_value:
+                raise RuntimeError(
+                    "native helper did not acknowledge k_imag_f32="
+                    f"{k_imag_value!r} (reported {acknowledged!r}); it predates "
+                    "complex-k support on assemble_standard_neumann, so the "
+                    "returned matrix is the real-k operator"
+                )
         return DenseAssemblyResult(
             session_id=str(result["session_id"]),
             frequency_hz=float(result["frequency_hz"]),

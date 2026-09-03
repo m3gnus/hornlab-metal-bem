@@ -140,6 +140,77 @@ def _read_complex_f32(
     return values
 
 
+def _warn_iterative_solve_formulation(config: SolveConfig) -> None:
+    """Warn when GMRES is asked to solve the undamped ``standard`` operator.
+
+    A body enclosing a sizeable air volume has a dense interior Dirichlet
+    spectrum -- on a 0.54 m enclosure above ~6 kHz, dense enough that no
+    frequency placement avoids it. The direct LU does not care: those resonances
+    lift the condition number to a few times 1e4, which costs a float32 LU
+    nothing. GMRES cares a great deal. Measured 2026-09-01 at 8 kHz on a closed
+    enclosure, block-Jacobi GMRES needed **344 iterations** under ``standard``
+    and **55** under ``complex_k``, same mesh, same preconditioner.
+
+    This warns rather than refuses, for two reasons. The answer is still correct
+    -- it is a performance trap, not a wrong result. And the property that
+    matters is a trapped interior volume, which no cheap mesh test measures:
+    topological closure does not, because every shell the mesher emits is a
+    closed two-manifold whether it encloses a cabinet or only its own wall
+    thickness. The substantive check is the iteration count itself, which
+    ``_warn_slow_iterative_solves`` reports from the solve that actually ran.
+    """
+    if config.dense_solve_implementation != "gmres":
+        return
+    if config.formulation != BIEFormulation.STANDARD:
+        return
+    logger.warning(
+        "dense_solve_implementation='gmres' with formulation='standard' solves "
+        "the undamped operator. On a body enclosing a sizeable volume this "
+        "costs roughly 6x the iterations (measured 344 vs 55 at 8 kHz on a "
+        "closed enclosure) for the same answer. Prefer formulation='complex_k' "
+        "with the iterative solver."
+    )
+
+
+_GMRES_SLOW_ITERATIONS = 150
+
+
+def _warn_slow_iterative_solves(
+    diagnostics: list[dict], config: SolveConfig
+) -> None:
+    """Report GMRES runs that needed far more iterations than measured norms.
+
+    150 is the gate this solver was accepted against; real operators measured
+    20-35. Crossing it means the operator is behaving unlike anything in the
+    Stage 0 study, and the first thing to suspect is an undamped formulation on
+    an enclosing body.
+    """
+    if config.dense_solve_implementation != "gmres":
+        return
+    worst = 0
+    for entry in diagnostics:
+        value = entry.get("dense_solve_refine_iterations")
+        if isinstance(value, list):
+            worst = max([worst, *(int(v) for v in value if v is not None)])
+        elif isinstance(value, int):
+            worst = max(worst, value)
+    if worst <= _GMRES_SLOW_ITERATIONS:
+        return
+    hint = (
+        " The formulation is 'standard'; 'complex_k' damps interior resonances "
+        "and measured 6x fewer iterations on an enclosure."
+        if config.formulation == BIEFormulation.STANDARD
+        else ""
+    )
+    logger.warning(
+        "Iterative solve needed up to %d iterations, past the %d this path was "
+        "accepted against (real operators measured 20-35).%s",
+        worst,
+        _GMRES_SLOW_ITERATIONS,
+        hint,
+    )
+
+
 def _native_env_overrides(config: SolveConfig) -> dict[str, str]:
     """Helper-process environment overrides for this solve.
 
@@ -150,6 +221,9 @@ def _native_env_overrides(config: SolveConfig) -> dict[str, str]:
     overrides: dict[str, str] = {
         "HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE": config.metal_native_assembly_mode,
         "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE": config.dense_solve_dtype,
+        "HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_IMPL": (
+            config.dense_solve_implementation
+        ),
     }
     overrides.update(_native_field_env_overrides())
     # complex128 zgesv holds a doublecomplex column-major copy alongside the
@@ -938,6 +1012,8 @@ def run_sweep_native_metal(
     if frequencies.size == 0:
         raise ValueError("frequencies must contain at least one value")
 
+    _warn_iterative_solve_formulation(config)
+
     mesh_tags = {int(tag) for tag in np.unique(mesh.physical_tags)}
     missing_tags = sorted(set(config.velocity_sources) - mesh_tags)
     if missing_tags:
@@ -1282,6 +1358,7 @@ def run_sweep_native_metal(
         config,
         n_sphere,
     )
+    _warn_slow_iterative_solves(native_diagnostics_rows, config)
 
     return SolveResult(
         frequencies_hz=np.array(completed_freqs, dtype=np.float64),

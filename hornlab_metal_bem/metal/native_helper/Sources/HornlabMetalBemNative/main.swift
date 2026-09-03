@@ -5299,10 +5299,57 @@ func requestedDenseSolveImplementation() throws -> String {
     let raw = ProcessInfo.processInfo.environment[
         metalDenseSolveImplementationEnv
     ] ?? "cgesv"
-    if raw == "cgesv" || raw == "cgetrf_cgetrs" {
+    if raw == "cgesv" || raw == "cgetrf_cgetrs" || raw == "gmres" {
         return raw
     }
-    try fail("\(metalDenseSolveImplementationEnv) must be 'cgesv' or 'cgetrf_cgetrs'")
+    try fail(
+        "\(metalDenseSolveImplementationEnv) must be 'cgesv', 'cgetrf_cgetrs' or 'gmres'"
+    )
+}
+
+/// GMRES restart length. 200 is well past the 20-35 iterations measured on real
+/// operators, so restarting should not normally engage at all; it exists as a
+/// memory bound for cases that behave worse than anything measured.
+func requestedGmresRestart() throws -> Int {
+    let raw = ProcessInfo.processInfo.environment[
+        "HORNLAB_METAL_BEM_NATIVE_GMRES_RESTART"
+    ] ?? "200"
+    guard let value = Int(raw), value >= 1 else {
+        try fail("HORNLAB_METAL_BEM_NATIVE_GMRES_RESTART must be a positive integer")
+    }
+    return value
+}
+
+func requestedGmresMaxIterations() throws -> Int {
+    let raw = ProcessInfo.processInfo.environment[
+        "HORNLAB_METAL_BEM_NATIVE_GMRES_MAX_ITERATIONS"
+    ] ?? "600"
+    guard let value = Int(raw), value >= 1 else {
+        try fail("HORNLAB_METAL_BEM_NATIVE_GMRES_MAX_ITERATIONS must be a positive integer")
+    }
+    return value
+}
+
+func requestedGmresTolerance() throws -> Double {
+    let raw = ProcessInfo.processInfo.environment[
+        "HORNLAB_METAL_BEM_NATIVE_GMRES_TOLERANCE"
+    ] ?? "1e-6"
+    guard let value = Double(raw), value > 0, value < 1 else {
+        try fail("HORNLAB_METAL_BEM_NATIVE_GMRES_TOLERANCE must be in (0, 1)")
+    }
+    return value
+}
+
+/// Preconditioner leaf size. 512 measured decisively better than 128 across the
+/// whole band (33 vs 43 iterations at kD 202) for a modest factorisation cost.
+func requestedGmresLeafSize() throws -> Int {
+    let raw = ProcessInfo.processInfo.environment[
+        "HORNLAB_METAL_BEM_NATIVE_GMRES_LEAF"
+    ] ?? "512"
+    guard let value = Int(raw), value >= 8 else {
+        try fail("HORNLAB_METAL_BEM_NATIVE_GMRES_LEAF must be an integer >= 8")
+    }
+    return value
 }
 
 func requestedDenseSolveDtype() throws -> String {
@@ -7816,12 +7863,15 @@ func solveCaseDenseMulti(
         rhsIm.append(extra.im)
     }
     guard let chiefPoints else {
+        // The only square boundary solve, so the only one GMRES can serve. Its
+        // preconditioner needs dof positions to cluster on.
         return try solveDenseAccelerateMulti(
             aReRowMajor: arrays.aRe,
             aImRowMajor: arrays.aIm,
             rhsRe: rhsRe,
             rhsIm: rhsIm,
-            n: geom.p1DofCount
+            n: geom.p1DofCount,
+            dofCoordinates: p1DofCoordinates(geom)
         )
     }
     let chiefRows = assembleChiefRows(
@@ -8475,13 +8525,101 @@ func solveDenseAccelerate(
     return multi.single(0)
 }
 
+/// One preconditioner build, then one GMRES solve per right-hand side.
+///
+/// The factorisation is the expensive part and is shared across drives, which is
+/// what preserves the property that extra channels are nearly free -- measured at
+/// 1.005x for three channels on the direct path, and the same argument holds here.
+func solveDenseGmresMulti(
+    aReRowMajor: [Float],
+    aImRowMajor: [Float],
+    rhsRe: [[Float]],
+    rhsIm: [[Float]],
+    n: Int,
+    dofCoordinates: (x: [Float], y: [Float], z: [Float])
+) throws -> MultiDenseSolveRun {
+    if aReRowMajor.count != n * n || aImRowMajor.count != n * n {
+        try fail("dense solve matrix size mismatch")
+    }
+    let sourceCount = rhsRe.count
+    if sourceCount < 1 || rhsIm.count != sourceCount {
+        try fail("dense solve RHS source count mismatch")
+    }
+    for s in 0..<sourceCount where rhsRe[s].count != n || rhsIm[s].count != n {
+        try fail("dense solve RHS size mismatch")
+    }
+    if dofCoordinates.x.count != n {
+        try fail("dense solve dof coordinate count mismatch")
+    }
+    let start = CFAbsoluteTimeGetCurrent()
+    let leaves = clusterLeaves(
+        x: dofCoordinates.x, y: dofCoordinates.y, z: dofCoordinates.z,
+        leafSize: try requestedGmresLeafSize()
+    )
+    let preconditioner = buildBlockJacobi(
+        aReRowMajor: aReRowMajor, aImRowMajor: aImRowMajor, n: n, blocks: leaves
+    )
+    let op = DenseComplexOperator(aRe: aReRowMajor, aIm: aImRowMajor, n: n)
+    let restart = try requestedGmresRestart()
+    let maxIterations = try requestedGmresMaxIterations()
+    let tolerance = try requestedGmresTolerance()
+
+    var pressures: [[Complex32]] = []
+    var iterations: [Int] = []
+    var residuals: [Double] = []
+    var anyDiverged = false
+    for s in 0..<sourceCount {
+        let run = gmresSolve(
+            operatorA: op, preconditioner: preconditioner,
+            bRe: rhsRe[s], bIm: rhsIm[s],
+            restart: restart, maxIterations: maxIterations, tolerance: tolerance
+        )
+        var out = [Complex32](repeating: Complex32.zero, count: n)
+        for i in 0..<n { out[i] = Complex32(re: run.xRe[i], im: run.xIm[i]) }
+        pressures.append(out)
+        iterations.append(run.iterations)
+        residuals.append(run.relativeResidual)
+        if !run.converged { anyDiverged = true }
+    }
+    // A non-converged GMRES returns a plausible-looking wrong answer, so surface
+    // it as a LAPACK-style failure rather than letting it reach the field
+    // evaluation silently.
+    var run = MultiDenseSolveRun(
+        pressures: anyDiverged ? [] : pressures,
+        implementation: "gmres_block_jacobi",
+        seconds: CFAbsoluteTimeGetCurrent() - start,
+        lapackInfo: anyDiverged ? Int32(-999) : 0,
+        rcond: nil
+    )
+    run.refineIterations = iterations
+    run.refineResidualRels = residuals
+    return run
+}
+
 func solveDenseAccelerateMulti(
     aReRowMajor: [Float],
     aImRowMajor: [Float],
     rhsRe: [[Float]],
     rhsIm: [[Float]],
-    n: Int
+    n: Int,
+    // Supplied only by the plain square boundary solve. The CHIEF path solves an
+    // overdetermined least-squares system and the coupled-IB path a Schur
+    // complement; neither is a square system GMRES can be pointed at, so both
+    // leave this nil and keep the direct factorisation.
+    dofCoordinates: (x: [Float], y: [Float], z: [Float])? = nil
 ) throws -> MultiDenseSolveRun {
+    if let coords = dofCoordinates,
+       try requestedDenseSolveDtype() != "float64",
+       try requestedDenseSolveImplementation() == "gmres" {
+        return try solveDenseGmresMulti(
+            aReRowMajor: aReRowMajor,
+            aImRowMajor: aImRowMajor,
+            rhsRe: rhsRe,
+            rhsIm: rhsIm,
+            n: n,
+            dofCoordinates: coords
+        )
+    }
     if try requestedDenseSolveDtype() == "float64" {
         return try solveDenseAccelerateZgesvMulti(
             aReRowMajor: aReRowMajor,
@@ -8834,6 +8972,14 @@ func assembleStandardNeumann(
         try fail("expected assemble_standard_neumann op")
     }
     let k = Float(try requireDouble(payload, "k_real_f32"))
+    // Optional so pre-existing manifests keep assembling the real-k operator
+    // byte-for-byte. Positive kImag is the same complex-k damping the fused
+    // solve batch applies; it is what makes this op usable for studying the
+    // operator production actually solves.
+    let kImag = Float((payload["k_imag_f32"] as? NSNumber)?.doubleValue ?? 0.0)
+    if !(kImag >= 0.0) || !kImag.isFinite {
+        try fail("k_imag_f32 must be finite and non-negative")
+    }
     let neumann = try readComplexVector(
         root: geom.root,
         descriptors: try requireObject(payload, "neumann_dp0"),
@@ -8844,7 +8990,7 @@ func assembleStandardNeumann(
     let aImDesc = try requireObject(outputs, "A_imag_f32")
     let rhsReDesc = try requireObject(outputs, "rhs_real_f32")
     let rhsImDesc = try requireObject(outputs, "rhs_imag_f32")
-    let run = try assembleRegular(geom: geom, neumann: neumann, k: k)
+    let run = try assembleRegular(geom: geom, neumann: neumann, k: k, kImag: kImag)
     try writeF32(try descriptorPath(root: geom.root, descriptor: aReDesc), run.arrays.aRe)
     try writeF32(try descriptorPath(root: geom.root, descriptor: aImDesc), run.arrays.aIm)
     try writeF32(try descriptorPath(root: geom.root, descriptor: rhsReDesc), run.arrays.rhsRe)
@@ -8878,6 +9024,10 @@ func assembleStandardNeumann(
         "duffy_corrections": duffyReport,
         "session_id": try requireString(payload, "session_id"),
         "frequency_hz": (payload["frequency_hz"] as? NSNumber)?.doubleValue ?? 0,
+        // Echoed so Python can assert the helper honoured the shift rather than
+        // silently ignoring it, matching the fused batch's acknowledgement rule.
+        "k_imag_f32": Double(kImag),
+        "complex_k": kImag != 0.0,
         "matrix_layout": "row_major_c",
         "matrix_shape": [geom.p1DofCount, geom.p1DofCount],
         "rhs_shape": [geom.p1DofCount],

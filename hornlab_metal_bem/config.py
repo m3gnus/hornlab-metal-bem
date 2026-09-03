@@ -468,6 +468,19 @@ class SolveConfig:
     # routing lowers the default solve concurrency for the float64 path unless
     # the caller pinned HORNLAB_METAL_BEM_NATIVE_SOLVE_CONCURRENCY.
     dense_solve_dtype: Literal["float32", "float64"] = "float32"
+    # Dense solve method. "cgesv" is the direct LU that has always shipped.
+    # "gmres" is block-Jacobi preconditioned GMRES: measured at 20-35 iterations
+    # across kD 5-202 and flat as the mesh refines, so it trades the LU's O(N^3)
+    # for O(iterations * N^2) and agrees with the LU to within float32 noise.
+    # It is opt-in. `standard` + "gmres" is not refused -- the answer is still
+    # correct, just ~6x the iterations on a closed body -- so sweep.py warns on
+    # that configuration and again when a measured iteration count crosses the
+    # gate the path was accepted against. This field is the only way to select
+    # it from Python: the helper env var is overwritten from this field on
+    # every solve (see _native_env_overrides in sweep.py).
+    dense_solve_implementation: Literal[
+        "cgesv", "cgetrf_cgetrs", "gmres"
+    ] = "cgesv"
     return_surface_pressure: bool = False
     # Retain the complete P1 pressure and total DP0 Neumann traces needed to
     # re-evaluate the exterior field after the solve. This implies surface
@@ -656,6 +669,23 @@ class SolveConfig:
             )
         if self.dense_solve_dtype not in {"float32", "float64"}:
             raise ValueError("dense_solve_dtype must be 'float32' or 'float64'")
+        if self.dense_solve_implementation not in {
+            "cgesv",
+            "cgetrf_cgetrs",
+            "gmres",
+        }:
+            raise ValueError(
+                "dense_solve_implementation must be 'cgesv', 'cgetrf_cgetrs' "
+                "or 'gmres'"
+            )
+        if (
+            self.dense_solve_implementation == "gmres"
+            and self.dense_solve_dtype == "float64"
+        ):
+            raise ValueError(
+                "dense_solve_implementation='gmres' has no float64 path; use "
+                "dense_solve_dtype='float32' or a direct solver"
+            )
         for name in (
             "metal_native_threads_per_group",
             "metal_native_matrix_threads_per_group",
