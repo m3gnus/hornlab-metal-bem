@@ -14,10 +14,14 @@ import hornlab_metal_bem as metal_bem
 import hornlab_metal_bem.circsym as circsym
 from hornlab_metal_bem._constants import SPEED_OF_SOUND
 from hornlab_metal_bem.circsym import (
+    _assemble_boundary_matrices_uncached,
+    _assemble_boundary_matrices_from_geometry,
     MeridianMesh,
+    _BoundaryAssemblyQuadratureGeometry,
     _assemble_boundary_matrices,
     _BoundaryAssemblyGeometryCache,
     _build_driver_neumann_segments,
+    _build_boundary_static_geometry,
     _build_far_remainder_compact_geometry,
     _build_far_remainder_geometry_parts,
     _build_source_segment_scale,
@@ -677,6 +681,156 @@ def test_far_onthefly_compiled_matches_precomputed_reference():
                 rtol=3e-13,
                 atol=3e-14,
             )
+
+
+def test_far_remainder_active_mask_skips_replaced_pairs():
+    meridian = _sphere_meridian(radius=0.1, segments=7)
+    geom = meridian.segment_geometry()
+    skip_rows = np.asarray([0, 2, 5], dtype=np.int64)
+    skip_cols = np.asarray([1, 3, 6], dtype=np.int64)
+    compact = _build_far_remainder_compact_geometry(
+        meridian,
+        geom,
+        None,
+        n_psi=48,
+        skip_rows=skip_rows,
+        skip_cols=skip_cols,
+    )
+    full = _build_far_remainder_compact_geometry(
+        meridian,
+        geom,
+        None,
+        n_psi=48,
+    )
+    expected_s, expected_h = _evaluate_far_remainder_onthefly_reference(
+        full,
+        30.0 + 1.0j,
+        workers=1,
+    )
+    expected_s[skip_rows, skip_cols] = 0.0 + 0.0j
+    expected_h[skip_rows, skip_cols] = 0.0 + 0.0j
+
+    actual_s, actual_h = _evaluate_far_remainder_onthefly_reference(
+        compact,
+        30.0 + 1.0j,
+        workers=1,
+    )
+    np.testing.assert_array_equal(actual_s[skip_rows, skip_cols], 0.0 + 0.0j)
+    np.testing.assert_array_equal(actual_h[skip_rows, skip_cols], 0.0 + 0.0j)
+    np.testing.assert_allclose(actual_s, expected_s, rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(actual_h, expected_h, rtol=0.0, atol=0.0)
+
+    c_kernel = _load_circsym_remainder_c_kernel()
+    if c_kernel is not None:
+        actual_s, actual_h = _evaluate_far_remainder_onthefly_compiled(
+            c_kernel,
+            compact,
+            30.0 + 1.0j,
+            workers=2,
+        )
+        np.testing.assert_allclose(actual_s, expected_s, rtol=3e-13, atol=3e-14)
+        np.testing.assert_allclose(actual_h, expected_h, rtol=3e-13, atol=3e-14)
+
+    numba_module = _load_circsym_remainder_numba_kernel()
+    if numba_module is not None:
+        actual_s, actual_h = _evaluate_far_remainder_with_kernel(
+            _CircsymRemainderKernel("numba", numba_module),
+            compact,
+            30.0 + 1.0j,
+            workers=2,
+        )
+        np.testing.assert_allclose(actual_s, expected_s, rtol=3e-13, atol=3e-14)
+        np.testing.assert_allclose(actual_h, expected_h, rtol=3e-13, atol=3e-14)
+
+
+@pytest.mark.parametrize("backend", ["c", "numba"])
+def test_full_boundary_assembly_derived_near_mask_is_exact_with_baffle(
+    backend,
+    monkeypatch,
+    request,
+    tmp_path,
+):
+    """Skipping masked far pairs must preserve the complete baffled assembly."""
+    monkeypatch.setenv("HORNLAB_CIRCSYM_ASSEMBLY_BACKEND", "cpu")
+    monkeypatch.setenv("HORNLAB_CIRCSYM_CPU_REMAINDER_BACKEND", backend)
+    if backend == "c":
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    circsym._load_circsym_remainder_c_kernel.cache_clear()
+    circsym._load_circsym_remainder_numba_kernel.cache_clear()
+    circsym._load_circsym_remainder_kernel.cache_clear()
+
+    def clear_remainder_caches():
+        circsym._load_circsym_remainder_c_kernel.cache_clear()
+        circsym._load_circsym_remainder_numba_kernel.cache_clear()
+        circsym._load_circsym_remainder_kernel.cache_clear()
+
+    request.addfinalizer(clear_remainder_caches)
+
+    kernel = _load_circsym_remainder_kernel()
+    if kernel is None:
+        pytest.skip(f"CircSym {backend} remainder backend is unavailable")
+
+    meridian = _piston_meridian(radius=0.1, segments=11)
+    baffle_z = 0.0
+    _validate_closed_or_baffled_meridian(meridian, baffle_z)
+    geom = meridian.segment_geometry()
+    static_s, static_h, near_rows, near_cols = _build_boundary_static_geometry(
+        meridian,
+        geom,
+        baffle_z,
+    )
+    assert near_rows.size > 0
+
+    n_psi = 64
+    cache = _BoundaryAssemblyGeometryCache(meridian, baffle_z, geom=geom)
+    _, _, derived_rows, derived_cols = cache._static_geometry()
+    masked = cache._quadrature_geometry(n_psi, derived_rows, derived_cols)
+    assert np.array_equal(derived_rows, near_rows)
+    assert np.array_equal(derived_cols, near_cols)
+    assert masked.far.active_mask is not None
+    assert not np.any(masked.far.active_mask[near_rows, near_cols])
+
+    unmasked = _BoundaryAssemblyQuadratureGeometry(
+        far=_build_far_remainder_compact_geometry(
+            meridian,
+            geom,
+            baffle_z,
+            n_psi=n_psi,
+        ),
+        near=masked.near,
+    )
+    k = 41.0 + 0.07j
+    masked_s, masked_h = _assemble_boundary_matrices_from_geometry(
+        static_s,
+        static_h,
+        near_rows,
+        near_cols,
+        masked,
+        k,
+        n_psi=n_psi,
+        remainder_kernel=kernel,
+    )
+    unmasked_s, unmasked_h = _assemble_boundary_matrices_from_geometry(
+        static_s,
+        static_h,
+        near_rows,
+        near_cols,
+        unmasked,
+        k,
+        n_psi=n_psi,
+        remainder_kernel=kernel,
+    )
+    np.testing.assert_array_equal(masked_s, unmasked_s)
+    np.testing.assert_array_equal(masked_h, unmasked_h)
+
+    reference_s, reference_h = _assemble_boundary_matrices_uncached(
+        meridian,
+        k,
+        baffle_z,
+        n_psi=n_psi,
+    )
+    np.testing.assert_allclose(masked_s, reference_s, rtol=6e-13, atol=6e-14)
+    np.testing.assert_allclose(masked_h, reference_h, rtol=6e-13, atol=6e-14)
 
 
 @pytest.mark.parametrize("baffle_z", [None, -0.137])

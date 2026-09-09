@@ -24,6 +24,7 @@ def evaluate_far_remainder_onthefly(
     normal_z,
     cos_psi,
     psi_weights,
+    active_mask,
     has_baffle,
     baffle_z,
     kr,
@@ -43,6 +44,8 @@ def evaluate_far_remainder_onthefly(
     for flat_index in prange(target_count * source_count):
         target_index = flat_index // source_count
         source_index = flat_index - target_index * source_count
+        if active_mask is not None and active_mask[target_index, source_index] == 0:
+            continue
         rt = target_rho[target_index]
         zt = target_z[target_index]
         nr = normal_rho[source_index]

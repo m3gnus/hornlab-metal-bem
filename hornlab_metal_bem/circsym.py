@@ -106,7 +106,7 @@ _CIRCSYM_METAL_ASSEMBLY_MIN_TERMS = 80_000_000
 _CIRCSYM_ASSEMBLY_BACKEND_ENV = "HORNLAB_CIRCSYM_ASSEMBLY_BACKEND"
 _CIRCSYM_CPU_REMAINDER_BACKEND_ENV = "HORNLAB_CIRCSYM_CPU_REMAINDER_BACKEND"
 _CIRCSYM_CPU_FIELD_BACKEND_ENV = "HORNLAB_CIRCSYM_CPU_FIELD_BACKEND"
-_CIRCSYM_C_KERNEL_BUILD_SCHEMA = "circsym-c-kernel-v2"
+_CIRCSYM_C_KERNEL_BUILD_SCHEMA = "circsym-c-kernel-v3"
 _CIRCSYM_C_KERNEL_COMPILE_ARGS = ("-O3", "-fPIC", "-pthread")
 _CIRCSYM_C_KERNEL_LINK_ARGS = ("-lm",)
 _CIRCSYM_C_KERNEL_ORPHAN_GRACE_SECONDS = 300.0
@@ -1532,6 +1532,7 @@ class _FarRemainderCompactGeometry:
     cos_psi: NDArray[np.float64]
     psi_weights: NDArray[np.float64]
     baffle_z: float | None
+    active_mask: NDArray[np.bool_] | None = None
 
 
 @dataclass
@@ -1778,6 +1779,8 @@ class _BoundaryAssemblyGeometryCache:
                     self.geom,
                     self.baffle_z,
                     n_psi=int(n_psi),
+                    skip_rows=near_rows,
+                    skip_cols=near_cols,
                 ),
                 near=_build_near_remainder_compact_geometry(
                     self._near_pairs,
@@ -1941,6 +1944,7 @@ typedef struct {
     const double *normal_z;
     const double *cos_psi;
     const double *psi_weights;
+    const uint8_t *active_mask;
     int32_t has_baffle;
     double baffle_z;
     double kr;
@@ -2030,6 +2034,7 @@ static void eval_far_onthefly_range(
     const double *normal_z = task->normal_z;
     const double *cos_psi = task->cos_psi;
     const double *psi_weights = task->psi_weights;
+    const uint8_t *active_mask = task->active_mask;
     const int32_t image_count = task->has_baffle ? 2 : 1;
     const double baffle_z = task->baffle_z;
     const double kr = task->kr;
@@ -2042,6 +2047,15 @@ static void eval_far_onthefly_range(
         const double rt = target_rho[i];
         const double zt = target_z[i];
         for (int64_t j = 0; j < ns; ++j) {
+            const int64_t pair_index = i * ns + j;
+            const int64_t out_idx = 2 * pair_index;
+            if (active_mask != NULL && active_mask[pair_index] == 0) {
+                out_s[out_idx] = 0.0;
+                out_s[out_idx + 1] = 0.0;
+                out_h[out_idx] = 0.0;
+                out_h[out_idx + 1] = 0.0;
+                continue;
+            }
             double s_re = 0.0;
             double s_im = 0.0;
             double h_re = 0.0;
@@ -2110,7 +2124,6 @@ static void eval_far_onthefly_range(
                 h_im += part_h_im;
             }
 
-            const int64_t out_idx = 2 * (i * ns + j);
             out_s[out_idx] = s_re;
             out_s[out_idx + 1] = s_im;
             out_h[out_idx] = h_re;
@@ -2372,6 +2385,7 @@ int circsym_eval_far_remainder_onthefly(
     const double *normal_z,
     const double *cos_psi,
     const double *psi_weights,
+    const uint8_t *active_mask,
     int32_t has_baffle,
     double baffle_z,
     double kr,
@@ -2403,6 +2417,7 @@ int circsym_eval_far_remainder_onthefly(
     task.normal_z = normal_z;
     task.cos_psi = cos_psi;
     task.psi_weights = psi_weights;
+    task.active_mask = active_mask;
     task.has_baffle = has_baffle;
     task.baffle_z = baffle_z;
     task.kr = kr;
@@ -2680,6 +2695,7 @@ class _CircsymRemainderCKernel:
                 double_ptr,
                 double_ptr,
                 double_ptr,
+                ctypes.POINTER(ctypes.c_uint8),
                 ctypes.c_int32,
                 ctypes.c_double,
                 ctypes.c_double,
@@ -3673,6 +3689,11 @@ def _evaluate_far_remainder_onthefly_compiled(
     normal_z = np.ascontiguousarray(part.normal_z, dtype=np.float64)
     cos_psi = np.ascontiguousarray(part.cos_psi, dtype=np.float64)
     psi_weights = np.ascontiguousarray(part.psi_weights, dtype=np.float64)
+    active_mask = (
+        None
+        if part.active_mask is None
+        else np.ascontiguousarray(part.active_mask, dtype=np.uint8)
+    )
     target_count = int(target_rho.size)
     source_count, line_count = source_rho.shape
     psi_count = int(cos_psi.size)
@@ -3692,6 +3713,11 @@ def _evaluate_far_remainder_onthefly_compiled(
         target_z_block = target_z[start:stop]
         s_block = s_out[start:stop]
         h_block = h_out[start:stop]
+        active_mask_block = (
+            None
+            if active_mask is None
+            else np.ascontiguousarray(active_mask[start:stop])
+        )
         status = kernel.eval_far_onthefly(
             ctypes.c_int64(stop - start),
             ctypes.c_int64(source_count),
@@ -3706,6 +3732,9 @@ def _evaluate_far_remainder_onthefly_compiled(
             normal_z.ctypes.data_as(double_ptr),
             cos_psi.ctypes.data_as(double_ptr),
             psi_weights.ctypes.data_as(double_ptr),
+            None
+            if active_mask_block is None
+            else active_mask_block.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             ctypes.c_int32(part.baffle_z is not None),
             ctypes.c_double(0.0 if part.baffle_z is None else float(part.baffle_z)),
             ctypes.c_double(float(k_value.real)),
@@ -3757,6 +3786,11 @@ def _evaluate_far_remainder_with_kernel(
     for start in range(0, target_count, block_size):
         _check_circsym_continue(should_continue)
         stop = min(target_count, start + block_size)
+        active_mask_block = (
+            None
+            if part.active_mask is None
+            else np.ascontiguousarray(part.active_mask[start:stop], dtype=np.uint8)
+        )
         s_block, h_block = kernel.implementation.evaluate_far_remainder_onthefly(
             np.ascontiguousarray(part.target_rho[start:stop], dtype=np.float64),
             np.ascontiguousarray(part.target_z[start:stop], dtype=np.float64),
@@ -3767,6 +3801,7 @@ def _evaluate_far_remainder_with_kernel(
             np.ascontiguousarray(part.normal_z, dtype=np.float64),
             np.ascontiguousarray(part.cos_psi, dtype=np.float64),
             np.ascontiguousarray(part.psi_weights, dtype=np.float64),
+            active_mask_block,
             part.baffle_z is not None,
             0.0 if part.baffle_z is None else float(part.baffle_z),
             float(k_value.real),
@@ -4103,6 +4138,10 @@ def _evaluate_far_remainder_onthefly_reference(
             raise
         else:
             executor.shutdown(wait=True)
+    if part.active_mask is not None:
+        inactive = ~np.asarray(part.active_mask, dtype=np.bool_)
+        s_out[inactive] = 0.0 + 0.0j
+        h_out[inactive] = 0.0 + 0.0j
     return s_out, h_out
 
 
@@ -4379,6 +4418,8 @@ def _build_far_remainder_compact_geometry(
     baffle_z: float | None,
     *,
     n_psi: int,
+    skip_rows: NDArray[np.int64] | None = None,
+    skip_cols: NDArray[np.int64] | None = None,
 ) -> _FarRemainderCompactGeometry:
     u, w = _ordinary_interval(0.0, 1.0)
     psi, psi_weights = _leggauss_psi(int(n_psi))
@@ -4391,6 +4432,24 @@ def _build_far_remainder_compact_geometry(
     measure = rho_s * lengths[:, None] * w[None, :]
     normal_rho = meridian.normals[:, 0]
     normal_z = meridian.normals[:, 1]
+    active_mask: NDArray[np.bool_] | None = None
+    if skip_rows is not None or skip_cols is not None:
+        if skip_rows is None or skip_cols is None:
+            raise ValueError("skip_rows and skip_cols must be provided together")
+        skip_rows_arr = np.asarray(skip_rows, dtype=np.int64).reshape(-1)
+        skip_cols_arr = np.asarray(skip_cols, dtype=np.int64).reshape(-1)
+        if skip_rows_arr.shape != skip_cols_arr.shape:
+            raise ValueError("skip_rows and skip_cols must have the same shape")
+        if np.any(skip_rows_arr < 0) or np.any(skip_rows_arr >= geom.rho_mid.size):
+            raise ValueError("skip_rows contains an out-of-range target index")
+        if np.any(skip_cols_arr < 0) or np.any(skip_cols_arr >= rho_s.shape[0]):
+            raise ValueError("skip_cols contains an out-of-range source index")
+        active_mask = np.ones(
+            (geom.rho_mid.size, rho_s.shape[0]),
+            dtype=np.bool_,
+        )
+        active_mask[skip_rows_arr, skip_cols_arr] = False
+        active_mask = np.ascontiguousarray(active_mask)
     return _FarRemainderCompactGeometry(
         target_rho=np.ascontiguousarray(geom.rho_mid, dtype=np.float64),
         target_z=np.ascontiguousarray(geom.z_mid, dtype=np.float64),
@@ -4402,6 +4461,7 @@ def _build_far_remainder_compact_geometry(
         cos_psi=np.ascontiguousarray(np.cos(psi), dtype=np.float64),
         psi_weights=np.ascontiguousarray(psi_weights, dtype=np.float64),
         baffle_z=None if baffle_z is None else float(baffle_z),
+        active_mask=active_mask,
     )
 
 
