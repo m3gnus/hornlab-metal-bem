@@ -393,3 +393,51 @@ def test_circsym_full_solve_adaptive_metal_field_matches_cpu(monkeypatch):
     assert metal.native_diagnostics[0]["field_backend_policy"] == "auto"
     assert metal.native_diagnostics[0]["assembly_backend"] == "metal"
     assert metal.native_diagnostics[0]["assembly_backend_policy"] == "auto"
+
+
+def test_circsym_forced_metal_frequency_batch_matches_cpu_sweep(monkeypatch):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+    theta = np.linspace(0.0, np.pi, 25)
+    meridian = MeridianMesh.from_polyline(
+        np.column_stack([0.1 * np.sin(theta), 0.1 * np.cos(theta)]),
+        tags=2,
+    )
+    config = SolveConfig(
+        velocity_sources={2: 1.0},
+        formulation="complex_k",
+        complex_k_shift=0.005,
+        observation=ObservationConfig(
+            distance_m=2.0,
+            angle_count=9,
+            planes=["horizontal"],
+            origin="throat",
+        ),
+    )
+    frequencies = np.array([300.0, 1_200.0, 4_000.0])
+
+    monkeypatch.setenv("HORNLAB_CIRCSYM_ASSEMBLY_BACKEND", "cpu")
+    monkeypatch.setenv("HORNLAB_CIRCSYM_FIELD_BACKEND", "cpu")
+    cpu = metal_bem.solve_circsym_frequencies(meridian, frequencies, config)
+    monkeypatch.setenv("HORNLAB_CIRCSYM_ASSEMBLY_BACKEND", "metal")
+    monkeypatch.setenv("HORNLAB_CIRCSYM_FIELD_BACKEND", "metal")
+    circsym._circsym_metal_runtime_status.cache_clear()
+    metal = metal_bem.solve_circsym_frequencies(meridian, frequencies, config)
+
+    pressure_relative = np.linalg.norm(
+        metal.pressure_complex - cpu.pressure_complex
+    ) / np.linalg.norm(cpu.pressure_complex)
+    impedance_relative = np.linalg.norm(
+        metal.impedance - cpu.impedance
+    ) / np.linalg.norm(cpu.impedance)
+    assert pressure_relative < 5.0e-5
+    assert impedance_relative < 5.0e-5
+    assert all(
+        item["assembly_backend"] == "metal"
+        and item["field_backend"] == "metal"
+        for item in metal.native_diagnostics
+    )

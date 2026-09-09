@@ -106,6 +106,39 @@ class CircSymMetalCancelled(RuntimeError):
     """Raised when a native CircSym operation is stopped by its callback."""
 
 
+def _communicate_circsym_process(
+    process: subprocess.Popen[str],
+    *,
+    should_continue: Callable[[], bool | None],
+    deadline: float | None,
+    timeout_message: str,
+) -> tuple[str, str]:
+    """Drain helper pipes while retaining cooperative cancellation polling."""
+    try:
+        while True:
+            if should_continue() is False:
+                process.terminate()
+                try:
+                    process.communicate(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+                raise CircSymMetalCancelled("CircSym Metal operation cancelled")
+            if deadline is not None and time.monotonic() > deadline:
+                process.kill()
+                process.communicate()
+                raise RuntimeError(timeout_message)
+            try:
+                return process.communicate(timeout=0.01)
+            except subprocess.TimeoutExpired:
+                continue
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+        raise
+
+
 def discover_native_runtime(
     config: MetalNativeRuntimeConfig | None = None,
     *,
@@ -429,29 +462,14 @@ def _evaluate_circsym_ring_kernels(
                     f"Failed to launch Swift/Metal native helper: {exc}"
                 ) from exc
             deadline = time.monotonic() + timeout_s if timeout_s is not None else None
-            try:
-                while process.poll() is None:
-                    if should_continue() is False:
-                        process.terminate()
-                        try:
-                            process.wait(timeout=1.0)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait()
-                        raise CircSymMetalCancelled("CircSym Metal operation cancelled")
-                    if deadline is not None and time.monotonic() > deadline:
-                        process.kill()
-                        process.wait()
-                        raise RuntimeError(
-                            "Swift/Metal native helper timed out during CircSym integration"
-                        )
-                    time.sleep(0.005)
-            except BaseException:
-                if process.poll() is None:
-                    process.kill()
-                    process.wait()
-                raise
-            stdout, stderr = process.communicate()
+            stdout, stderr = _communicate_circsym_process(
+                process,
+                should_continue=should_continue,
+                deadline=deadline,
+                timeout_message=(
+                    "Swift/Metal native helper timed out during CircSym integration"
+                ),
+            )
             returncode = int(process.returncode or 0)
             # Catch a cancellation request that arrived between the final poll
             # and process exit before accepting and publishing its result.
@@ -723,29 +741,12 @@ def _evaluate_circsym_ring_kernels_batch(
                     f"Failed to launch Swift/Metal native helper: {exc}"
                 ) from exc
             deadline = time.monotonic() + timeout_s if timeout_s is not None else None
-            try:
-                while process.poll() is None:
-                    if should_continue() is False:
-                        process.terminate()
-                        try:
-                            process.wait(timeout=1.0)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait()
-                        raise CircSymMetalCancelled("CircSym Metal operation cancelled")
-                    if deadline is not None and time.monotonic() > deadline:
-                        process.kill()
-                        process.wait()
-                        raise RuntimeError(
-                            "Swift/Metal native helper timed out during CircSym batch"
-                        )
-                    time.sleep(0.005)
-            except BaseException:
-                if process.poll() is None:
-                    process.kill()
-                    process.wait()
-                raise
-            stdout, stderr = process.communicate()
+            stdout, stderr = _communicate_circsym_process(
+                process,
+                should_continue=should_continue,
+                deadline=deadline,
+                timeout_message="Swift/Metal native helper timed out during CircSym batch",
+            )
             returncode = int(process.returncode or 0)
             if should_continue() is False:
                 raise CircSymMetalCancelled("CircSym Metal operation cancelled")

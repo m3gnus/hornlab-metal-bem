@@ -1,103 +1,109 @@
-# Axisymmetric feasibility prototype
+# Axisymmetric qualification prototype
 
-Date: 2026-09-09. Base: `e7e32d0`. Status: **qualification failed; do not
-restore Axisymmetric to the UI or AUTO routing.**
+Date: 2026-09-09. Base: `e7e32d0`. Status: **speed qualified; overall
+qualification failed. Keep Axisymmetric out of the UI and AUTO routing until the
+physics gate passes.**
 
 ## Scope and decision rule
 
-This is the bounded two-round experiment from the 0.3.3 plan. It uses the saved
-plain circular R-OSSE inputs: 53 meridian segments, a 1,222-triangle `yz+xz`
-quarter surface, 40 logarithmic frequencies from 100 Hz to 20 kHz, and 37-angle
-horizontal and vertical cuts at 2 m. Mesh generation is excluded from both timed
-arms.
+The saved circular R-OSSE comparison uses 53 meridian segments, a 1,222-triangle
+`yz+xz` quarter surface, 40 logarithmic frequencies from 100 Hz to 20 kHz, and
+37-angle horizontal and vertical cuts at 2 m. Mesh generation is excluded from
+both timed arms. One cold run per arm is excluded, and subsequent paired runs
+alternate order.
 
-The hard product question is whether Axisymmetric is materially faster than the
-realistic quarter-domain full-3D solve. The prior plan makes "materially" concrete
-as at least 2x faster (ratio below 0.5) and at most 0.5 seconds for this sweep. A
-result within timing noise of quarter is a failure.
+Qualification requires all of the following:
 
-## Prototype rounds
+- Axisymmetric/quarter-3D warm-median ratio below 0.5.
+- Axisymmetric warm median at or below 0.5 seconds.
+- Metal Axisymmetric output matching the compact CPU implementation.
+- Axisymmetric versus quarter-3D errors below 2% complex-pressure relative L2,
+  0.5 dB directivity above -40 dB, and 5 degrees RMS phase above the amplitude
+  floor.
 
-1. A Numba field kernel preserves the complete S/H ring quadrature but performs
-   the target/source/line/azimuth reduction in compiled loops. It avoids the
-   large temporary complex arrays created once per line node by the NumPy path.
-   The production default remains NumPy; the prototype is explicitly selected
-   with `HORNLAB_CIRCSYM_CPU_FIELD_BACKEND=numba` or `--cpu-field numba`.
-2. An experimental azimuth-order floor tests 32 points instead of the existing
-   conservative 64-point floor. Frequency-dependent orders above the floor are
-   unchanged. This is an experiment, not an adaptive production rule.
+The harness requires every gate for overall approval. Passing speed alone never
+enables the product path.
 
-The matched benchmark alternates solver order after one excluded warm-up per
-arm. Full-3D uses the resident corrected Metal `yz+xz` path. Axisymmetric uses
-the existing compiled CPU assembly plus the candidate CPU field kernel. The
-existing one-shot CircSym Metal path was separately measured and was slower,
-because it repeatedly launches and provisions the helper.
+## Implemented positive results
 
-## Results
+- The portable CPU field default is now the compiled Numba implementation.
+  NumPy remains selectable for diagnosis. On the CPU-only comparison, skipping
+  analytically replaced near pairs reduced assembly by about 8--9% while
+  preserving exact output; the measured one-thread sweep improved from 3.369 s
+  to 3.158 s and the eight-thread sweep from 0.524 s to 0.499 s.
+- Near-pair geometry is stored compactly and expanded only for the active block,
+  avoiding the previous large dense geometry allocation.
+- Metal assembly and field evaluation batch the complete frequency sweep in one
+  helper invocation. Geometry, quadrature data, pipelines, and output buffers
+  are reused across frequencies within that invocation. There is no persistence
+  between helper invocations.
+- The candidate 32-point azimuth floor agrees with the unchanged 64-point
+  Axisymmetric reference on this fixture. Orders above the floor remain
+  frequency-dependent.
+- The benchmark records release/debug helper flavor, runs a helper smoke test,
+  reports per-frequency errors, normalizes source velocity for equal physical
+  volume velocity, and includes compact-CPU parity in overall qualification.
+- Native cancellation now drains helper output while polling, the batched Metal
+  path rejects work counts outside its 32-bit kernel range, and regressions cover
+  forced batch sweeps, baffled and unbaffled kernels, complex wavenumbers, and
+  variable quadrature orders.
 
-Warm wall-clock medians on the same Apple M-series host:
+## Speed result
 
-| Axisymmetric implementation | Pairs | Axisymmetric | Quarter 3-D | Ratio | Result |
-|---|---:|---:|---:|---:|---|
-| NumPy field, 64-point floor | 5 | 2.008 s | 0.957 s | 2.099 | Slower than quarter |
-| Numba field, 64-point floor | 3 | 0.956 s | 0.973 s | 0.983 | Timing-noise tie |
-| Numba field, 32-point floor | 9 | 0.919 s | 0.952 s | 0.965 | Timing-noise tie |
+The consolidated release-helper run measured:
 
-The compiled field kernel is a real local improvement: on the matched 64-point
-case it reduces the field stage from about 1.34 s to about 0.28 s and total wall
-time by roughly 2.1x. It does not create the required product advantage. The
-best nine-pair candidate is only 3.5% faster than quarter, misses the 2x gate by
-about 1.93x, and misses the 0.5-second target by about 0.42 s.
+| Axisymmetric | Quarter 3-D | Ratio | 2x gate | 0.5 s gate |
+|---:|---:|---:|---:|---:|
+| 0.202 s | 0.925 s | 0.218 | PASS | PASS |
 
-The best candidate's excluded cold run was 1.254 s; the corresponding quarter
-warm-up was 1.007 s. Its remaining warm Axisymmetric cost was approximately
-0.64 s assembly, 0.24 s field, and 0.007 s dense solve. Dense-solver work is not
-a useful optimization target.
+Axisymmetric is about 4.58x faster than quarter-domain full 3-D for this matched
+Apple Metal workload. A separate seven-pair run measured 0.329 s versus 0.971 s
+(0.339x), so the exact wall time is sensitive to host load; both measurements
+pass the product speed gates.
 
-## Numerical evidence and limitation
+This acceleration is specific to the Axisymmetric formulation. A full-3D SIMD
+prototype was also tested and rejected: it was 2.05x slower on the representative
+2,272-triangle case, so no full-3D code from that experiment was retained.
 
-- Numba versus NumPy ordinary field matrices agrees within `3e-13` relative in
-  direct unit comparisons, for free-space and image-plane cases.
-- The 32-point candidate versus the unchanged 64-point full Axisymmetric sweep
-  differs by `7.66e-8` pressure relative L2, `4.93e-5 dB` maximum directivity,
-  and `1.92e-5` degrees RMS phase above the amplitude floor on this fixture.
-- Axisymmetric versus the current small quarter mesh over the complete 20 kHz
-  band differs by 3.88% complex-pressure relative L2 and 2.29% magnitude L2;
-  the directivity error is 14.73 dB even where both patterns exceed -40 dB,
-  and RMS phase error above the amplitude floor is 29.31 degrees. These fail
-  the prototype's explicit 2%, 0.5 dB, and 5-degree numerical gates. The prior
-  convergence work already warns that this quarter mesh is not an absolute
-  high-frequency truth reference. Therefore this run does not establish
-  equal-error physics across the full band. That uncertainty cannot rescue a
-  failed speed gate.
+The CPU improvements are useful independently of Metal and preserve the earlier
+advantage observed on slower GPU-less systems, but CPU hardware still needs its
+own qualification measurements before automatic routing is changed.
 
-Existing analytic and CircSym parity tolerances remain unchanged. The complete
-repository suite passes: 581 passed and 89 skipped.
+## Physics blocker
 
-## Independent alternatives from the Astra review
+Before the independent review's source-area correction, Axisymmetric versus the
+quarter mesh differed by **3.88%** complex-pressure relative L2, **14.73 dB**
+directivity above -40 dB, and **29.31 degrees** RMS phase. The Claude Fable
+reviewer was explicitly given those figures and told that speed is no longer the
+remaining blocker.
 
-The independent architecture review found that the largest missing transport
-improvement is a resident or frequency-batched CircSym helper. Other ranked
-options are an error-controlled per-pair azimuth rule, SIMD-group reduction
-inside each GPU ring pair, reuse of near-pair geometry, and eventually a
-higher-order meridian discretization. The compiled CPU field option ranked
-first and produced the measured improvement above.
+The reviewer found that the polygonal quarter source has 2.69% less area than the
+meridian source. Scaling quarter-source velocity by 1.027608 to compare equal
+volume velocity improved the 100 Hz pressure error from 2.62% to 1.03%. Across
+the full 100 Hz--20 kHz sweep, however, the normalized pressure error is 5.21%;
+directivity remains 14.73 dB and phase remains 29.31 degrees. This confirms that
+source normalization is necessary but does not explain the high-frequency
+discrepancy.
 
-A resident helper is not a credible automatic rescue by itself: the best
-candidate already spends only about 0.24 s in field work, while CPU assembly is
-the dominant 0.64 s stage. Meeting 0.5 s would require a further measured
-assembly reduction as well as retaining all numerical gates. The plan permits
-only two focused feasibility rounds, so those ideas remain research proposals
-rather than grounds to re-enable the product path.
+The coarse meshes are not converged enough to decide which solver is the better
+high-frequency reference. The next physics work is an equal-volume-velocity
+meridian/quarter refinement ladder with per-frequency error reporting,
+self-convergence for both formulations, and an analytic low-frequency anchor.
+Until that work passes the numerical gate, overall qualification remains FAIL.
 
-The full plan also called for a BEAT Metal comparison, independent meridian and
-quarter-mesh convergence, raw load capture, and packaged-runtime identity. This
-prototype stops before claiming that full qualification because the candidate
-already failed the hard Metal-quarter speed gate. Running a slower comparison
-or additional physics work cannot turn a timing-noise tie into the required 2x
-advantage. The benchmark nevertheless records numerical thresholds and will
-only report overall PASS when both speed targets and the pressure/directivity/
-phase gates pass.
+## Independent review
+
+Claude Fable found no core numerical bug in the new compact CPU or batched Metal
+paths. Its actionable findings were implemented: portable Windows backend
+selection, Numba product default, equal-volume source normalization,
+per-frequency metrics, release-helper provenance, sweep-level Metal regression,
+pipe-safe cancellation, and the Metal work-count guard.
+
+The review also identified larger future optimizations that were not positive
+prototype results yet: cross-invocation persistent Metal sessions, streaming
+large remainder batches instead of materializing every remainder, and reusing
+the active mask across azimuth samples. They remain research items and are not
+used to claim qualification.
 
 ## Reproduction
 
@@ -106,9 +112,9 @@ PYTHONPATH=.:../hornlab-waveguide-mesher \
 python scripts/bench_axisymmetric_vs_quarter.py \
   --config path/to/rosse-config.json \
   --quarter-mesh path/to/rosse-quarter.msh \
-  --repeats 9 --cpu-field numba --azimuth-min 32 --json
+  --axisym-backend metal --repeats 5 --azimuth-min 32 --json
 ```
 
-Decision: keep explicit experimental backend access and saved-result reading,
-but leave Axisymmetric hidden and excluded from AUTO. Retirement or preservation
-of the research implementation is a separate follow-on decision.
+Decision: retain the qualified fast implementations and the refusal harness,
+but do not restore Axisymmetric to the UI or AUTO routing until the physics gate
+passes on converged matched inputs.

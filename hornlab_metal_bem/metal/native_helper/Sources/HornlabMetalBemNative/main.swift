@@ -11203,6 +11203,9 @@ func evaluateCircSymRingKernelsBatch(
     let pipeline = try device.makeComputePipelineState(function: function)
     let pipelineSeconds = CFAbsoluteTimeGetCurrent() - pipelineStart
     let pairCount = nTargets * nSources
+    if pairCount > 0 && nFrequencies > Int(Int32.max) / pairCount {
+        try fail("CircSym batch work count exceeds the Metal kernel's Int32 range")
+    }
     let workCount = nFrequencies * pairCount
     let slpRe = try makeOutputBuffer(device, count: workCount, label: "circsym_batch_slp_re")
     let slpIm = try makeOutputBuffer(device, count: workCount, label: "circsym_batch_slp_im")

@@ -3647,7 +3647,9 @@ def _circsym_cpu_remainder_status() -> dict[str, Any]:
 
 
 def _requested_circsym_cpu_field_backend() -> str:
-    backend = os.environ.get(_CIRCSYM_CPU_FIELD_BACKEND_ENV, "numpy").strip().lower()
+    # Numba is a required runtime dependency and its compiled target/source loop
+    # is materially faster on CPU-only systems while matching the NumPy reference.
+    backend = os.environ.get(_CIRCSYM_CPU_FIELD_BACKEND_ENV, "numba").strip().lower()
     if backend not in {"numpy", "numba"}:
         raise ValueError(
             f"{_CIRCSYM_CPU_FIELD_BACKEND_ENV} must be 'numpy' or 'numba'"

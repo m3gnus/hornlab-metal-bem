@@ -75,6 +75,12 @@ def _freq_for_ka(ka: float, radius: float = 0.1) -> float:
     return float(ka) * SPEED_OF_SOUND / (2.0 * np.pi * radius)
 
 
+def test_circsym_cpu_field_defaults_to_numba(monkeypatch):
+    monkeypatch.delenv("HORNLAB_CIRCSYM_CPU_FIELD_BACKEND", raising=False)
+
+    assert circsym._requested_circsym_cpu_field_backend() == "numba"
+
+
 def _pulsating_sphere_impedance(ka: np.ndarray) -> np.ndarray:
     # The textbook form ika/(1+ika) is written in the e^(+iwt) convention
     # (Green's kernel e^(-ikR)). This package solves the conjugate one --
@@ -766,9 +772,13 @@ def test_full_boundary_assembly_derived_near_mask_is_exact_with_baffle(
 
     request.addfinalizer(clear_remainder_caches)
 
-    kernel = _load_circsym_remainder_kernel()
-    if kernel is None:
+    if backend == "c":
+        implementation = _load_circsym_remainder_c_kernel()
+    else:
+        implementation = _load_circsym_remainder_numba_kernel()
+    if implementation is None:
         pytest.skip(f"CircSym {backend} remainder backend is unavailable")
+    kernel = _CircsymRemainderKernel(backend, implementation)
 
     meridian = _piston_meridian(radius=0.1, segments=11)
     baffle_z = 0.0

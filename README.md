@@ -73,11 +73,13 @@ python scripts/bench_axisymmetric_vs_quarter.py \
 ```
 
 The comparison excludes mesh generation from both arms, runs one excluded
-warm-up per solver, alternates paired warm runs, and reports both the simple
-"faster than quarter" result and the stronger 2x qualification target. The
-`--cpu-field numba` and `--azimuth-min` controls are experimental prototype
-knobs; changing azimuth order must be judged against the harness's unchanged
-64-point CircSym reference, not from timing alone.
+warm-up per solver, alternates paired warm runs, and requires speed, compact-CPU
+parity, and cross-solver physics gates for overall qualification. It also
+normalizes source velocity for equal physical volume velocity and reports
+frequency-local errors. The Numba CPU field implementation is the portable
+default; `--cpu-field numpy` remains available for diagnosis. Changing azimuth
+order must be judged against the harness's unchanged 64-point CircSym reference,
+not from timing alone.
 
 The default fixture is a closed free-standing conical horn swept from 400 Hz to
 16 kHz. `--target-edge-mm`, `--frequencies`, `--angles`, and `--repeat` expose

@@ -123,6 +123,8 @@ def _build_inputs(config_path: Path, quarter_mesh_path: Path, angle_count: int):
         native_symmetry_plane="yz+xz",
     )
     _validate_matched_inputs(raw_config, meridian, quarter)
+    meridian_source_area, quarter_source_area = _source_areas(meridian, quarter)
+    quarter_velocity_scale = meridian_source_area / quarter_source_area
     frame = mb.ObservationFrame(
         axis=np.array([0.0, 0.0, 1.0]),
         origin=np.zeros(3),
@@ -147,13 +149,41 @@ def _build_inputs(config_path: Path, quarter_mesh_path: Path, angle_count: int):
     }
     axisym_config = mb.SolveConfig(**common)
     quarter_config = mb.SolveConfig(
-        **common,
+        **{
+            **common,
+            # Match physical volume velocity despite polygonization of the
+            # quarter-domain source disc.
+            "velocity_sources": {TAG_SOURCE: quarter_velocity_scale},
+        },
         mesh_scale=1.0,
         native_symmetry_plane="yz+xz",
         metal_native_assembly_mode="corrected",
         dense_solve_implementation="cgetrf_cgetrs",
     )
     return meridian, quarter, axisym_config, quarter_config
+
+
+def _source_areas(meridian: Any, quarter: Any) -> tuple[float, float]:
+    """Return full-domain source areas for the meridian and quarter meshes."""
+    vertices = np.asarray(quarter.grid.vertices, dtype=np.float64).T
+    triangles = np.asarray(quarter.grid.elements, dtype=np.int64).T
+    corners = vertices[triangles]
+    triangle_areas = 0.5 * np.linalg.norm(
+        np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]),
+        axis=1,
+    )
+    quarter_source_area = 4.0 * float(
+        np.sum(triangle_areas[np.asarray(quarter.physical_tags) == TAG_SOURCE])
+    )
+    meridian_geom = meridian.segment_geometry()
+    meridian_source_area = float(
+        np.sum(
+            meridian_geom.area_weights[
+                np.asarray(meridian.physical_tags) == TAG_SOURCE
+            ]
+        )
+    )
+    return meridian_source_area, quarter_source_area
 
 
 def _validate_matched_inputs(
@@ -193,25 +223,61 @@ def _validate_matched_inputs(
     ):
         raise ValueError("quarter mesh axial extent does not match the meridian")
 
-    triangles = np.asarray(quarter.grid.elements, dtype=np.int64).T
-    corners = vertices[triangles]
-    triangle_areas = 0.5 * np.linalg.norm(
-        np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]),
-        axis=1,
-    )
-    quarter_source_area = 4.0 * float(
-        np.sum(triangle_areas[np.asarray(quarter.physical_tags) == TAG_SOURCE])
-    )
-    meridian_geom = meridian.segment_geometry()
-    meridian_source_area = float(
-        np.sum(
-            meridian_geom.area_weights[np.asarray(meridian.physical_tags) == TAG_SOURCE]
-        )
-    )
+    meridian_source_area, quarter_source_area = _source_areas(meridian, quarter)
     if not np.isclose(
         quarter_source_area, meridian_source_area, rtol=0.05, atol=1.0e-10
     ):
         raise ValueError("quarter mesh source area does not match the meridian")
+
+
+def _accuracy_by_frequency(
+    axisym: Any, quarter: Any, frequencies_hz: Any
+) -> list[dict[str, float]]:
+    """Expose frequency-local errors so a few high-frequency rows cannot hide."""
+    axisym_pressure = np.asarray(axisym.pressure_complex, dtype=np.complex128)
+    quarter_pressure = np.asarray(quarter.pressure_complex, dtype=np.complex128)
+    axisym_db = np.asarray(axisym.directivity_db, dtype=np.float64)
+    quarter_db = np.asarray(quarter.directivity_db, dtype=np.float64)
+    if axisym_pressure.shape != quarter_pressure.shape:
+        raise RuntimeError("matched comparison returned different pressure shapes")
+    frequencies = np.asarray(frequencies_hz, dtype=np.float64)
+    if frequencies.shape != (axisym_pressure.shape[0],):
+        raise RuntimeError("frequency grid does not match pressure rows")
+    rows: list[dict[str, float]] = []
+    for index in range(axisym_pressure.shape[0]):
+        ap = np.ravel(axisym_pressure[index])
+        qp = np.ravel(quarter_pressure[index])
+        adb = np.ravel(axisym_db[index])
+        qdb = np.ravel(quarter_db[index])
+        pressure_scale = max(float(np.linalg.norm(qp)), 1.0e-30)
+        db_mask = (adb >= -40.0) & (qdb >= -40.0)
+        amplitude_floor = 1.0e-4 * float(np.max(np.abs(qp)))
+        phase_mask = np.abs(qp) >= amplitude_floor
+        rows.append(
+            {
+                "frequency_hz": float(frequencies[index]),
+                "pressure_relative_l2": float(
+                    np.linalg.norm(ap - qp) / pressure_scale
+                ),
+                "directivity_max_abs_db_above_minus_40": float(
+                    np.max(np.abs(adb[db_mask] - qdb[db_mask]))
+                    if np.any(db_mask)
+                    else 0.0
+                ),
+                "phase_rms_degrees_above_floor": float(
+                    np.sqrt(
+                        np.mean(
+                            np.square(
+                                np.rad2deg(np.angle(ap[phase_mask] / qp[phase_mask]))
+                            )
+                        )
+                    )
+                    if np.any(phase_mask)
+                    else 0.0
+                ),
+            }
+        )
+    return rows
 
 
 def _timed(call: Callable[[], Any]) -> tuple[Any, dict[str, Any]]:
@@ -303,6 +369,8 @@ def main(argv: list[str] | None = None) -> int:
         args.quarter_mesh,
         args.angles,
     )
+    meridian_source_area, quarter_source_area = _source_areas(meridian, quarter)
+    quarter_velocity_scale = meridian_source_area / quarter_source_area
     frequencies = np.geomspace(args.f1, args.f2, args.frequencies)
 
     def axisym_call():
@@ -368,7 +436,14 @@ def main(argv: list[str] | None = None) -> int:
         package_version = "source-tree"
     from hornlab_metal_bem.metal.native import discover_native_runtime
 
-    native_runtime = discover_native_runtime(run_smoke_test=False)
+    native_runtime = discover_native_runtime(run_smoke_test=True)
+    helper_build_flavor = None
+    if native_runtime.helper_executable_path is not None:
+        helper_parts = native_runtime.helper_executable_path.parts
+        if "release" in helper_parts:
+            helper_build_flavor = "release"
+        elif "debug" in helper_parts:
+            helper_build_flavor = "debug"
     payload = {
         "benchmark": "axisymmetric_vs_quarter_3d",
         "platform": platform.platform(),
@@ -383,6 +458,8 @@ def main(argv: list[str] | None = None) -> int:
                 else None
             ),
             "apple_silicon": native_runtime.is_apple_silicon,
+            "build_flavor": helper_build_flavor,
+            "smoke_test_ok": native_runtime.smoke_test_ok,
         },
         "environment": {
             name: os.environ.get(name)
@@ -409,6 +486,11 @@ def main(argv: list[str] | None = None) -> int:
             "quarter_triangles": quarter.info.n_triangles,
             "quarter_symmetry": "yz+xz",
             "axisymmetric_azimuth_min": args.azimuth_min,
+            "meridian_source_area_m2": meridian_source_area,
+            "quarter_source_area_m2": quarter_source_area,
+            "quarter_velocity_scale_for_equal_volume_velocity": (
+                quarter_velocity_scale
+            ),
         },
         "axisymmetric_backend": {
             "assembly": args.axisym_backend,
@@ -442,6 +524,9 @@ def main(argv: list[str] | None = None) -> int:
         },
         "numerical_gate": numerical_gate,
         "cross_solver_difference": cross_solver_difference,
+        "cross_solver_difference_by_frequency": _accuracy_by_frequency(
+            last_results["axisymmetric"], last_results["quarter_3d"], frequencies
+        ),
         "candidate_vs_64_point_axisymmetric": _accuracy(
             last_results["axisymmetric"], axisym_reference
         ),
