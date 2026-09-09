@@ -76,10 +76,31 @@ The comparison excludes mesh generation from both arms, runs one excluded
 warm-up per solver, alternates paired warm runs, and requires speed, compact-CPU
 parity, and cross-solver physics gates for overall qualification. It also
 normalizes source velocity for equal physical volume velocity and reports
-frequency-local errors. The Numba CPU field implementation is the portable
+frequency-local errors. The JSON records tagged quarter-to-meridian geometric
+distance at both the solved coarse panels and an 8x finer same-config generating
+curve; these are scale-aware discretization diagnostics, not a blanket geometry
+rejection. The shared flat mouth-closure contract remains a separate strict
+check. It also records significant-field and null-region phase separately (the existing
+1e-4 significant-field phase gate remains authoritative; 1e-3 and 1e-2 floors
+are additional diagnostics), and full-3D near-quadrature plus dense-solve
+provenance. To run a fixed-geometry CircSym convergence ladder,
+use `--meridian-refinement-factors 1,2,4,8`; each rung uniformly subdivides the
+already-built straight meridian panels, preserving their tags, normals, and
+surface area. Select `--meridian-refinement-factor 4` as well when timing the
+four-times-refined rung (for example, 52 to 208 segments), rather than using a
+coarse timing to characterize it. The Numba CPU field implementation is the portable
 default; `--cpu-field numpy` remains available for diagnosis. Changing azimuth
 order must be judged against the harness's unchanged 64-point CircSym reference,
 not from timing alone.
+
+For a separate resonance diagnostic, supply points known to lie in the excluded
+solid interior enclosed by the exterior boundary—typically wall material, never
+the horn air cavity—and run `--resonance-comparison --chief-points points.json`.
+The caller is responsible for verifying placement; the harness cannot prove it
+from an arbitrary exterior mesh. This makes paired real-k+CHIEF solves and a
+complex-k shift ladder for both Axisymmetric and quarter-3D arms. It is
+reporting-only and cannot change the Axisymmetric qualification result. The
+harness intentionally refuses to infer CHIEF locations from arbitrary geometry.
 
 The default fixture is a closed free-standing conical horn swept from 400 Hz to
 16 kHz. `--target-edge-mm`, `--frequencies`, `--angles`, and `--repeat` expose
