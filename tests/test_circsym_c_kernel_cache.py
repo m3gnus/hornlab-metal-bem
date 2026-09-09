@@ -135,6 +135,34 @@ def _compile_library_with_stale_fingerprint(
         '    return "stale-build-fingerprint";\n'
         "}\n"
         "int circsym_eval_near_remainder(void) { return 0; }\n"
+        "int circsym_eval_near_remainder_onthefly(void) { return 0; }\n"
+        "int circsym_eval_far_remainder_onthefly(void) { return 0; }\n",
+        encoding="ascii",
+    )
+    command = [compiler, "-O2", "-fPIC"]
+    command.append("-dynamiclib" if platform.system() == "Darwin" else "-shared")
+    command.extend([str(source), "-o", str(output)])
+    subprocess.run(command, check=True, capture_output=True, text=True)
+    output.chmod(0o700)
+    selection_path = _kernel_selection_path(output.parent, cache_key)
+    selection_path.write_text(output.name + "\n", encoding="ascii")
+    selection_path.chmod(0o600)
+
+
+def _compile_library_without_compact_near_export(
+    output: Path,
+    tmp_path: Path,
+    *,
+    compiler: str,
+    cache_key: str,
+    build_fingerprint: str,
+) -> None:
+    source = tmp_path / f"legacy-near-{output.stem}.c"
+    source.write_text(
+        "const char *circsym_c_kernel_build_fingerprint(void) {\n"
+        f'    return "{build_fingerprint}";\n'
+        "}\n"
+        "int circsym_eval_near_remainder(void) { return 0; }\n"
         "int circsym_eval_far_remainder_onthefly(void) { return 0; }\n",
         encoding="ascii",
     )
@@ -342,6 +370,57 @@ def test_c_kernel_cache_recompiles_once_after_load_failure(
     assert not rejected_path.exists()
     assert Path(kernel.library._name) == selected
     assert hasattr(kernel.library, "circsym_eval_near_remainder")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the runtime C kernel is POSIX-only")
+def test_c_kernel_cache_rebuilds_library_missing_compact_near_export(
+    monkeypatch,
+    tmp_path: Path,
+):
+    compiler_wrapper, invocation_log, compiler = _counting_compiler(tmp_path)
+    monkeypatch.setenv("CC", str(compiler_wrapper))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    cache_dir = Path(_circsym_c_kernel_cache_dir())
+    _prepare_circsym_c_kernel_cache(str(cache_dir))
+    platform_name = platform.system().lower()
+    build_fingerprint = circsym._circsym_c_kernel_build_fingerprint(
+        compiler=str(compiler_wrapper),
+        platform_name=platform_name,
+    )
+    cache_key = _circsym_c_kernel_cache_key(
+        build_fingerprint=build_fingerprint,
+        platform_name=platform_name,
+    )
+    rejected_path = _generation_library_path(
+        cache_dir,
+        "legacy-near-abi",
+        cache_key,
+    )
+    _compile_library_without_compact_near_export(
+        rejected_path,
+        tmp_path,
+        compiler=compiler,
+        cache_key=cache_key,
+        build_fingerprint=build_fingerprint,
+    )
+    preloaded = ctypes.CDLL(str(rejected_path))
+    assert hasattr(preloaded, "circsym_eval_near_remainder")
+    assert hasattr(preloaded, "circsym_eval_far_remainder_onthefly")
+    assert not hasattr(preloaded, "circsym_eval_near_remainder_onthefly")
+
+    circsym._load_circsym_remainder_c_kernel.cache_clear()
+    try:
+        kernel = circsym._load_circsym_remainder_c_kernel()
+        assert kernel is not None
+    finally:
+        circsym._load_circsym_remainder_c_kernel.cache_clear()
+
+    assert invocation_log.read_text(encoding="utf-8").splitlines() == ["compile"]
+    selected = _selected_library_path(cache_dir, cache_key)
+    assert selected != rejected_path
+    assert not rejected_path.exists()
+    assert Path(kernel.library._name) == selected
+    assert hasattr(kernel.library, "circsym_eval_near_remainder_onthefly")
 
 
 @pytest.mark.skipif(os.name != "posix", reason="the runtime C kernel is POSIX-only")

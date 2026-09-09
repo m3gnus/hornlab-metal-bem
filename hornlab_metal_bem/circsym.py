@@ -1456,9 +1456,28 @@ class _NearRemainderGeometry:
 
 
 @dataclass
+class _NearPairCompactGeometry:
+    target_rho: NDArray[np.float64]
+    target_z: NDArray[np.float64]
+    source_rho: NDArray[np.float64]
+    source_z: NDArray[np.float64]
+    measure: NDArray[np.float64]
+    normal_rho: NDArray[np.float64]
+    normal_z: NDArray[np.float64]
+    baffle_z: float | None
+
+
+@dataclass
+class _NearRemainderCompactGeometry:
+    pairs: _NearPairCompactGeometry
+    cos_psi: NDArray[np.float64]
+    psi_weights: NDArray[np.float64]
+
+
+@dataclass
 class _BoundaryAssemblyQuadratureGeometry:
     far: _FarRemainderCompactGeometry
-    near_parts: tuple[_NearRemainderGeometry, ...]
+    near: _NearRemainderCompactGeometry
 
 
 class _BoundaryAssemblyGeometryCache:
@@ -1491,6 +1510,7 @@ class _BoundaryAssemblyGeometryCache:
         self._static_h: NDArray[np.complex128] | None = None
         self._near_rows: NDArray[np.int64] | None = None
         self._near_cols: NDArray[np.int64] | None = None
+        self._near_pairs: _NearPairCompactGeometry | None = None
         self._quadrature: dict[int, _BoundaryAssemblyQuadratureGeometry] = {}
 
     def assemble(
@@ -1580,6 +1600,15 @@ class _BoundaryAssemblyGeometryCache:
         cached = self._quadrature.get(int(n_psi))
         if cached is None:
             _check_circsym_continue(should_continue)
+            if self._near_pairs is None:
+                self._near_pairs = _build_near_pair_compact_geometry(
+                    self.meridian,
+                    self.geom,
+                    near_rows,
+                    near_cols,
+                    self.baffle_z,
+                    should_continue=should_continue,
+                )
             cached = _BoundaryAssemblyQuadratureGeometry(
                 far=_build_far_remainder_compact_geometry(
                     self.meridian,
@@ -1587,14 +1616,9 @@ class _BoundaryAssemblyGeometryCache:
                     self.baffle_z,
                     n_psi=int(n_psi),
                 ),
-                near_parts=_build_near_remainder_geometry_parts(
-                    self.meridian,
-                    self.geom,
-                    near_rows,
-                    near_cols,
-                    self.baffle_z,
+                near=_build_near_remainder_compact_geometry(
+                    self._near_pairs,
                     n_psi=int(n_psi),
-                    should_continue=should_continue,
                 ),
             )
             self._quadrature[int(n_psi)] = cached
@@ -1683,21 +1707,16 @@ def _assemble_boundary_matrices_from_geometry(
             )
 
     if near_rows.size:
-        s_near = np.zeros(near_rows.size, dtype=np.complex128)
-        h_near = np.zeros_like(s_near)
-        for part in qgeom.near_parts:
-            _check_circsym_continue(should_continue)
-            if remainder_kernel is None:
-                s_part, h_part = _evaluate_near_remainder(part, k)
-            else:
-                s_part, h_part = _evaluate_near_remainder_with_kernel(
-                    remainder_kernel,
-                    part,
-                    k,
-                    workers=workers,
-                )
-            s_near += s_part
-            h_near += h_part
+        _check_circsym_continue(should_continue)
+        if remainder_kernel is None:
+            s_near, h_near = _evaluate_near_remainder_compact(qgeom.near, k)
+        else:
+            s_near, h_near = _evaluate_near_remainder_compact_with_kernel(
+                remainder_kernel,
+                qgeom.near,
+                k,
+                workers=workers,
+            )
         S[near_rows, near_cols] = static_s[near_rows, near_cols] + s_near
         H[near_rows, near_cols] = static_h[near_rows, near_cols] + h_near
     return S, H
@@ -1776,6 +1795,33 @@ typedef struct {
     int64_t start;
     int64_t stop;
 } NearThreadTask;
+
+typedef struct {
+    int64_t pair_count;
+    int64_t node_count;
+    int64_t psi_count;
+    const double *target_rho;
+    const double *target_z;
+    const double *source_rho;
+    const double *source_z;
+    const double *measure;
+    const double *normal_rho;
+    const double *normal_z;
+    const double *cos_psi;
+    const double *psi_weights;
+    int32_t has_baffle;
+    double baffle_z;
+    double kr;
+    double ki;
+    double *out_s;
+    double *out_h;
+} NearOntheflyTask;
+
+typedef struct {
+    const NearOntheflyTask *task;
+    int64_t start;
+    int64_t stop;
+} NearOntheflyThreadTask;
 
 static inline void cmul(
     double ar,
@@ -2001,6 +2047,139 @@ static void *eval_near_worker(void *raw) {
     return NULL;
 }
 
+static void eval_near_onthefly_range(
+    const NearOntheflyTask *task,
+    int64_t start,
+    int64_t stop
+) {
+    const int64_t node_count = task->node_count;
+    const int64_t psi_count = task->psi_count;
+    const int32_t image_count = task->has_baffle ? 2 : 1;
+    const double four_pi = 4.0 * 3.141592653589793238462643383279502884;
+
+    for (int64_t pair = start; pair < stop; ++pair) {
+        const double rt = task->target_rho[pair];
+        const double zt = task->target_z[pair];
+        const double nr = task->normal_rho[pair];
+        const double source_nz = task->normal_z[pair];
+        double s_re = 0.0;
+        double s_im = 0.0;
+        double h_re = 0.0;
+        double h_im = 0.0;
+
+        for (int32_t image = 0; image < image_count; ++image) {
+            const double nz = image ? -source_nz : source_nz;
+            double part_s_re = 0.0;
+            double part_s_im = 0.0;
+            double part_h_re = 0.0;
+            double part_h_im = 0.0;
+            for (int64_t node = 0; node < node_count; ++node) {
+                const int64_t source_idx = pair * node_count + node;
+                const double source_measure = task->measure[source_idx];
+                if (source_measure == 0.0) {
+                    continue;
+                }
+                const double rs = task->source_rho[source_idx];
+                const double base_zs = task->source_z[source_idx];
+                const double zs = image ? 2.0 * task->baffle_z - base_zs : base_zs;
+                const double dz = zs - zt;
+
+                for (int64_t psi = 0; psi < psi_count; ++psi) {
+                    const double cp = task->cos_psi[psi];
+                    double r2 = rt * rt + rs * rs - 2.0 * rt * rs * cp + dz * dz;
+                    if (r2 < 0.0) {
+                        r2 = 0.0;
+                    }
+                    const double r = sqrt(r2);
+                    const double w = (
+                        source_measure * (2.0 * task->psi_weights[psi]) / four_pi
+                    );
+                    if (r <= 1.0e-13) {
+                        part_s_re += (-task->ki) * w;
+                        part_s_im += task->kr * w;
+                        continue;
+                    }
+
+                    const double q_re = task->kr * r;
+                    const double q_im = task->ki * r;
+                    double remg_re;
+                    double remg_im;
+                    double expr_re;
+                    double expr_im;
+                    if (hypot(q_re, q_im) < 1.0e-5) {
+                        const double z_re = -q_im;
+                        const double z_im = q_re;
+                        double z2_re, z2_im, z3_re, z3_im, z4_re, z4_im, z5_re, z5_im;
+                        cmul(z_re, z_im, z_re, z_im, &z2_re, &z2_im);
+                        cmul(z2_re, z2_im, z_re, z_im, &z3_re, &z3_im);
+                        cmul(z3_re, z3_im, z_re, z_im, &z4_re, &z4_im);
+                        cmul(z4_re, z4_im, z_re, z_im, &z5_re, &z5_im);
+                        remg_re = (
+                            z_re + 0.5 * z2_re + z3_re / 6.0 +
+                            z4_re / 24.0 + z5_re / 120.0
+                        ) / r;
+                        remg_im = (
+                            z_im + 0.5 * z2_im + z3_im / 6.0 +
+                            z4_im / 24.0 + z5_im / 120.0
+                        ) / r;
+
+                        double q2_re, q2_im, q3_re, q3_im, q4_re, q4_im, q5_re, q5_im;
+                        cmul(q_re, q_im, q_re, q_im, &q2_re, &q2_im);
+                        cmul(q2_re, q2_im, q_re, q_im, &q3_re, &q3_im);
+                        cmul(q3_re, q3_im, q_re, q_im, &q4_re, &q4_im);
+                        cmul(q4_re, q4_im, q_re, q_im, &q5_re, &q5_im);
+                        expr_re = (
+                            -0.5 * q2_re + q3_im / 3.0 +
+                            0.125 * q4_re - q5_im / 30.0
+                        );
+                        expr_im = (
+                            -0.5 * q2_im - q3_re / 3.0 +
+                            0.125 * q4_im + q5_re / 30.0
+                        );
+                    } else {
+                        const double decay = exp(-q_im);
+                        const double phase_re = decay * cos(q_re);
+                        const double phase_im = decay * sin(q_re);
+                        remg_re = (phase_re - 1.0) / r;
+                        remg_im = phase_im / r;
+                        const double factor_re = -q_im - 1.0;
+                        const double factor_im = q_re;
+                        expr_re = phase_re * factor_re - phase_im * factor_im + 1.0;
+                        expr_im = phase_re * factor_im + phase_im * factor_re;
+                    }
+
+                    const double numerator = (rs - rt * cp) * nr + dz * nz;
+                    const double wh = w * numerator / ((r * r) * r);
+                    part_s_re += remg_re * w;
+                    part_s_im += remg_im * w;
+                    part_h_re += expr_re * wh;
+                    part_h_im += expr_im * wh;
+                }
+            }
+            s_re += part_s_re;
+            s_im += part_s_im;
+            h_re += part_h_re;
+            h_im += part_h_im;
+        }
+        const int64_t out_idx = 2 * pair;
+        task->out_s[out_idx] = s_re;
+        task->out_s[out_idx + 1] = s_im;
+        task->out_h[out_idx] = h_re;
+        task->out_h[out_idx + 1] = h_im;
+    }
+}
+
+static void *eval_near_onthefly_worker(void *raw) {
+    const NearOntheflyThreadTask *thread_task =
+        (const NearOntheflyThreadTask *)raw;
+    eval_near_onthefly_range(
+        thread_task->task,
+        thread_task->start,
+        thread_task->stop
+    );
+    return NULL;
+}
+
 int circsym_eval_far_remainder_onthefly(
     int64_t nt,
     int64_t ns,
@@ -2177,6 +2356,106 @@ int circsym_eval_near_remainder(
     free(thread_tasks);
     return 0;
 }
+
+int circsym_eval_near_remainder_onthefly(
+    int64_t pair_count,
+    int64_t node_count,
+    int64_t psi_count,
+    const double *target_rho,
+    const double *target_z,
+    const double *source_rho,
+    const double *source_z,
+    const double *measure,
+    const double *normal_rho,
+    const double *normal_z,
+    const double *cos_psi,
+    const double *psi_weights,
+    int32_t has_baffle,
+    double baffle_z,
+    double kr,
+    double ki,
+    double *out_s,
+    double *out_h,
+    int32_t requested_threads
+) {
+    if (pair_count < 0 || node_count < 0 || psi_count < 0 ||
+        target_rho == NULL || target_z == NULL ||
+        source_rho == NULL || source_z == NULL || measure == NULL ||
+        normal_rho == NULL || normal_z == NULL ||
+        cos_psi == NULL || psi_weights == NULL ||
+        out_s == NULL || out_h == NULL) {
+        return -1;
+    }
+    NearOntheflyTask task;
+    task.pair_count = pair_count;
+    task.node_count = node_count;
+    task.psi_count = psi_count;
+    task.target_rho = target_rho;
+    task.target_z = target_z;
+    task.source_rho = source_rho;
+    task.source_z = source_z;
+    task.measure = measure;
+    task.normal_rho = normal_rho;
+    task.normal_z = normal_z;
+    task.cos_psi = cos_psi;
+    task.psi_weights = psi_weights;
+    task.has_baffle = has_baffle;
+    task.baffle_z = baffle_z;
+    task.kr = kr;
+    task.ki = ki;
+    task.out_s = out_s;
+    task.out_h = out_h;
+
+    int32_t threads = requested_threads;
+    if (threads < 1) {
+        threads = 1;
+    }
+    if ((int64_t)threads > pair_count) {
+        threads = (int32_t)pair_count;
+    }
+    if (threads <= 1 || pair_count <= 1) {
+        eval_near_onthefly_range(&task, 0, pair_count);
+        return 0;
+    }
+
+    pthread_t *handles = (pthread_t *)malloc((size_t)threads * sizeof(pthread_t));
+    NearOntheflyThreadTask *thread_tasks = (NearOntheflyThreadTask *)malloc(
+        (size_t)threads * sizeof(NearOntheflyThreadTask)
+    );
+    if (handles == NULL || thread_tasks == NULL) {
+        free(handles);
+        free(thread_tasks);
+        eval_near_onthefly_range(&task, 0, pair_count);
+        return 0;
+    }
+
+    int32_t created = 0;
+    for (int32_t t = 0; t < threads; ++t) {
+        const int64_t start = (pair_count * (int64_t)t) / (int64_t)threads;
+        const int64_t stop = (pair_count * (int64_t)(t + 1)) / (int64_t)threads;
+        thread_tasks[t].task = &task;
+        thread_tasks[t].start = start;
+        thread_tasks[t].stop = stop;
+        if (pthread_create(
+                &handles[t], NULL, eval_near_onthefly_worker, &thread_tasks[t]
+            ) != 0) {
+            break;
+        }
+        created += 1;
+    }
+
+    for (int32_t t = 0; t < created; ++t) {
+        pthread_join(handles[t], NULL);
+    }
+    if (created != threads) {
+        const int64_t fallback_start =
+            (pair_count * (int64_t)created) / (int64_t)threads;
+        eval_near_onthefly_range(&task, fallback_start, pair_count);
+    }
+    free(handles);
+    free(thread_tasks);
+    return 0;
+}
 """
 
 
@@ -2204,6 +2483,9 @@ class _CircsymRemainderCKernel:
             fcntl.flock(self._lease_fd, fcntl.LOCK_SH)
             self.library = ctypes.CDLL(library_path)
             self.eval_near = self.library.circsym_eval_near_remainder
+            self.eval_near_onthefly = (
+                self.library.circsym_eval_near_remainder_onthefly
+            )
             double_ptr = ctypes.POINTER(ctypes.c_double)
             self.eval_far_onthefly = self.library.circsym_eval_far_remainder_onthefly
             self.eval_far_onthefly.argtypes = [
@@ -2243,6 +2525,28 @@ class _CircsymRemainderCKernel:
                 ctypes.c_int32,
             ]
             self.eval_near.restype = ctypes.c_int
+            self.eval_near_onthefly.argtypes = [
+                ctypes.c_int64,
+                ctypes.c_int64,
+                ctypes.c_int64,
+                double_ptr,
+                double_ptr,
+                double_ptr,
+                double_ptr,
+                double_ptr,
+                double_ptr,
+                double_ptr,
+                double_ptr,
+                double_ptr,
+                ctypes.c_int32,
+                ctypes.c_double,
+                ctypes.c_double,
+                ctypes.c_double,
+                double_ptr,
+                double_ptr,
+                ctypes.c_int32,
+            ]
+            self.eval_near_onthefly.restype = ctypes.c_int
         except Exception:
             self.close()
             raise
@@ -3406,6 +3710,102 @@ def _evaluate_near_remainder_with_kernel(
     )
 
 
+def _evaluate_near_remainder_compact_compiled(
+    kernel: _CircsymRemainderCKernel,
+    part: _NearRemainderCompactGeometry,
+    k: complex,
+    *,
+    workers: int,
+) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    pairs = part.pairs
+    pair_count = int(pairs.target_rho.size)
+    if pair_count == 0:
+        return (
+            np.empty(0, dtype=np.complex128),
+            np.empty(0, dtype=np.complex128),
+        )
+    target_rho = np.ascontiguousarray(pairs.target_rho, dtype=np.float64)
+    target_z = np.ascontiguousarray(pairs.target_z, dtype=np.float64)
+    source_rho = np.ascontiguousarray(pairs.source_rho, dtype=np.float64)
+    source_z = np.ascontiguousarray(pairs.source_z, dtype=np.float64)
+    measure = np.ascontiguousarray(pairs.measure, dtype=np.float64)
+    normal_rho = np.ascontiguousarray(pairs.normal_rho, dtype=np.float64)
+    normal_z = np.ascontiguousarray(pairs.normal_z, dtype=np.float64)
+    cos_psi = np.ascontiguousarray(part.cos_psi, dtype=np.float64)
+    psi_weights = np.ascontiguousarray(part.psi_weights, dtype=np.float64)
+    node_count = int(source_rho.shape[1])
+    psi_count = int(cos_psi.size)
+    s_out = np.empty(pair_count, dtype=np.complex128)
+    h_out = np.empty_like(s_out)
+    double_ptr = ctypes.POINTER(ctypes.c_double)
+    k_value = complex(k)
+    status = kernel.eval_near_onthefly(
+        ctypes.c_int64(pair_count),
+        ctypes.c_int64(node_count),
+        ctypes.c_int64(psi_count),
+        target_rho.ctypes.data_as(double_ptr),
+        target_z.ctypes.data_as(double_ptr),
+        source_rho.ctypes.data_as(double_ptr),
+        source_z.ctypes.data_as(double_ptr),
+        measure.ctypes.data_as(double_ptr),
+        normal_rho.ctypes.data_as(double_ptr),
+        normal_z.ctypes.data_as(double_ptr),
+        cos_psi.ctypes.data_as(double_ptr),
+        psi_weights.ctypes.data_as(double_ptr),
+        ctypes.c_int32(pairs.baffle_z is not None),
+        ctypes.c_double(0.0 if pairs.baffle_z is None else float(pairs.baffle_z)),
+        ctypes.c_double(float(k_value.real)),
+        ctypes.c_double(float(k_value.imag)),
+        s_out.ctypes.data_as(double_ptr),
+        h_out.ctypes.data_as(double_ptr),
+        ctypes.c_int32(max(1, min(int(workers), pair_count))),
+    )
+    if int(status) != 0:
+        return _evaluate_near_remainder_compact(part, k)
+    return s_out, h_out
+
+
+def _evaluate_near_remainder_compact_with_kernel(
+    kernel: _CircsymRemainderKernel,
+    part: _NearRemainderCompactGeometry,
+    k: complex,
+    *,
+    workers: int,
+) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    if kernel.backend == "c":
+        return _evaluate_near_remainder_compact_compiled(
+            kernel.implementation,
+            part,
+            k,
+            workers=workers,
+        )
+    if kernel.backend != "numba":
+        raise RuntimeError(f"unknown CircSym remainder backend {kernel.backend!r}")
+    pairs = part.pairs
+    if pairs.target_rho.size == 0:
+        return (
+            np.empty(0, dtype=np.complex128),
+            np.empty(0, dtype=np.complex128),
+        )
+    del workers
+    k_value = complex(k)
+    return kernel.implementation.evaluate_near_remainder_onthefly(
+        np.ascontiguousarray(pairs.target_rho, dtype=np.float64),
+        np.ascontiguousarray(pairs.target_z, dtype=np.float64),
+        np.ascontiguousarray(pairs.source_rho, dtype=np.float64),
+        np.ascontiguousarray(pairs.source_z, dtype=np.float64),
+        np.ascontiguousarray(pairs.measure, dtype=np.float64),
+        np.ascontiguousarray(pairs.normal_rho, dtype=np.float64),
+        np.ascontiguousarray(pairs.normal_z, dtype=np.float64),
+        np.ascontiguousarray(part.cos_psi, dtype=np.float64),
+        np.ascontiguousarray(part.psi_weights, dtype=np.float64),
+        pairs.baffle_z is not None,
+        0.0 if pairs.baffle_z is None else float(pairs.baffle_z),
+        float(k_value.real),
+        float(k_value.imag),
+    )
+
+
 def _evaluate_far_remainder_block(
     part: _FarRemainderGeometry,
     k: complex,
@@ -3516,6 +3916,74 @@ def _evaluate_near_remainder(
         np.asarray(np.sum(rem_g * part.weight, axis=(1, 2)), dtype=np.complex128),
         np.asarray(np.sum(rem_h * part.weight, axis=(1, 2)), dtype=np.complex128),
     )
+
+
+def _evaluate_near_remainder_compact(
+    part: _NearRemainderCompactGeometry,
+    k: complex,
+) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
+    """Evaluate adaptive near pairs without materialising per-order 3-D tensors."""
+
+    pairs = part.pairs
+    pair_count = int(pairs.target_rho.size)
+    s_out = np.zeros(pair_count, dtype=np.complex128)
+    h_out = np.zeros_like(s_out)
+    cos_psi = part.cos_psi[None, :]
+    psi_factor = 2.0 * part.psi_weights[None, :] / (4.0 * np.pi)
+    k_value = complex(k)
+    image_count = 2 if pairs.baffle_z is not None else 1
+    for pair_index in range(pair_count):
+        node_mask = pairs.measure[pair_index] != 0.0
+        if not np.any(node_mask):
+            continue
+        target_rho = float(pairs.target_rho[pair_index])
+        target_z = float(pairs.target_z[pair_index])
+        rho_s = pairs.source_rho[pair_index, node_mask][:, None]
+        base_z_s = pairs.source_z[pair_index, node_mask][:, None]
+        measure = pairs.measure[pair_index, node_mask][:, None]
+        normal_rho = float(pairs.normal_rho[pair_index])
+        source_normal_z = float(pairs.normal_z[pair_index])
+        for image_index in range(image_count):
+            if image_index:
+                assert pairs.baffle_z is not None
+                z_s = 2.0 * float(pairs.baffle_z) - base_z_s
+                normal_z = -source_normal_z
+            else:
+                z_s = base_z_s
+                normal_z = source_normal_z
+            dz = z_s - target_z
+            R2 = (
+                target_rho * target_rho
+                + rho_s * rho_s
+                - 2.0 * target_rho * rho_s * cos_psi
+                + dz * dz
+            )
+            R = np.sqrt(np.maximum(R2, 0.0))
+            numerator = (
+                (rho_s - target_rho * cos_psi) * normal_rho + dz * normal_z
+            )
+            weight = measure * psi_factor
+            q = k_value * R
+            with np.errstate(divide="ignore", invalid="ignore"):
+                rem_g = np.expm1(1j * q) / R
+            rem_g = np.where(R > 1e-13, rem_g, 1j * k_value)
+            expr = np.exp(1j * q) * (1j * q - 1.0) + 1.0
+            small = np.abs(q) < 1e-5
+            if np.any(small):
+                qs = q[small]
+                expr = expr.astype(np.complex128, copy=True)
+                expr[small] = (
+                    -0.5 * qs * qs
+                    - (1j / 3.0) * qs**3
+                    + 0.125 * qs**4
+                    + (1j / 30.0) * qs**5
+                )
+            with np.errstate(divide="ignore", invalid="ignore"):
+                rem_h = expr * numerator / (R * R * R)
+            rem_h = np.where(R > 1e-13, rem_h, 0.0 + 0.0j)
+            s_out[pair_index] += np.sum(rem_g * weight)
+            h_out[pair_index] += np.sum(rem_h * weight)
+    return s_out, h_out
 
 
 def _build_boundary_static_geometry(
@@ -3906,6 +4374,77 @@ def _build_near_remainder_geometry_parts(
             )
         )
     return tuple(parts)
+
+
+def _build_near_pair_compact_geometry(
+    meridian: MeridianMesh,
+    geom: SimpleNamespace,
+    near_rows: NDArray[np.int64],
+    near_cols: NDArray[np.int64],
+    baffle_z: float | None,
+    *,
+    should_continue: Callable[[], bool | None] | None = None,
+) -> _NearPairCompactGeometry:
+    """Prepare frequency-invariant adaptive line geometry for all near pairs."""
+
+    pair_sources: list[NDArray[np.float64]] = []
+    pair_measures: list[NDArray[np.float64]] = []
+    max_nodes = 0
+    for pair_index, (row, col) in enumerate(zip(near_rows, near_cols)):
+        if pair_index % _CANCELLATION_PAIR_BLOCK == 0:
+            _check_circsym_continue(should_continue)
+        target_rho = float(geom.rho_mid[row])
+        target_z = float(geom.z_mid[row])
+        source_length = float(geom.lengths[col])
+        u, w = _segment_quadrature_nodes(
+            target_rho=target_rho,
+            target_z=target_z,
+            source_p0=geom.p0[col],
+            source_delta=geom.delta[col],
+            source_length=source_length,
+            self_pair=int(row) == int(col),
+        )
+        source = geom.p0[col][None, :] + u[:, None] * geom.delta[col][None, :]
+        pair_sources.append(source)
+        pair_measures.append(source[:, 0] * source_length * w)
+        max_nodes = max(max_nodes, int(u.size))
+
+    pair_count = int(near_rows.size)
+    source_rho = np.zeros((pair_count, max_nodes), dtype=np.float64)
+    source_z = np.zeros_like(source_rho)
+    measure = np.zeros_like(source_rho)
+    for pair_index, (source, source_measure) in enumerate(
+        zip(pair_sources, pair_measures)
+    ):
+        node_count = int(source.shape[0])
+        source_rho[pair_index, :node_count] = source[:, 0]
+        source_z[pair_index, :node_count] = source[:, 1]
+        measure[pair_index, :node_count] = source_measure
+
+    normals = meridian.normals[np.asarray(near_cols, dtype=np.int64)]
+    return _NearPairCompactGeometry(
+        target_rho=np.ascontiguousarray(geom.rho_mid[near_rows], dtype=np.float64),
+        target_z=np.ascontiguousarray(geom.z_mid[near_rows], dtype=np.float64),
+        source_rho=source_rho,
+        source_z=source_z,
+        measure=measure,
+        normal_rho=np.ascontiguousarray(normals[:, 0], dtype=np.float64),
+        normal_z=np.ascontiguousarray(normals[:, 1], dtype=np.float64),
+        baffle_z=None if baffle_z is None else float(baffle_z),
+    )
+
+
+def _build_near_remainder_compact_geometry(
+    pairs: _NearPairCompactGeometry,
+    *,
+    n_psi: int,
+) -> _NearRemainderCompactGeometry:
+    psi, psi_weights = _leggauss_psi(int(n_psi))
+    return _NearRemainderCompactGeometry(
+        pairs=pairs,
+        cos_psi=np.ascontiguousarray(np.cos(psi), dtype=np.float64),
+        psi_weights=np.ascontiguousarray(psi_weights, dtype=np.float64),
+    )
 
 
 def _build_near_remainder_geometry(

@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import ctypes
+import os
+import platform
+import shutil
+import subprocess
+
 import numpy as np
 import pytest
 from scipy.special import j1, spherical_jn, spherical_yn, struve
@@ -404,6 +410,214 @@ def test_cached_boundary_assembly_matches_uncached(baffled_sheet: bool):
 
     np.testing.assert_allclose(S_cached, S_uncached, rtol=6e-13, atol=6e-14)
     np.testing.assert_allclose(H_cached, H_uncached, rtol=6e-13, atol=6e-14)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "numba", "c"])
+def test_compact_near_evaluators_match_materialized_reference(
+    backend,
+    monkeypatch,
+    tmp_path,
+):
+    kernel = None
+    if backend == "numba":
+        implementation = _load_circsym_remainder_numba_kernel()
+        if implementation is None:
+            pytest.skip("Numba is unavailable")
+        kernel = _CircsymRemainderKernel("numba", implementation)
+    elif backend == "c":
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+        circsym._load_circsym_remainder_c_kernel.cache_clear()
+        implementation = _load_circsym_remainder_c_kernel()
+        if implementation is None:
+            pytest.skip("runtime C compiler is unavailable")
+        kernel = _CircsymRemainderKernel("c", implementation)
+
+    try:
+        meridian = _sphere_meridian(radius=0.1, segments=9)
+        for baffle_z in (None, -0.137):
+            geom = meridian.segment_geometry()
+            _, _, near_rows, near_cols = circsym._build_boundary_static_geometry(
+                meridian,
+                geom,
+                baffle_z,
+            )
+            materialized = circsym._build_near_remainder_geometry_parts(
+                meridian,
+                geom,
+                near_rows,
+                near_cols,
+                baffle_z,
+                n_psi=48,
+            )
+            pairs = circsym._build_near_pair_compact_geometry(
+                meridian,
+                geom,
+                near_rows,
+                near_cols,
+                baffle_z,
+            )
+            compact = circsym._build_near_remainder_compact_geometry(
+                pairs,
+                n_psi=48,
+            )
+
+            for k in (1.0e-6 + 2.0e-7j, 27.0 + 0.3j, 800.0 + 2.0j):
+                expected_s = np.zeros(near_rows.size, dtype=np.complex128)
+                expected_h = np.zeros_like(expected_s)
+                for part in materialized:
+                    if kernel is None:
+                        s_part, h_part = _evaluate_near_remainder(part, k)
+                    else:
+                        s_part, h_part = _evaluate_near_remainder_with_kernel(
+                            kernel,
+                            part,
+                            k,
+                            workers=2,
+                        )
+                    expected_s += s_part
+                    expected_h += h_part
+
+                if kernel is None:
+                    actual_s, actual_h = circsym._evaluate_near_remainder_compact(
+                        compact,
+                        k,
+                    )
+                else:
+                    actual_s, actual_h = (
+                        circsym._evaluate_near_remainder_compact_with_kernel(
+                            kernel,
+                            compact,
+                            k,
+                            workers=2,
+                        )
+                    )
+
+                np.testing.assert_allclose(
+                    actual_s,
+                    expected_s,
+                    rtol=6e-13,
+                    atol=6e-14,
+                )
+                np.testing.assert_allclose(
+                    actual_h,
+                    expected_h,
+                    rtol=6e-13,
+                    atol=6e-14,
+                )
+    finally:
+        if backend == "c":
+            circsym._load_circsym_remainder_c_kernel.cache_clear()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the runtime C kernel is POSIX-only")
+def test_compact_near_c_partial_thread_failure_evaluates_each_pair_once(tmp_path):
+    compiler = shutil.which(os.environ.get("CC", "cc"))
+    if compiler is None:
+        pytest.skip("runtime C compiler is unavailable")
+
+    source_text = circsym._CIRCSYM_REMAINDER_C_SOURCE
+    pthread_hook = r"""
+static int test_pthread_create_calls = 0;
+static int64_t test_near_pair_visits[4096] = {0};
+
+static int test_pthread_create(
+    pthread_t *thread,
+    const pthread_attr_t *attr,
+    void *(*start_routine)(void *),
+    void *arg
+) {
+    if (test_pthread_create_calls++ == 1) {
+        return 11;
+    }
+    return pthread_create(thread, attr, start_routine, arg);
+}
+
+#define pthread_create test_pthread_create
+
+int64_t circsym_test_near_pair_visits(int64_t pair) {
+    return test_near_pair_visits[pair];
+}
+"""
+    source_text = source_text.replace(
+        "#include <stdlib.h>\n",
+        "#include <stdlib.h>\n" + pthread_hook,
+        1,
+    )
+    compact_function = source_text.index("static void eval_near_onthefly_range(")
+    pair_loop = source_text.index(
+        "    for (int64_t pair = start; pair < stop; ++pair) {\n",
+        compact_function,
+    )
+    loop_line_end = source_text.index("\n", pair_loop) + 1
+    source_text = (
+        source_text[:loop_line_end]
+        + "        test_near_pair_visits[pair] += 1;\n"
+        + source_text[loop_line_end:]
+    )
+
+    source_path = tmp_path / "partial-thread-failure.c"
+    extension = ".dylib" if platform.system() == "Darwin" else ".so"
+    library_path = tmp_path / f"partial-thread-failure{extension}"
+    source_path.write_text(source_text, encoding="utf-8")
+    command = [compiler, "-O2", "-fPIC", "-pthread"]
+    command.append("-dynamiclib" if platform.system() == "Darwin" else "-shared")
+    command.extend([str(source_path), "-o", str(library_path), "-lm"])
+    subprocess.run(command, check=True, capture_output=True, text=True)
+    library_path.chmod(0o700)
+
+    kernel = circsym._CircsymRemainderCKernel(str(library_path))
+    try:
+        meridian = _sphere_meridian(radius=0.1, segments=9)
+        geom = meridian.segment_geometry()
+        _, _, near_rows, near_cols = circsym._build_boundary_static_geometry(
+            meridian,
+            geom,
+            None,
+        )
+        pairs = circsym._build_near_pair_compact_geometry(
+            meridian,
+            geom,
+            near_rows,
+            near_cols,
+            None,
+        )
+        compact = circsym._build_near_remainder_compact_geometry(pairs, n_psi=48)
+        expected_s, expected_h = circsym._evaluate_near_remainder_compact(
+            compact,
+            27.0 + 0.3j,
+        )
+        actual_s, actual_h = circsym._evaluate_near_remainder_compact_compiled(
+            kernel,
+            compact,
+            27.0 + 0.3j,
+            workers=4,
+        )
+
+        visits = kernel.library.circsym_test_near_pair_visits
+        visits.argtypes = [ctypes.c_int64]
+        visits.restype = ctypes.c_int64
+        assert [visits(index) for index in range(near_rows.size)] == [
+            1
+        ] * near_rows.size
+        np.testing.assert_allclose(actual_s, expected_s, rtol=6e-13, atol=6e-14)
+        np.testing.assert_allclose(actual_h, expected_h, rtol=6e-13, atol=6e-14)
+    finally:
+        kernel.close()
+
+
+def test_boundary_cache_reuses_compact_near_pairs_across_azimuth_orders():
+    meridian = _sphere_meridian(radius=0.1, segments=9)
+    cache = _BoundaryAssemblyGeometryCache(meridian, None)
+    _, _, near_rows, near_cols = cache._static_geometry()
+
+    low = cache._quadrature_geometry(32, near_rows, near_cols)
+    high = cache._quadrature_geometry(96, near_rows, near_cols)
+
+    assert low.near.pairs is high.near.pairs
+    assert low.near.cos_psi.shape == (32,)
+    assert high.near.cos_psi.shape == (96,)
+    assert low.near.pairs.source_rho.ndim == 2
+    assert low.near.pairs.source_rho.shape[0] == near_rows.size
 
 
 def test_far_onthefly_compiled_matches_precomputed_reference():
