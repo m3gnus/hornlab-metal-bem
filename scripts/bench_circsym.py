@@ -24,6 +24,8 @@ RELEVANT_ENV = (
     "HORNLAB_CIRCSYM_ASSEMBLY_BACKEND",
     "HORNLAB_CIRCSYM_FIELD_BACKEND",
     "HORNLAB_CIRCSYM_CPU_REMAINDER_BACKEND",
+    "HORNLAB_CIRCSYM_CPU_FIELD_BACKEND",
+    "HORNLAB_CIRCSYM_AZIMUTH_POINTS_MIN",
     "HORNLAB_CIRCSYM_ASSEMBLY_THREADS",
     "HORNLAB_CIRCSYM_FIELD_THREADS",
 )
@@ -33,6 +35,13 @@ def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def _azimuth_int(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed < 8:
+        raise argparse.ArgumentTypeError("must be at least 8")
     return parsed
 
 
@@ -72,6 +81,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("auto", "c", "numba", "numpy"),
         default="auto",
         help="portable CPU remainder kernel (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--cpu-field",
+        choices=("numpy", "numba"),
+        default="numpy",
+        help="portable CPU field kernel (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--azimuth-min",
+        type=_azimuth_int,
+        default=64,
+        metavar="N",
+        help="experimental minimum azimuth quadrature order (default: %(default)s)",
     )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -234,6 +256,8 @@ def main(argv: list[str] | None = None) -> int:
     os.environ["HORNLAB_CIRCSYM_ASSEMBLY_BACKEND"] = args.backend
     os.environ["HORNLAB_CIRCSYM_FIELD_BACKEND"] = args.backend
     os.environ["HORNLAB_CIRCSYM_CPU_REMAINDER_BACKEND"] = args.cpu_remainder
+    os.environ["HORNLAB_CIRCSYM_CPU_FIELD_BACKEND"] = args.cpu_field
+    os.environ["HORNLAB_CIRCSYM_AZIMUTH_POINTS_MIN"] = str(args.azimuth_min)
     frequencies = np.geomspace(args.f1, args.f2, args.frequencies)
 
     records: list[dict[str, Any]] = []

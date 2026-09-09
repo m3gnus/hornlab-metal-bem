@@ -61,6 +61,24 @@ python scripts/bench_circsym.py --json
 python scripts/bench_circsym.py --fixture infinite-baffle --backend cpu --json
 ```
 
+For the conditional axisymmetric-vs-quarter-domain qualification, provide a
+mesher configuration and the matching already-generated quarter surface mesh:
+
+```bash
+PYTHONPATH=.:../hornlab-waveguide-mesher \
+python scripts/bench_axisymmetric_vs_quarter.py \
+  --config path/to/rosse-config.json \
+  --quarter-mesh path/to/rosse-quarter.msh \
+  --repeats 5 --json
+```
+
+The comparison excludes mesh generation from both arms, runs one excluded
+warm-up per solver, alternates paired warm runs, and reports both the simple
+"faster than quarter" result and the stronger 2x qualification target. The
+`--cpu-field numba` and `--azimuth-min` controls are experimental prototype
+knobs; changing azimuth order must be judged against the harness's unchanged
+64-point CircSym reference, not from timing alone.
+
 The default fixture is a closed free-standing conical horn swept from 400 Hz to
 16 kHz. `--target-edge-mm`, `--frequencies`, `--angles`, and `--repeat` expose
 the workload without hiding it behind a machine-specific preset. CI separately

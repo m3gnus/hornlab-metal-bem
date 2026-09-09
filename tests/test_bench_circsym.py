@@ -37,6 +37,8 @@ def test_bench_circsym_cpu_json_smoke(capsys):
     assert payload["meridian_segments"] > 0
     assert payload["environment"]["HORNLAB_CIRCSYM_ASSEMBLY_BACKEND"] == "cpu"
     assert payload["environment"]["HORNLAB_CIRCSYM_FIELD_BACKEND"] == "cpu"
+    assert payload["environment"]["HORNLAB_CIRCSYM_CPU_FIELD_BACKEND"] == "numpy"
+    assert payload["environment"]["HORNLAB_CIRCSYM_AZIMUTH_POINTS_MIN"] == "64"
     assert payload["warmup"]["wall_seconds"] >= 0.0
     assert payload["warmup"]["seconds_per_frequency"] >= 0.0
     assert payload["runs"] == []

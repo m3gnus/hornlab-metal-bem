@@ -92,6 +92,7 @@ def _check_circsym_continue(
 
 _AZIMUTH_POINTS_MIN = 64
 _AZIMUTH_POINTS_PER_KRHO = 4.0
+_CIRCSYM_AZIMUTH_POINTS_MIN_ENV = "HORNLAB_CIRCSYM_AZIMUTH_POINTS_MIN"
 _LINE_QUAD_ORDER = 16
 _SINGULAR_LINE_QUAD_ORDER = 24
 _GRADED_POWER = 3.0
@@ -104,6 +105,7 @@ _CIRCSYM_FIELD_BACKEND_ENV = "HORNLAB_CIRCSYM_FIELD_BACKEND"
 _CIRCSYM_METAL_ASSEMBLY_MIN_TERMS = 80_000_000
 _CIRCSYM_ASSEMBLY_BACKEND_ENV = "HORNLAB_CIRCSYM_ASSEMBLY_BACKEND"
 _CIRCSYM_CPU_REMAINDER_BACKEND_ENV = "HORNLAB_CIRCSYM_CPU_REMAINDER_BACKEND"
+_CIRCSYM_CPU_FIELD_BACKEND_ENV = "HORNLAB_CIRCSYM_CPU_FIELD_BACKEND"
 _CIRCSYM_C_KERNEL_BUILD_SCHEMA = "circsym-c-kernel-v2"
 _CIRCSYM_C_KERNEL_COMPILE_ARGS = ("-O3", "-fPIC", "-pthread")
 _CIRCSYM_C_KERNEL_LINK_ARGS = ("-lm",)
@@ -566,6 +568,7 @@ def run_sweep_circsym(
                 n_psi,
             ),
             "field_backend_policy": _requested_circsym_field_backend(),
+            "cpu_field_kernel": _circsym_cpu_field_status(),
             "chief_points": bool(config.chief_points is not None),
             "chief_points_count": int(chief_rows_count),
         }
@@ -958,6 +961,7 @@ def run_sweep_coupled_ib(
                 n_psi,
             ),
             "field_backend_policy": _requested_circsym_field_backend(),
+            "cpu_field_kernel": _circsym_cpu_field_status(),
         }
         native_diagnostics.append(diagnostics)
 
@@ -1079,7 +1083,11 @@ def _complex_wavenumber(frequency_hz: float, config: SolveConfig) -> complex:
 
 def _azimuth_order(k: complex, rho_max: float) -> int:
     krho = abs(complex(k)) * max(float(rho_max), 0.0)
-    return max(_AZIMUTH_POINTS_MIN, int(math.ceil(_AZIMUTH_POINTS_PER_KRHO * krho)))
+    raw_minimum = os.environ.get(_CIRCSYM_AZIMUTH_POINTS_MIN_ENV)
+    minimum = _AZIMUTH_POINTS_MIN if raw_minimum is None else int(raw_minimum)
+    if minimum < 8:
+        raise ValueError(f"{_CIRCSYM_AZIMUTH_POINTS_MIN_ENV} must be at least 8")
+    return max(minimum, math.ceil(_AZIMUTH_POINTS_PER_KRHO * krho))
 
 
 @lru_cache(maxsize=64)
@@ -3140,6 +3148,32 @@ def _circsym_cpu_remainder_status() -> dict[str, Any]:
     }
 
 
+def _requested_circsym_cpu_field_backend() -> str:
+    backend = os.environ.get(_CIRCSYM_CPU_FIELD_BACKEND_ENV, "numpy").strip().lower()
+    if backend not in {"numpy", "numba"}:
+        raise ValueError(
+            f"{_CIRCSYM_CPU_FIELD_BACKEND_ENV} must be 'numpy' or 'numba'"
+        )
+    return backend
+
+
+def _circsym_cpu_field_status() -> dict[str, Any]:
+    requested = _requested_circsym_cpu_field_backend()
+    implementation = (
+        _load_circsym_remainder_numba_kernel() if requested == "numba" else None
+    )
+    if requested == "numba" and implementation is None:
+        raise RuntimeError(
+            "CircSym Numba field backend was requested but is unavailable: "
+            + (_circsym_numba_kernel_failure or "unknown import failure")
+        )
+    return {
+        "policy": requested,
+        "selected": "numba" if implementation is not None else "numpy",
+        "numba_unavailable_reason": _circsym_numba_kernel_failure,
+    }
+
+
 def _evaluate_far_remainder_onthefly_compiled(
     kernel: _CircsymRemainderCKernel,
     part: _FarRemainderCompactGeometry,
@@ -4567,9 +4601,10 @@ def _integrate_field_segment_kernels_batched(
         indices.size,
         int(n_psi),
     )
+    cpu_field_backend = _circsym_cpu_field_status()["selected"]
     workers = (
         1
-        if field_backend == "metal"
+        if field_backend == "metal" or cpu_field_backend == "numba"
         else _field_kernel_worker_count(work_rho.size, indices.size)
     )
     block_size = (
@@ -4751,6 +4786,33 @@ def _integrate_ordinary_field_kernels_targets_batched(
             if _requested_circsym_field_backend() == "metal":
                 raise
             _record_circsym_metal_field_failure(exc)
+
+    cpu_field = _circsym_cpu_field_status()
+    if cpu_field["selected"] == "numba":
+        source = p0[:, None, :] + u[None, :, None] * delta[:, None, :]
+        rho_s = np.ascontiguousarray(source[:, :, 0], dtype=np.float64)
+        z_s = np.ascontiguousarray(source[:, :, 1], dtype=np.float64)
+        line_measure = np.ascontiguousarray(
+            rho_s * lengths[:, None] * w[None, :], dtype=np.float64
+        )
+        implementation = _load_circsym_remainder_numba_kernel()
+        assert implementation is not None
+        k_value = complex(k)
+        return implementation.evaluate_field_onthefly(
+            np.ascontiguousarray(target_rho_arr, dtype=np.float64),
+            np.ascontiguousarray(target_z_arr, dtype=np.float64),
+            rho_s,
+            z_s,
+            line_measure,
+            np.ascontiguousarray(normal[:, 0], dtype=np.float64),
+            np.ascontiguousarray(normal[:, 1], dtype=np.float64),
+            np.ascontiguousarray(np.cos(psi), dtype=np.float64),
+            np.ascontiguousarray(psi_weights, dtype=np.float64),
+            baffle_z is not None,
+            0.0 if baffle_z is None else float(baffle_z),
+            float(k_value.real),
+            float(k_value.imag),
+        )
 
     normal_rho = normal[:, 0][None, :, None]
     normal_z = normal[:, 1][None, :, None]

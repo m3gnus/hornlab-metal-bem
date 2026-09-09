@@ -66,8 +66,7 @@ def evaluate_far_remainder_onthefly(
                 for psi_index in range(psi_count):
                     cp = cos_psi[psi_index]
                     r2 = rt * rt + rs * rs - 2.0 * rt * rs * cp + dz * dz
-                    if r2 < 0.0:
-                        r2 = 0.0
+                    r2 = max(r2, 0.0)
                     distance = math.sqrt(r2)
                     if distance <= 1.0e-13:
                         continue
@@ -92,6 +91,100 @@ def evaluate_far_remainder_onthefly(
                     expr_im = phase_re * factor_im + phase_im * factor_re
                     h_re += expr_re * h_weight
                     h_im += expr_im * h_weight
+
+        out_s[target_index, source_index] = complex(s_re, s_im)
+        out_h[target_index, source_index] = complex(h_re, h_im)
+
+    return out_s, out_h
+
+
+@njit(parallel=True, cache=True)
+def evaluate_field_onthefly(
+    target_rho,
+    target_z,
+    source_rho,
+    source_z,
+    measure,
+    normal_rho,
+    normal_z,
+    cos_psi,
+    psi_weights,
+    has_baffle,
+    baffle_z,
+    kr,
+    ki,
+):
+    """Evaluate complete ordinary S/H field kernels without NumPy tensors.
+
+    The arithmetic and quadrature match the NumPy reference in ``circsym.py``.
+    Keeping the target/source/line/azimuth reduction inside compiled loops avoids
+    allocating a target x source x azimuth complex array for every line node.
+    Near-boundary pairs are still replaced by the caller's existing specialised
+    quadrature, so this routine changes only the ordinary far-pair executor.
+    """
+
+    target_count = target_rho.shape[0]
+    source_count = source_rho.shape[0]
+    line_count = source_rho.shape[1]
+    psi_count = cos_psi.shape[0]
+    image_count = 2 if has_baffle else 1
+    out_s = np.zeros((target_count, source_count), dtype=np.complex128)
+    out_h = np.zeros((target_count, source_count), dtype=np.complex128)
+    four_pi = 4.0 * math.pi
+
+    for flat_index in prange(target_count * source_count):
+        target_index = flat_index // source_count
+        source_index = flat_index - target_index * source_count
+        rt = target_rho[target_index]
+        zt = target_z[target_index]
+        nr = normal_rho[source_index]
+        source_nz = normal_z[source_index]
+        s_re = 0.0
+        s_im = 0.0
+        h_re = 0.0
+        h_im = 0.0
+
+        for image_index in range(image_count):
+            nz = -source_nz if image_index else source_nz
+            for line_index in range(line_count):
+                source_measure = measure[source_index, line_index]
+                if source_measure == 0.0:
+                    continue
+                rs = source_rho[source_index, line_index]
+                base_zs = source_z[source_index, line_index]
+                zs = 2.0 * baffle_z - base_zs if image_index else base_zs
+                dz = zs - zt
+
+                for psi_index in range(psi_count):
+                    cp = cos_psi[psi_index]
+                    r2 = rt * rt + rs * rs - 2.0 * rt * rs * cp + dz * dz
+                    r2 = max(r2, 0.0)
+                    distance = math.sqrt(r2)
+                    if distance <= 1.0e-13:
+                        continue
+
+                    q_re = kr * distance
+                    q_im = ki * distance
+                    decay = math.exp(-q_im)
+                    phase_re = decay * math.cos(q_re)
+                    phase_im = decay * math.sin(q_re)
+                    weighted_measure = (
+                        source_measure * (2.0 * psi_weights[psi_index]) / four_pi
+                    )
+                    g_scale = weighted_measure / distance
+                    s_re += phase_re * g_scale
+                    s_im += phase_im * g_scale
+
+                    numerator = (rs - rt * cp) * nr + dz * nz
+                    h_scale = weighted_measure * numerator / (distance**3)
+                    factor_re = -q_im - 1.0
+                    factor_im = q_re
+                    h_re += (
+                        phase_re * factor_re - phase_im * factor_im
+                    ) * h_scale
+                    h_im += (
+                        phase_re * factor_im + phase_im * factor_re
+                    ) * h_scale
 
         out_s[target_index, source_index] = complex(s_re, s_im)
         out_h[target_index, source_index] = complex(h_re, h_im)
@@ -170,4 +263,8 @@ def evaluate_near_remainder(R, numerator, weight, kr, ki):
     return out_s, out_h
 
 
-__all__ = ["evaluate_far_remainder_onthefly", "evaluate_near_remainder"]
+__all__ = [
+    "evaluate_far_remainder_onthefly",
+    "evaluate_field_onthefly",
+    "evaluate_near_remainder",
+]

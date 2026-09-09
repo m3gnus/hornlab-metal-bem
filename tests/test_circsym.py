@@ -9,14 +9,13 @@ import hornlab_metal_bem.circsym as circsym
 from hornlab_metal_bem._constants import SPEED_OF_SOUND
 from hornlab_metal_bem.circsym import (
     MeridianMesh,
-    _BoundaryAssemblyGeometryCache,
-    _CircsymRemainderKernel,
-    _NearRemainderGeometry,
     _assemble_boundary_matrices,
+    _BoundaryAssemblyGeometryCache,
+    _build_driver_neumann_segments,
     _build_far_remainder_compact_geometry,
     _build_far_remainder_geometry_parts,
-    _build_driver_neumann_segments,
     _build_source_segment_scale,
+    _CircsymRemainderKernel,
     _evaluate_far_remainder_block,
     _evaluate_far_remainder_onthefly_compiled,
     _evaluate_far_remainder_onthefly_reference,
@@ -25,11 +24,13 @@ from hornlab_metal_bem.circsym import (
     _evaluate_near_remainder_with_kernel,
     _evaluate_points_pressure,
     _infer_circsym_frame,
-    _is_flat_baffled_sheet,
+    _integrate_ordinary_field_kernels_targets_batched,
     _integrate_segment_kernel,
+    _is_flat_baffled_sheet,
     _load_circsym_remainder_c_kernel,
     _load_circsym_remainder_kernel,
     _load_circsym_remainder_numba_kernel,
+    _NearRemainderGeometry,
     _ring_remainder_kernel_m0,
     _ring_remainder_kernel_m0_targets_batched,
     _validate_closed_or_baffled_meridian,
@@ -512,6 +513,37 @@ def test_numba_remainder_kernels_match_numpy_reference(baffle_z):
         12.0 + 0.4j,
         workers=2,
     )
+    np.testing.assert_allclose(actual_s, expected_s, rtol=3e-13, atol=3e-14)
+    np.testing.assert_allclose(actual_h, expected_h, rtol=3e-13, atol=3e-14)
+
+
+@pytest.mark.parametrize("baffle_z", [None, -0.137])
+def test_numba_field_kernel_matches_numpy_reference(monkeypatch, baffle_z):
+    implementation = _load_circsym_remainder_numba_kernel()
+    if implementation is None:
+        pytest.skip("Numba is unavailable")
+    meridian = _sphere_meridian(radius=0.1, segments=7)
+    geom = meridian.segment_geometry()
+    kwargs = {
+        "target_rho": np.array([0.0, 0.08, 0.21], dtype=np.float64),
+        "target_z": np.array([0.7, 0.65, 0.8], dtype=np.float64),
+        "meridian": meridian,
+        "geom": geom,
+        "source_indices": np.arange(meridian.segment_count),
+        "k": 12.0 + 0.4j,
+        "baffle_z": baffle_z,
+        "n_psi": 48,
+        "backend": "cpu",
+        "metal_runtime_status": None,
+        "should_continue": None,
+    }
+    monkeypatch.setenv("HORNLAB_CIRCSYM_CPU_FIELD_BACKEND", "numpy")
+    expected_s, expected_h = _integrate_ordinary_field_kernels_targets_batched(
+        **kwargs
+    )
+    monkeypatch.setenv("HORNLAB_CIRCSYM_CPU_FIELD_BACKEND", "numba")
+    actual_s, actual_h = _integrate_ordinary_field_kernels_targets_batched(**kwargs)
+
     np.testing.assert_allclose(actual_s, expected_s, rtol=3e-13, atol=3e-14)
     np.testing.assert_allclose(actual_h, expected_h, rtol=3e-13, atol=3e-14)
 
