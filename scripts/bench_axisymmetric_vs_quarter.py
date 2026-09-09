@@ -58,6 +58,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--angles", type=_positive_int, default=37)
     parser.add_argument("--repeats", type=_positive_int, default=5)
     parser.add_argument(
+        "--axisym-backend",
+        choices=("cpu", "metal"),
+        default="cpu",
+        help="CircSym assembly and field executor (default: %(default)s)",
+    )
+    parser.add_argument(
         "--cpu-field",
         choices=("numpy", "numba"),
         default="numba",
@@ -256,14 +262,37 @@ def _accuracy(axisym: Any, quarter: Any) -> dict[str, float]:
     }
 
 
+def _axisym_parity(candidate: Any, reference: Any) -> dict[str, float]:
+    metrics = _accuracy(candidate, reference)
+    candidate_impedance = np.asarray(candidate.impedance, dtype=np.complex128)
+    reference_impedance = np.asarray(reference.impedance, dtype=np.complex128)
+    if candidate_impedance.shape != reference_impedance.shape:
+        raise RuntimeError("axisymmetric parity returned different impedance shapes")
+    scale = max(float(np.linalg.norm(reference_impedance)), 1.0e-30)
+    metrics["impedance_relative_l2"] = float(
+        np.linalg.norm(candidate_impedance - reference_impedance) / scale
+    )
+    return metrics
+
+
 def _median_wall(records: list[dict[str, Any]]) -> float:
     return float(statistics.median(float(record["wall_seconds"]) for record in records))
 
 
+def _passes_overall_qualification(
+    *,
+    speed_ratio: bool,
+    half_second: bool,
+    compact_cpu_parity: bool,
+    numerical_gate: bool,
+) -> bool:
+    return speed_ratio and half_second and compact_cpu_parity and numerical_gate
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    os.environ["HORNLAB_CIRCSYM_ASSEMBLY_BACKEND"] = "cpu"
-    os.environ["HORNLAB_CIRCSYM_FIELD_BACKEND"] = "cpu"
+    os.environ["HORNLAB_CIRCSYM_ASSEMBLY_BACKEND"] = args.axisym_backend
+    os.environ["HORNLAB_CIRCSYM_FIELD_BACKEND"] = args.axisym_backend
     os.environ["HORNLAB_CIRCSYM_CPU_FIELD_BACKEND"] = args.cpu_field
     os.environ["HORNLAB_CIRCSYM_AZIMUTH_POINTS_MIN"] = str(args.azimuth_min)
 
@@ -301,6 +330,12 @@ def main(argv: list[str] | None = None) -> int:
     axisym_median = _median_wall(records["axisymmetric"])
     quarter_median = _median_wall(records["quarter_3d"])
     ratio = axisym_median / quarter_median
+    axisym_candidate = last_results["axisymmetric"]
+    os.environ["HORNLAB_CIRCSYM_ASSEMBLY_BACKEND"] = "cpu"
+    os.environ["HORNLAB_CIRCSYM_FIELD_BACKEND"] = "cpu"
+    compact_cpu_reference = axisym_call()
+    os.environ["HORNLAB_CIRCSYM_ASSEMBLY_BACKEND"] = args.axisym_backend
+    os.environ["HORNLAB_CIRCSYM_FIELD_BACKEND"] = args.axisym_backend
     os.environ["HORNLAB_CIRCSYM_AZIMUTH_POINTS_MIN"] = "64"
     axisym_reference = axisym_call()
     os.environ["HORNLAB_CIRCSYM_AZIMUTH_POINTS_MIN"] = str(args.azimuth_min)
@@ -321,6 +356,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     passes_speed_ratio = ratio < args.qualification_ratio
     passes_half_second = axisym_median <= 0.5
+    compact_cpu_parity = _axisym_parity(axisym_candidate, compact_cpu_reference)
+    passes_compact_cpu_parity = (
+        compact_cpu_parity["pressure_relative_l2"] < 5.0e-5
+        and compact_cpu_parity["directivity_max_abs_db"] < 0.01
+        and compact_cpu_parity["impedance_relative_l2"] < 5.0e-5
+    )
     try:
         package_version = importlib.metadata.version("hornlab-metal-bem")
     except importlib.metadata.PackageNotFoundError:
@@ -370,8 +411,12 @@ def main(argv: list[str] | None = None) -> int:
             "axisymmetric_azimuth_min": args.azimuth_min,
         },
         "axisymmetric_backend": {
-            "assembly": "cpu",
-            "field": f"cpu-{args.cpu_field}",
+            "assembly": args.axisym_backend,
+            "field": (
+                f"cpu-{args.cpu_field}"
+                if args.axisym_backend == "cpu"
+                else "metal-frequency-batch"
+            ),
         },
         "warmup_excluded": {
             "axisymmetric": axisym_cold,
@@ -386,9 +431,13 @@ def main(argv: list[str] | None = None) -> int:
             "qualification_ratio": args.qualification_ratio,
             "passes_speed_ratio": passes_speed_ratio,
             "passes_half_second_target": passes_half_second,
+            "passes_compact_cpu_parity": passes_compact_cpu_parity,
             "passes_numerical_gate": passes_numerical_gate,
-            "passes_overall_qualification": (
-                passes_speed_ratio and passes_half_second and passes_numerical_gate
+            "passes_overall_qualification": _passes_overall_qualification(
+                speed_ratio=passes_speed_ratio,
+                half_second=passes_half_second,
+                compact_cpu_parity=passes_compact_cpu_parity,
+                numerical_gate=passes_numerical_gate,
             ),
         },
         "numerical_gate": numerical_gate,
@@ -396,6 +445,12 @@ def main(argv: list[str] | None = None) -> int:
         "candidate_vs_64_point_axisymmetric": _accuracy(
             last_results["axisymmetric"], axisym_reference
         ),
+        "candidate_vs_compact_cpu": compact_cpu_parity,
+        "compact_cpu_parity_gate": {
+            "max_pressure_relative_l2": 5.0e-5,
+            "max_directivity_error_db": 0.01,
+            "max_impedance_relative_l2": 5.0e-5,
+        },
     }
     if args.json:
         print(json.dumps(_jsonable(payload), indent=2, sort_keys=True))

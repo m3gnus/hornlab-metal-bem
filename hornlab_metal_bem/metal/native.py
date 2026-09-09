@@ -508,6 +508,305 @@ def evaluate_circsym_ring_remainder_kernels(
     return _evaluate_circsym_ring_kernels(kernel_mode="remainder", **kwargs)
 
 
+def _evaluate_circsym_ring_kernels_batch(
+    *,
+    target_rho: NDArray[Any],
+    target_z: NDArray[Any],
+    source_rho: NDArray[Any],
+    source_z: NDArray[Any],
+    measure: NDArray[Any],
+    normal_rho: NDArray[Any],
+    normal_z: NDArray[Any],
+    cos_psi_by_frequency: tuple[NDArray[Any], ...],
+    psi_weights_by_frequency: tuple[NDArray[Any], ...],
+    k_values: NDArray[Any],
+    kernel_mode: str,
+    baffle_z: float | None = None,
+    runtime_config: MetalNativeRuntimeConfig | None = None,
+    runtime_status: MetalNativeRuntimeStatus | None = None,
+    work_dir: Path | None = None,
+    operation_id: str | None = None,
+    should_continue: Callable[[], bool | None] | None = None,
+) -> CircSymMetalFieldKernels:
+    """Evaluate one ring geometry in one helper invocation over all wavenumbers.
+
+    Geometry, pipeline, and buffers are reused only within this invocation; the
+    helper exits after writing the batch and persists no GPU state across calls.
+    """
+    from .session import (
+        BinaryArrayDescriptor,
+        CircSymRingBatchPayload,
+        read_json_manifest,
+        write_binary_array,
+        write_json_manifest,
+    )
+
+    started = time.perf_counter()
+
+    def real_array(name: str, value: NDArray[Any], ndim: int) -> NDArray[np.float32]:
+        array = np.asarray(value)
+        if array.ndim != ndim or any(int(dim) <= 0 for dim in array.shape):
+            raise ValueError(f"{name} must be a non-empty {ndim}D array")
+        if not np.issubdtype(array.dtype, np.number) or np.iscomplexobj(array):
+            raise ValueError(f"{name} must be real numeric data")
+        if not np.all(np.isfinite(array)):
+            raise ValueError(f"{name} must contain only finite values")
+        return np.ascontiguousarray(array, dtype=np.float32)
+
+    target_rho_arr = real_array("target_rho", target_rho, 1)
+    target_z_arr = real_array("target_z", target_z, 1)
+    if target_z_arr.shape != target_rho_arr.shape:
+        raise ValueError("target_z must have the same shape as target_rho")
+    source_rho_arr = real_array("source_rho", source_rho, 2)
+    source_z_arr = real_array("source_z", source_z, 2)
+    measure_arr = real_array("measure", measure, 2)
+    if source_z_arr.shape != source_rho_arr.shape:
+        raise ValueError("source_z must have the same shape as source_rho")
+    if measure_arr.shape != source_rho_arr.shape:
+        raise ValueError("measure must have the same shape as source_rho")
+    normal_rho_arr = real_array("normal_rho", normal_rho, 1)
+    normal_z_arr = real_array("normal_z", normal_z, 1)
+    source_vector_shape = (source_rho_arr.shape[0],)
+    if normal_rho_arr.shape != source_vector_shape:
+        raise ValueError("normal_rho length must match the source count")
+    if normal_z_arr.shape != source_vector_shape:
+        raise ValueError("normal_z length must match the source count")
+    if np.any(target_rho_arr < 0.0) or np.any(source_rho_arr < 0.0):
+        raise ValueError("target_rho and source_rho must be non-negative")
+
+    k_arr = np.asarray(k_values, dtype=np.complex128).reshape(-1)
+    if k_arr.size == 0 or not np.all(np.isfinite(k_arr)):
+        raise ValueError("k_values must be non-empty and finite")
+    if len(cos_psi_by_frequency) != k_arr.size:
+        raise ValueError("cos_psi_by_frequency length must match k_values")
+    if len(psi_weights_by_frequency) != k_arr.size:
+        raise ValueError("psi_weights_by_frequency length must match k_values")
+    cos_rows: list[NDArray[np.float32]] = []
+    weight_rows: list[NDArray[np.float32]] = []
+    n_psi_values = np.empty(k_arr.size, dtype=np.int32)
+    for index, (cos_value, weight_value) in enumerate(
+        zip(cos_psi_by_frequency, psi_weights_by_frequency, strict=True)
+    ):
+        cos_row = real_array(f"cos_psi_by_frequency[{index}]", cos_value, 1)
+        weight_row = real_array(
+            f"psi_weights_by_frequency[{index}]", weight_value, 1
+        )
+        if weight_row.shape != cos_row.shape:
+            raise ValueError("each psi weight row must match its cosine row")
+        if np.any(np.abs(cos_row) > 1.000001):
+            raise ValueError("cos_psi values must lie in [-1, 1]")
+        n_psi_values[index] = int(cos_row.size)
+        cos_rows.append(cos_row)
+        weight_rows.append(weight_row)
+    max_psi = int(np.max(n_psi_values))
+    cos_psi_arr = np.zeros((k_arr.size, max_psi), dtype=np.float32)
+    psi_weights_arr = np.zeros_like(cos_psi_arr)
+    for index, (cos_row, weight_row) in enumerate(
+        zip(cos_rows, weight_rows, strict=True)
+    ):
+        cos_psi_arr[index, : cos_row.size] = cos_row
+        psi_weights_arr[index, : weight_row.size] = weight_row
+
+    if baffle_z is not None and not np.isfinite(float(baffle_z)):
+        raise ValueError("baffle_z must be finite when provided")
+    if kernel_mode not in {"field", "remainder"}:
+        raise ValueError("kernel_mode must be 'field' or 'remainder'")
+
+    status = runtime_status
+    if status is None:
+        status = assert_native_runtime_available(runtime_config, run_smoke_test=True)
+    elif not status.available:
+        raise RuntimeError(
+            "Swift/Metal native helper is unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+
+    owns_root = work_dir is None
+    root = (
+        Path(tempfile.mkdtemp(prefix="hornlab-circsym-metal-batch-"))
+        if owns_root
+        else Path(work_dir)
+    )
+    op_dir = root / (operation_id or f"circsym-batch-{uuid4().hex[:12]}")
+    inputs_dir = op_dir / "inputs"
+    outputs_dir = op_dir / "outputs"
+    try:
+        values: dict[str, tuple[NDArray[Any], Any]] = {
+            "k_real_f32": (np.asarray(k_arr.real, dtype=np.float32), np.float32),
+            "k_imag_f32": (np.asarray(k_arr.imag, dtype=np.float32), np.float32),
+            "n_psi_i32": (n_psi_values, np.int32),
+            "target_rho_f32": (target_rho_arr, np.float32),
+            "target_z_f32": (target_z_arr, np.float32),
+            "source_rho_f32": (source_rho_arr, np.float32),
+            "source_z_f32": (source_z_arr, np.float32),
+            "measure_f32": (measure_arr, np.float32),
+            "normal_rho_f32": (normal_rho_arr, np.float32),
+            "normal_z_f32": (normal_z_arr, np.float32),
+            "cos_psi_f32": (cos_psi_arr, np.float32),
+            "psi_weights_f32": (psi_weights_arr, np.float32),
+        }
+        inputs = {
+            name: write_binary_array(
+                value,
+                inputs_dir / f"{name}.bin",
+                dtype=dtype,
+                relative_to=op_dir,
+            )
+            for name, (value, dtype) in values.items()
+        }
+        output_shape = (
+            int(k_arr.size),
+            int(target_rho_arr.size),
+            int(source_rho_arr.shape[0]),
+        )
+        outputs = {
+            name: BinaryArrayDescriptor(
+                path=(outputs_dir / f"{name}.bin").relative_to(op_dir).as_posix(),
+                shape=output_shape,
+                dtype="float32",
+            )
+            for name in (
+                "slp_real_f32",
+                "slp_imag_f32",
+                "dlp_real_f32",
+                "dlp_imag_f32",
+            )
+        }
+        payload = CircSymRingBatchPayload(
+            inputs=inputs,
+            outputs=outputs,
+            baffle_z_f32=baffle_z,
+            kernel_mode=kernel_mode,
+        )
+        payload_path = write_json_manifest(payload, op_dir / "request.json")
+        result_path = op_dir / "result.json"
+        ipc_write_seconds = time.perf_counter() - started
+        command = _native_helper_command(
+            status,
+            "evaluate_circsym_ring_kernels_batch",
+            str(payload_path),
+            str(result_path),
+        )
+        timeout_s = (runtime_config or MetalNativeRuntimeConfig()).operation_timeout_s
+        if should_continue is None:
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=status.backend_dir,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_s,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    "Swift/Metal native helper timed out during CircSym batch"
+                ) from exc
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Failed to launch Swift/Metal native helper: {exc}"
+                ) from exc
+            returncode = completed.returncode
+            stdout = completed.stdout
+            stderr = completed.stderr
+        else:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=status.backend_dir,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Failed to launch Swift/Metal native helper: {exc}"
+                ) from exc
+            deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+            try:
+                while process.poll() is None:
+                    if should_continue() is False:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+                        raise CircSymMetalCancelled("CircSym Metal operation cancelled")
+                    if deadline is not None and time.monotonic() > deadline:
+                        process.kill()
+                        process.wait()
+                        raise RuntimeError(
+                            "Swift/Metal native helper timed out during CircSym batch"
+                        )
+                    time.sleep(0.005)
+            except BaseException:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                raise
+            stdout, stderr = process.communicate()
+            returncode = int(process.returncode or 0)
+            if should_continue() is False:
+                raise CircSymMetalCancelled("CircSym Metal operation cancelled")
+        if returncode != 0:
+            message = (
+                stderr.strip()
+                or stdout.strip()
+                or f"Swift helper exited with {returncode}"
+            )
+            raise RuntimeError(
+                "Swift/Metal native helper failed during CircSym batch: " + message
+            )
+        if not result_path.is_file():
+            raise RuntimeError(f"Swift/Metal native helper did not write {result_path}")
+        diagnostics = read_json_manifest(result_path)
+        output_read_started = time.perf_counter()
+
+        def read_complex(real_key: str, imag_key: str) -> NDArray[np.complex128]:
+            count = int(np.prod(output_shape))
+            real_path = op_dir / str(diagnostics[real_key])
+            imag_path = op_dir / str(diagnostics[imag_key])
+            real_values = np.fromfile(real_path, dtype="<f4", count=count)
+            imag_values = np.fromfile(imag_path, dtype="<f4", count=count)
+            if real_values.size != count or imag_values.size != count:
+                raise RuntimeError("CircSym Metal helper output byte count mismatch")
+            return np.asarray(
+                real_values.reshape(output_shape) + 1j * imag_values.reshape(output_shape),
+                dtype=np.complex128,
+            )
+
+        slp = read_complex("slp_real_f32", "slp_imag_f32")
+        dlp = read_complex("dlp_real_f32", "dlp_imag_f32")
+        diagnostics["python_ipc_write_seconds"] = ipc_write_seconds
+        diagnostics["python_output_read_seconds"] = (
+            time.perf_counter() - output_read_started
+        )
+        diagnostics["python_wall_seconds"] = time.perf_counter() - started
+        return CircSymMetalFieldKernels(
+            slp=slp,
+            dlp=dlp,
+            diagnostics=diagnostics,
+        )
+    finally:
+        if owns_root:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+def evaluate_circsym_ring_field_kernels_batch(
+    **kwargs: Any,
+) -> CircSymMetalFieldKernels:
+    """Evaluate field kernels as one per-helper-invocation frequency batch."""
+    return _evaluate_circsym_ring_kernels_batch(kernel_mode="field", **kwargs)
+
+
+def evaluate_circsym_ring_remainder_kernels_batch(
+    **kwargs: Any,
+) -> CircSymMetalFieldKernels:
+    """Evaluate remainders as one per-helper-invocation frequency batch."""
+    return _evaluate_circsym_ring_kernels_batch(kernel_mode="remainder", **kwargs)
+
+
 class MetalNativeStandardSession:
     """Session wrapper for native helper contract validation."""
 

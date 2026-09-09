@@ -354,6 +354,13 @@ def run_sweep_circsym(
         ],
         dtype=np.int32,
     )
+    k_by_frequency = np.asarray(
+        [
+            _complex_wavenumber(float(frequency_hz), config)
+            for frequency_hz in frequencies_arr
+        ],
+        dtype=np.complex128,
+    )
     # Keep the quadrature order frequency-local. The assembly cache is keyed by
     # n_psi, so repeated orders still reuse geometry without forcing low
     # frequencies to pay the sweep's high-frequency field/assembly cost.
@@ -365,6 +372,20 @@ def run_sweep_circsym(
         reusable_n_psi=set(n_psi_use_counts),
         n_psi_use_counts=n_psi_use_counts,
         cache_single_use=False,
+    )
+    assembly_cache.prepare_metal_remainder_batch(
+        k_by_frequency,
+        n_psi_by_frequency,
+        should_continue=config.should_continue,
+    )
+    field_batch = _prepare_circsym_observation_metal_batch(
+        meridian,
+        geom,
+        obs_points,
+        np.asarray(k_by_frequency.real, dtype=np.complex128),
+        n_psi_by_frequency,
+        config,
+        has_sphere_points=sphere_evaluation_points is not None,
     )
 
     pressure_rows: list[NDArray[np.complex128]] = []
@@ -384,7 +405,7 @@ def run_sweep_circsym(
         frequency = float(frequency_hz)
         t_case = time.time()
         omega = 2.0 * np.pi * frequency
-        k = _complex_wavenumber(frequency, config)
+        k = complex(k_by_frequency[freq_index])
         n_psi = int(n_psi_by_frequency[freq_index])
         case_impedance = (
             impedance_sources_arg[freq_index]
@@ -466,17 +487,34 @@ def run_sweep_circsym(
         q_total = q_driver + 1j * k * beta * pressure
 
         t_field = time.time()
-        field_pressure = _evaluate_observation_pressure(
-            meridian,
-            pressure,
-            q_total,
-            obs_points,
-            k_field,
-            config,
-            geom=geom,
-            n_psi=n_psi,
-            should_continue=config.should_continue,
-        )
+        if field_batch is None:
+            field_pressure = _evaluate_observation_pressure(
+                meridian,
+                pressure,
+                q_total,
+                obs_points,
+                k_field,
+                config,
+                geom=geom,
+                n_psi=n_psi,
+                should_continue=config.should_continue,
+            )
+        else:
+            if field_batch.rayleigh_sheet:
+                first_unique = -(field_batch.slp[freq_index] @ q_total)
+            else:
+                first_unique = (
+                    field_batch.dlp[freq_index] @ pressure
+                    - field_batch.slp[freq_index] @ q_total
+                )
+            if field_batch.active_targets is None:
+                first = first_unique[field_batch.target_inverse]
+            else:
+                first = np.zeros(obs_points.shape[1], dtype=np.complex128)
+                first[field_batch.active_targets] = first_unique[
+                    field_batch.target_inverse
+                ]
+            field_pressure = np.tile(first[None, :], (obs_points.shape[0], 1))
         sphere_pressure_unique = (
             _evaluate_points_pressure(
                 meridian,
@@ -571,6 +609,15 @@ def run_sweep_circsym(
             "cpu_field_kernel": _circsym_cpu_field_status(),
             "chief_points": bool(config.chief_points is not None),
             "chief_points_count": int(chief_rows_count),
+            "frequency_batch": {
+                "assembly": assembly_cache.metal_batch_diagnostics is not None,
+                "field": field_batch is not None,
+                "frequency_count": int(frequencies_arr.size),
+                "lifecycle": "per_helper_invocation",
+                "cross_invocation_persistence": False,
+                "near_correction": "cpu_complex128",
+                "arithmetic_reduction": False,
+            },
         }
         if chief_residual_rel is not None:
             diagnostics["chief_solver"] = "scipy_linalg_lstsq"
@@ -611,13 +658,52 @@ def run_sweep_circsym(
         int(tag): np.asarray(values, dtype=np.complex128)
         for tag, values in surface_pavg.items()
     }
+    assembly_batch_s = float(assembly_cache.metal_batch_wall_s)
+    field_batch_s = 0.0 if field_batch is None else float(field_batch.wall_s)
     timings = {
-        "solve_s": sum(float(entry["timing_s"]) for entry in solver_log),
-        "assembly_s": sum(float(entry["assembly_s"]) for entry in solver_log),
+        "solve_s": (
+            sum(float(entry["timing_s"]) for entry in solver_log)
+            + assembly_batch_s
+            + field_batch_s
+        ),
+        "assembly_s": (
+            sum(float(entry["assembly_s"]) for entry in solver_log)
+            + assembly_batch_s
+        ),
         "dense_solve_s": sum(float(entry["dense_solve_s"]) for entry in solver_log),
-        "directivity_s": sum(float(entry["field_s"]) for entry in solver_log),
+        "directivity_s": (
+            sum(float(entry["field_s"]) for entry in solver_log)
+            + field_batch_s
+        ),
+        "metal_batch_assembly_s": assembly_batch_s,
+        "metal_batch_field_s": field_batch_s,
         "total_s": time.time() - t_total,
     }
+    for prefix, batch_diagnostics in (
+        ("metal_batch_assembly", assembly_cache.metal_batch_diagnostics),
+        (
+            "metal_batch_field",
+            None if field_batch is None else field_batch.diagnostics,
+        ),
+    ):
+        if batch_diagnostics is None:
+            continue
+        for name in (
+            "python_ipc_write_seconds",
+            "python_output_read_seconds",
+            "python_wall_seconds",
+            "input_read_seconds",
+            "invocation_setup_seconds",
+            "metal_library_seconds",
+            "pipeline_seconds",
+            "kernel_seconds",
+            "kernel_device_seconds",
+            "output_write_seconds",
+            "helper_wall_seconds",
+        ):
+            value = batch_diagnostics.get(name)
+            if value is not None:
+                timings[f"{prefix}_{name}"] = float(value)
     radiated_power_sphere_w, sphere_coverage_sr = _sphere_power_from_log(
         solver_log,
         config,
@@ -1475,6 +1561,17 @@ class _NearRemainderCompactGeometry:
 
 
 @dataclass
+class _CircSymFieldFrequencyBatch:
+    slp: NDArray[np.complex128]
+    dlp: NDArray[np.complex128]
+    target_inverse: NDArray[np.int64]
+    active_targets: NDArray[np.bool_] | None
+    rayleigh_sheet: bool
+    wall_s: float
+    diagnostics: dict[str, Any]
+
+
+@dataclass
 class _BoundaryAssemblyQuadratureGeometry:
     far: _FarRemainderCompactGeometry
     near: _NearRemainderCompactGeometry
@@ -1512,6 +1609,68 @@ class _BoundaryAssemblyGeometryCache:
         self._near_cols: NDArray[np.int64] | None = None
         self._near_pairs: _NearPairCompactGeometry | None = None
         self._quadrature: dict[int, _BoundaryAssemblyQuadratureGeometry] = {}
+        self._metal_remainders: dict[
+            tuple[float, float, int],
+            tuple[NDArray[np.complex128], NDArray[np.complex128]],
+        ] = {}
+        self.metal_batch_diagnostics: dict[str, Any] | None = None
+        self.metal_batch_wall_s = 0.0
+
+    def prepare_metal_remainder_batch(
+        self,
+        k_values: NDArray[np.complex128],
+        n_psi_values: NDArray[np.int32],
+        *,
+        should_continue: Callable[[], bool | None] | None = None,
+    ) -> None:
+        """Evaluate all far remainders in one per-invocation frequency batch."""
+        kvals = np.asarray(k_values, dtype=np.complex128).reshape(-1)
+        orders = np.asarray(n_psi_values, dtype=np.int32).reshape(-1)
+        if kvals.shape != orders.shape or kvals.size == 0:
+            raise ValueError("k_values and n_psi_values must be non-empty and aligned")
+        selections = [
+            _select_circsym_assembly_backend(self.meridian.segment_count, int(order))
+            for order in orders
+        ]
+        if any(backend != "metal" for backend, _ in selections):
+            return
+        runtime_status = selections[0][1]
+        if runtime_status is None:
+            return
+        started = time.perf_counter()
+        _, _, near_rows, near_cols = self._static_geometry(
+            should_continue=should_continue
+        )
+        parts = tuple(
+            self._quadrature_geometry(
+                int(order),
+                near_rows,
+                near_cols,
+                should_continue=should_continue,
+            ).far
+            for order in orders
+        )
+        try:
+            s_batch, h_batch, diagnostics = (
+                _evaluate_far_remainder_onthefly_metal_batch(
+                    parts,
+                    kvals,
+                    runtime_status=runtime_status,
+                    should_continue=should_continue,
+                )
+            )
+        except _CircSymMetalAccelerationError as exc:
+            if _requested_circsym_assembly_backend() == "metal":
+                raise
+            _record_circsym_metal_assembly_failure(exc)
+            return
+        self.metal_batch_wall_s = time.perf_counter() - started
+        self.metal_batch_diagnostics = diagnostics
+        for index, (k_value, order) in enumerate(zip(kvals, orders, strict=True)):
+            self._metal_remainders[_metal_remainder_key(k_value, int(order))] = (
+                s_batch[index],
+                h_batch[index],
+            )
 
     def assemble(
         self,
@@ -1553,6 +1712,10 @@ class _BoundaryAssemblyGeometryCache:
                 k,
                 n_psi=n_psi_int,
                 remainder_kernel=remainder_kernel,
+                metal_remainder=self._metal_remainders.pop(
+                    _metal_remainder_key(k, n_psi_int),
+                    None,
+                ),
                 should_continue=should_continue,
             )
         except MemoryError:
@@ -1647,6 +1810,11 @@ def _same_optional_float(a: float | None, b: float | None) -> bool:
     return float(a) == float(b)
 
 
+def _metal_remainder_key(k: complex, n_psi: int) -> tuple[float, float, int]:
+    value = complex(k)
+    return float(value.real), float(value.imag), int(n_psi)
+
+
 def _assemble_boundary_matrices_from_geometry(
     static_s: NDArray[np.complex128],
     static_h: NDArray[np.complex128],
@@ -1657,6 +1825,10 @@ def _assemble_boundary_matrices_from_geometry(
     *,
     n_psi: int,
     remainder_kernel: _CircsymRemainderKernel | None,
+    metal_remainder: tuple[
+        NDArray[np.complex128], NDArray[np.complex128]
+    ]
+    | None = None,
     should_continue: Callable[[], bool | None] | None = None,
 ) -> tuple[NDArray[np.complex128], NDArray[np.complex128]]:
     _check_circsym_continue(should_continue)
@@ -1670,20 +1842,26 @@ def _assemble_boundary_matrices_from_geometry(
     )
     far_complete = False
     if assembly_backend == "metal":
-        try:
-            s_part, h_part = _evaluate_far_remainder_onthefly_metal(
-                qgeom.far,
-                k,
-                runtime_status=metal_runtime_status,
-                should_continue=should_continue,
-            )
+        if metal_remainder is not None:
+            s_part, h_part = metal_remainder
             S += s_part
             H += h_part
             far_complete = True
-        except _CircSymMetalAccelerationError as exc:
-            if _requested_circsym_assembly_backend() == "metal":
-                raise
-            _record_circsym_metal_assembly_failure(exc)
+        else:
+            try:
+                s_part, h_part = _evaluate_far_remainder_onthefly_metal(
+                    qgeom.far,
+                    k,
+                    runtime_status=metal_runtime_status,
+                    should_continue=should_continue,
+                )
+                S += s_part
+                H += h_part
+                far_complete = True
+            except _CircSymMetalAccelerationError as exc:
+                if _requested_circsym_assembly_backend() == "metal":
+                    raise
+                _record_circsym_metal_assembly_failure(exc)
     if not far_complete:
         if remainder_kernel is not None:
             s_part, h_part = _evaluate_far_remainder_with_kernel(
@@ -3637,6 +3815,51 @@ def _evaluate_far_remainder_onthefly_metal(
     return result.slp, result.dlp
 
 
+def _evaluate_far_remainder_onthefly_metal_batch(
+    parts: tuple[_FarRemainderCompactGeometry, ...],
+    k_values: NDArray[np.complex128],
+    *,
+    runtime_status: Any,
+    should_continue: Callable[[], bool | None] | None = None,
+) -> tuple[
+    NDArray[np.complex128],
+    NDArray[np.complex128],
+    dict[str, Any],
+]:
+    from .metal.native import CircSymMetalCancelled
+    from .metal.native import evaluate_circsym_ring_remainder_kernels_batch
+
+    if not parts:
+        raise ValueError("parts must be non-empty")
+    _check_circsym_continue(should_continue)
+    geometry = parts[0]
+    try:
+        result = evaluate_circsym_ring_remainder_kernels_batch(
+            target_rho=geometry.target_rho,
+            target_z=geometry.target_z,
+            source_rho=geometry.source_rho,
+            source_z=geometry.source_z,
+            measure=geometry.measure,
+            normal_rho=geometry.normal_rho,
+            normal_z=geometry.normal_z,
+            cos_psi_by_frequency=tuple(part.cos_psi for part in parts),
+            psi_weights_by_frequency=tuple(part.psi_weights for part in parts),
+            k_values=np.asarray(k_values, dtype=np.complex128),
+            baffle_z=geometry.baffle_z,
+            runtime_status=runtime_status,
+            should_continue=should_continue,
+            operation_id="circsym-assembly-frequency-batch",
+        )
+    except CircSymMetalCancelled as exc:
+        raise CircSymCancelled("CircSym solve cancelled") from exc
+    except Exception as exc:
+        raise _CircSymMetalAccelerationError(
+            f"native CircSym remainder batch failed: {exc}"
+        ) from exc
+    _check_circsym_continue(should_continue)
+    return result.slp, result.dlp, result.diagnostics
+
+
 def _evaluate_near_remainder_compiled(
     kernel: _CircsymRemainderCKernel,
     part: _NearRemainderGeometry,
@@ -5095,6 +5318,113 @@ def _record_circsym_metal_assembly_failure(exc: BaseException) -> None:
             "of this process: %s",
             exc,
         )
+
+
+def _prepare_circsym_observation_metal_batch(
+    meridian: MeridianMesh,
+    geom: SimpleNamespace,
+    obs_points: NDArray[np.float64],
+    k_values: NDArray[np.complex128],
+    n_psi_values: NDArray[np.int32],
+    config: SolveConfig,
+    *,
+    has_sphere_points: bool,
+) -> _CircSymFieldFrequencyBatch | None:
+    """Prepare the ordinary generated observation field in one Metal batch."""
+    if config.observation.custom_points is not None or has_sphere_points:
+        return None
+    kvals = np.asarray(k_values, dtype=np.complex128).reshape(-1)
+    orders = np.asarray(n_psi_values, dtype=np.int32).reshape(-1)
+    if kvals.shape != orders.shape or kvals.size == 0:
+        raise ValueError("k_values and n_psi_values must be non-empty and aligned")
+    selections = [
+        _select_circsym_field_backend(
+            int(obs_points.shape[1]), meridian.segment_count, int(order)
+        )
+        for order in orders
+    ]
+    if any(backend != "metal" for backend, _ in selections):
+        return None
+    runtime_status = selections[0][1]
+    if runtime_status is None:
+        return None
+
+    started = time.perf_counter()
+    target_rho, target_z = _points_target_rho_z(obs_points[0])
+    rayleigh_sheet = _is_flat_baffled_sheet(
+        meridian, config.circsym_baffle_z, geom=geom
+    )
+    active_targets: NDArray[np.bool_] | None = None
+    if rayleigh_sheet:
+        active_targets = _baffled_sheet_active_targets(
+            meridian,
+            target_z,
+            float(config.circsym_baffle_z),
+            geom=geom,
+        )
+        if not np.any(active_targets):
+            return None
+    targets = np.column_stack((target_rho, target_z))
+    if active_targets is not None:
+        targets = targets[active_targets]
+    unique_targets, inverse = np.unique(targets, axis=0, return_inverse=True)
+    source_indices = np.arange(meridian.segment_count, dtype=np.int64)
+    far_mask = _ordinary_far_source_mask_targets(
+        unique_targets[:, 0],
+        unique_targets[:, 1],
+        geom,
+        source_indices=source_indices,
+    )
+    # Retain the adaptive FP64 path for any near observation. The product
+    # fixture is a 2 m generated arc and is entirely ordinary/far.
+    if not np.all(far_mask):
+        return None
+
+    u, w = _ordinary_interval(0.0, 1.0)
+    source = (
+        geom.p0[:, None, :]
+        + u[None, :, None] * geom.delta[:, None, :]
+    )
+    rho_s = source[:, :, 0]
+    z_s = source[:, :, 1]
+    line_measure = rho_s * geom.lengths[:, None] * w[None, :]
+    quadrature = tuple(_leggauss_psi(int(order)) for order in orders)
+    try:
+        from .metal.native import CircSymMetalCancelled
+        from .metal.native import evaluate_circsym_ring_field_kernels_batch
+
+        result = evaluate_circsym_ring_field_kernels_batch(
+            target_rho=unique_targets[:, 0],
+            target_z=unique_targets[:, 1],
+            source_rho=rho_s,
+            source_z=z_s,
+            measure=line_measure,
+            normal_rho=meridian.normals[:, 0],
+            normal_z=meridian.normals[:, 1],
+            cos_psi_by_frequency=tuple(np.cos(item[0]) for item in quadrature),
+            psi_weights_by_frequency=tuple(item[1] for item in quadrature),
+            k_values=kvals,
+            baffle_z=config.circsym_baffle_z,
+            runtime_status=runtime_status,
+            should_continue=config.should_continue,
+            operation_id="circsym-observation-frequency-batch",
+        )
+    except CircSymMetalCancelled as exc:
+        raise CircSymCancelled("CircSym solve cancelled") from exc
+    except Exception as exc:
+        if _requested_circsym_field_backend() == "metal":
+            raise
+        _record_circsym_metal_field_failure(exc)
+        return None
+    return _CircSymFieldFrequencyBatch(
+        slp=result.slp,
+        dlp=result.dlp,
+        target_inverse=np.asarray(inverse, dtype=np.int64),
+        active_targets=active_targets,
+        rayleigh_sheet=rayleigh_sheet,
+        wall_s=time.perf_counter() - started,
+        diagnostics=result.diagnostics,
+    )
 
 
 def _integrate_field_segment_kernels_batched(

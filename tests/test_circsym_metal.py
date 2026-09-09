@@ -12,7 +12,9 @@ from hornlab_metal_bem.metal import (
     CircSymMetalCancelled,
     discover_native_runtime,
     evaluate_circsym_ring_field_kernels,
+    evaluate_circsym_ring_field_kernels_batch,
     evaluate_circsym_ring_remainder_kernels,
+    evaluate_circsym_ring_remainder_kernels_batch,
 )
 
 
@@ -237,6 +239,75 @@ def test_circsym_metal_ring_remainder_matches_complex128_cpu_reference(baffle_z)
         "swift_native_metal_circsym_ring_remainder"
     )
     assert result.diagnostics["kernel_mode"] == "remainder"
+
+
+@pytest.mark.parametrize(
+    ("kernel_mode", "evaluate_batch"),
+    [
+        ("field", evaluate_circsym_ring_field_kernels_batch),
+        ("remainder", evaluate_circsym_ring_remainder_kernels_batch),
+    ],
+)
+@pytest.mark.parametrize("baffle_z", [None, -0.075])
+def test_circsym_metal_frequency_batch_matches_variable_order_cpu_reference(
+    kernel_mode,
+    evaluate_batch,
+    baffle_z,
+):
+    status = discover_native_runtime(run_smoke_test=True)
+    if not status.available:
+        pytest.skip(
+            "Swift/Metal native helper unavailable: "
+            + "; ".join(status.unavailable_reasons)
+        )
+    values = _field_fixture()
+    values.pop("cos_psi")
+    values.pop("psi_weights")
+    k_values = np.array([7.0 + 0.01j, 211.0 + 0.35j])
+    rules = tuple(_psi_rule(order) for order in (32, 48))
+    expected = [
+        _reference_ring_field(
+            **values,
+            cos_psi=cos_psi,
+            psi_weights=psi_weights,
+            k=k,
+            baffle_z=baffle_z,
+            kernel_mode=kernel_mode,
+        )
+        for k, (cos_psi, psi_weights) in zip(k_values, rules, strict=True)
+    ]
+    result = evaluate_batch(
+        **values,
+        cos_psi_by_frequency=tuple(item[0] for item in rules),
+        psi_weights_by_frequency=tuple(item[1] for item in rules),
+        k_values=k_values,
+        baffle_z=baffle_z,
+        runtime_status=status,
+    )
+
+    for frequency_index, (expected_slp, expected_dlp) in enumerate(expected):
+        slp_relative = np.linalg.norm(
+            result.slp[frequency_index] - expected_slp
+        ) / np.linalg.norm(expected_slp)
+        dlp_relative = np.linalg.norm(
+            result.dlp[frequency_index] - expected_dlp
+        ) / np.linalg.norm(expected_dlp)
+        # Device-buffer frequency inputs and the extra image accumulation change
+        # FP32 rounding at cancellation-heavy points.  The baffled worst case is
+        # about 6.66e-5, so 8e-5 leaves modest device/compiler headroom while
+        # remaining far below the error caused by a missing or wrong-sign image.
+        tolerance = 8.0e-5 if baffle_z is not None else 6.0e-5
+        assert slp_relative < tolerance
+        assert dlp_relative < tolerance
+    assert result.slp.shape == (2, 4, 3)
+    assert result.diagnostics["frequency_count"] == 2
+    assert result.diagnostics["dispatch_count"] == 1
+    assert result.diagnostics["scalar_equivalent_dispatch_count"] == 2
+    assert result.diagnostics["arithmetic_reduction"] is False
+    assert result.diagnostics["baffle_image"] is (baffle_z is not None)
+    reuse = result.diagnostics["per_invocation_batch_reuse"]
+    assert reuse["geometry_buffers"] is True
+    assert reuse["cross_invocation_persistence"] is False
 
 
 def test_circsym_metal_operation_can_be_cancelled_inside_kernel_case():

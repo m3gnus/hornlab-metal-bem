@@ -43,9 +43,27 @@ def test_parse_args_defaults_to_original_qualification_gate(tmp_path):
         ]
     )
 
+    assert args.axisym_backend == "cpu"
     assert args.cpu_field == "numba"
     assert args.azimuth_min == 64
     assert args.qualification_ratio == 0.5
+
+
+def test_overall_qualification_requires_compact_cpu_parity():
+    common = {
+        "speed_ratio": True,
+        "half_second": True,
+        "numerical_gate": True,
+    }
+
+    assert benchmark._passes_overall_qualification(
+        **common,
+        compact_cpu_parity=True,
+    )
+    assert not benchmark._passes_overall_qualification(
+        **common,
+        compact_cpu_parity=False,
+    )
 
 
 def test_matched_input_validation_rejects_wrong_quarter_extent():
