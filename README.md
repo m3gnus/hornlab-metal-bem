@@ -74,9 +74,13 @@ python scripts/bench_axisymmetric_vs_quarter.py \
 
 The comparison excludes mesh generation from both arms, runs one excluded
 warm-up per solver, alternates paired warm runs, and requires speed, compact-CPU
-parity, and cross-solver physics gates for overall qualification. It also
-normalizes source velocity for equal physical volume velocity and reports
-frequency-local errors. The JSON records tagged quarter-to-meridian geometric
+parity, aggregate cross-solver physics gates, and the same physics budgets at
+every requested frequency for overall qualification. It also normalizes source
+velocity for equal physical volume velocity and reports frequency-local errors.
+Directivity retains the historical intersection-mask metric and additionally
+reports a fixed-reference mask plus mask-membership coverage, so a disappearing
+or displaced lobe cannot be hidden by the candidate mask. The JSON records
+tagged quarter-to-meridian geometric
 distance at both the solved coarse panels and an 8x finer same-config generating
 curve; these are scale-aware discretization diagnostics, not a blanket geometry
 rejection. The shared flat mouth-closure contract remains a separate strict
@@ -92,6 +96,15 @@ coarse timing to characterize it. The Numba CPU field implementation is the port
 default; `--cpu-field numpy` remains available for diagnosis. Changing azimuth
 order must be judged against the harness's unchanged 64-point CircSym reference,
 not from timing alone.
+
+Optional unrestricted full-domain controls are diagnostic-only and never relax
+or replace the qualification gates. Use `--reflect-quarter-to-full` to isolate
+native symmetry, seams, and source normalization on exactly reflected
+triangles; `--full-mesh path.msh` for one independently generated full mesh; or
+`--full-mesh-ladder coarse.msh,...,fine.msh` for consecutive and finest-rung
+convergence comparisons. Full meshes are always solved without native symmetry,
+and the report records their hashes, geometry checks, source scaling, P1 DOF
+counts, and timings.
 
 For a separate resonance diagnostic, supply points known to lie in the excluded
 solid interior enclosed by the exterior boundary—typically wall material, never

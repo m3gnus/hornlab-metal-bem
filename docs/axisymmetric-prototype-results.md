@@ -22,7 +22,9 @@ Qualification requires all of the following:
 - Metal Axisymmetric output matching the compact CPU implementation.
 - Axisymmetric versus quarter-3D errors below 2% complex-pressure relative L2,
   0.5 dB directivity above -40 dB, and 5 degrees RMS phase above the amplitude
-  floor.
+  floor, both in aggregate and at every requested frequency. The per-frequency
+  directivity gate uses a fixed reference mask; the historical intersection-mask
+  metric remains in the report for continuity.
 
 The harness requires every gate for overall approval. Passing speed alone never
 enables the product path.
@@ -50,8 +52,10 @@ enables the product path.
 - The benchmark records release/debug helper flavor, runs a helper smoke test,
   reports per-frequency errors, significant-field/null-region phase diagnostics,
   equal-volume source normalization, geometry provenance, and compact-CPU
-  parity. Fixed-geometry meridian subdivision supports 53/106/212/424-style
-  convergence ladders without changing the represented profile.
+  parity. It now also supports exact-reflected, independent-full, and ordered
+  full-mesh-ladder controls without changing the activation gate. Fixed-geometry
+  meridian subdivision supports 53/106/212/424-style convergence ladders without
+  changing the represented profile.
 - The paired real-k+CHIEF and complex-k shift-ladder experiment is diagnostic
   only. Thin-wall CHIEF points triggered near-boundary warnings and degraded the
   result; complex-k shifts 0.001 and 0.005 did not improve it.
@@ -123,6 +127,65 @@ reference has not yet been established or shown feasible. Therefore the current
 decision is **not** that the Axisymmetric speed path fails. The infrastructure
 and positive geometry/harness changes are retained, while Axisymmetric UI/AUTO
 routing remains disabled pending a converged high-frequency reference.
+
+### Unrestricted full-3D controls at 20 kHz
+
+An exact four-image reflection of the 1,208-triangle quarter mesh was solved as
+an ordinary unrestricted 4,832-triangle full-domain P1 system. Across five
+frequencies from 100 Hz to 20 kHz, quarter-versus-full agreement remained far
+inside the numerical budgets. At 20 kHz it was 0.000678% complex-pressure L2,
+0.00327 dB fixed-reference-mask directivity, and 0.00792 degrees phase RMS. This
+clears native symmetry, seam handling, and equal-volume source normalization as
+material causes of the discrepancy.
+
+Separately generated full meshes were then tested as an ordered 4,830 / 9,124 /
+17,974-triangle ladder. The corresponding P1 systems have 2,417 / 4,564 / 8,989
+unknowns; the finest primary complex128 matrix is about 1.20 GiB before solver
+workspace. At 20 kHz, the middle full rung still differs from the finest full
+rung by 2.42% pressure, 1.45 dB directivity, and 29.88 degrees phase. The full
+ladder therefore fails convergence and the finest rung cannot be called ground
+truth.
+
+The matching finest quarter and independently remeshed full meshes nevertheless
+agree to 0.292% pressure, 0.391 dB directivity, and 2.58 degrees phase at 20 kHz.
+Against that same full result, Axisymmetric differs by 6.55% pressure, 9.05 dB
+directivity, and 70.59 degrees phase. This is useful corroboration that the
+Axisymmetric upper-band difference is real on the tested discretizations, but it
+does not supersede the failed full-mesh convergence check. The finest full mesh's
+worst edge is 21.69 mm, only 0.79 elements per 17.15 mm wavelength at 20 kHz.
+
+### Geometry and azimuth convergence
+
+The earlier 208/416/832 ladder subdivides the original straight meridian chords.
+It tests panel/integration convergence on frozen faceted geometry, not convergence
+to the configured R-OSSE profile. A separate regenerated-geometry experiment at
+20 kHz changed by 6.00% pressure, 18.93 dB directivity, and 66.60 degrees phase
+between 102 and 396 meridian segments. The 396-to-791 change fell to 0.331%,
+2.225 dB, and 12.44 degrees, respectively. Geometry/panelization is therefore a
+dominant upper-band error source, and even the 791-segment rung remains outside
+the directivity and phase budgets.
+
+The actual azimuth rule selects 235 samples at 20 kHz, so the old floor-32 versus
+floor-64 check did not exercise upper-band quadrature. On regenerated 102-segment
+geometry, forcing 256, 512, and 1,024 samples changed pressure by at most
+1.04e-12 relative and directivity by at most 4.45e-10 dB between adjacent tested
+rungs. The 256 floor is converged for this case; 512 and 1,024 only add cost.
+
+### Cyclic full-3D reference prototype
+
+A validation-only cyclic P1 `m=0` reduction now revolves a meridian into an exact
+rotational mesh, sums full-matrix column orbits into representative rows, and
+reconstructs the ordinary full-3D pressure. Against actually assembled corrected
+full matrices at 20 kHz, reduced/full solution relative L2 was 2.17e-5 to 2.74e-5
+for 8--32 sectors. This proves the discrete reduction contract independently of
+the current midpoint-collocation Axisymmetric formulation.
+
+The prototype still materializes the full dense matrix. Scaling it into a useful
+upper-band reference requires one orbit-aware native operation covering both the
+regular kernel and the singular/adjacent Duffy corrections. Implementing only
+representative regular rows would silently omit corrections and is intentionally
+not retained as a solve route. The detailed contract is in
+`docs/cyclic-m0-reference-prototype.md`.
 
 ### Axisymmetric self-convergence
 

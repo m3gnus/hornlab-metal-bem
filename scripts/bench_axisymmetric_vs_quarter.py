@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import argparse
 import copy
+from collections import Counter
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import platform
 import statistics
@@ -28,6 +30,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 TAG_SOURCE = 2
+_DIRECTIVITY_DB_FLOOR = -300.0
 # This is deliberately much tighter than the older extent checks.  It measures
 # the actual revolved surface represented by the quarter mesh, tag by tag,
 # rather than only comparing its bounding box.  0.1 mm leaves a practical
@@ -92,10 +95,48 @@ def _complex_k_shifts(value: str) -> tuple[float, ...]:
     return shifts
 
 
+def _full_mesh_ladder(value: str) -> tuple[Path, ...]:
+    """Parse caller-ordered external full meshes from coarse to fine."""
+    paths = tuple(Path(item.strip()) for item in value.split(",") if item.strip())
+    if len(paths) < 2:
+        raise argparse.ArgumentTypeError(
+            "must contain at least two comma-separated full mesh paths"
+        )
+    if len({path.resolve() for path in paths}) != len(paths):
+        raise argparse.ArgumentTypeError("must not contain duplicate full mesh paths")
+    return paths
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--quarter-mesh", type=Path, required=True)
+    full_mesh_group = parser.add_mutually_exclusive_group()
+    full_mesh_group.add_argument(
+        "--full-mesh",
+        type=Path,
+        help=(
+            "optional unsymmetrized full-domain 3-D mesh; runs a diagnostic-only "
+            "Axisym/quarter/full comparison without changing qualification gates"
+        ),
+    )
+    full_mesh_group.add_argument(
+        "--full-mesh-ladder",
+        type=_full_mesh_ladder,
+        metavar="COARSE.msh,...,FINE.msh",
+        help=(
+            "caller-ordered external full-domain meshes, coarse to fine; reports "
+            "consecutive and finest-rung diagnostics only"
+        ),
+    )
+    full_mesh_group.add_argument(
+        "--reflect-quarter-to-full",
+        action="store_true",
+        help=(
+            "diagnostically expand --quarter-mesh through exact X/Y reflections "
+            "and solve it with no native symmetry; mutually exclusive with --full-mesh"
+        ),
+    )
     parser.add_argument("--f1", type=_positive_float, default=100.0)
     parser.add_argument("--f2", type=_positive_float, default=20_000.0)
     parser.add_argument("--frequencies", type=_positive_int, default=40)
@@ -200,9 +241,15 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return _jsonable(value.tolist())
     if isinstance(value, np.generic):
-        return value.item()
+        return _jsonable(value.item())
     if isinstance(value, complex):
+        if not math.isfinite(value.real) or not math.isfinite(value.imag):
+            raise ValueError("refusing to serialize non-finite complex result")
         return {"real": value.real, "imaginary": value.imag}
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("refusing to serialize non-finite floating-point result")
+        return value
     return value
 
 
@@ -281,7 +328,53 @@ def _high_resolution_generating_curve_config(raw_config: dict[str, Any]) -> dict
     return config
 
 
-def _build_inputs(config_path: Path, quarter_mesh_path: Path, angle_count: int):
+def _expanded_full_mesh_from_quarter(quarter: Any) -> tuple[Any, dict[str, Any]]:
+    """Build an unsymmetrized full mesh from exactly the quarter triangles.
+
+    This is intentionally a diagnostic control, distinct from a separately
+    remeshed ``--full-mesh`` input: it isolates native-symmetry, seam, and
+    source-normalisation differences without introducing meshing variation.
+    """
+    from hornlab_metal_bem import LoadedMesh, MeshInfo
+    from hornlab_metal_bem.mesh import make_pure_grid
+    from hornlab_metal_bem.validation.native_symmetry import expand_quarter_mesh_xy
+
+    vertices = np.asarray(quarter.grid.vertices, dtype=np.float64).T
+    triangles = np.asarray(quarter.grid.elements, dtype=np.int64).T
+    tags = np.asarray(quarter.physical_tags, dtype=np.int32).reshape(-1)
+    expanded = expand_quarter_mesh_xy(vertices, triangles, tags)
+    expanded_vertices = expanded.vertices_nx3
+    full = LoadedMesh(
+        grid=make_pure_grid(expanded_vertices, expanded.triangles_nx3),
+        physical_tags=expanded.physical_tags,
+        info=MeshInfo(
+            n_vertices=int(expanded_vertices.shape[0]),
+            n_triangles=int(expanded.triangles_nx3.shape[0]),
+            physical_groups=dict(quarter.info.physical_groups),
+            bounding_box_m=(
+                np.min(expanded_vertices, axis=0),
+                np.max(expanded_vertices, axis=0),
+            ),
+        ),
+        coupled_ib_aperture_tag=quarter.coupled_ib_aperture_tag,
+    )
+    return full, {
+        "source": "exact_xy_reflection_of_quarter_mesh",
+        "quarter_triangles": int(quarter.info.n_triangles),
+        "full_triangles": int(full.info.n_triangles),
+        "triangle_image_count": 4,
+        "native_symmetry_plane": None,
+    }
+
+
+def _build_inputs(
+    config_path: Path,
+    quarter_mesh_path: Path,
+    angle_count: int,
+    full_mesh_path: Path | None = None,
+    reflect_quarter_to_full: bool = False,
+    full_mesh_ladder_paths: tuple[Path, ...] | None = None,
+):
     import hornlab_mesher as hm
 
     import hornlab_metal_bem as mb
@@ -298,6 +391,35 @@ def _build_inputs(config_path: Path, quarter_mesh_path: Path, angle_count: int):
         scale=1.0,
         native_symmetry_plane="yz+xz",
     )
+    full: Any | None = None
+    full_provenance: dict[str, Any] | None = None
+    full_meshes: list[tuple[Any, dict[str, Any]]] = []
+    if full_mesh_ladder_paths is not None:
+        for rung, path in enumerate(full_mesh_ladder_paths):
+            loaded = mb.load_mesh(path, scale=1.0, native_symmetry_plane=None)
+            full_meshes.append(
+                (
+                    loaded,
+                    {
+                        "source": "caller_supplied_full_mesh_ladder",
+                        "path": str(path.resolve()),
+                        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                        "ladder_rung": rung,
+                        "native_symmetry_plane": None,
+                    },
+                )
+            )
+        full, full_provenance = full_meshes[0]
+    elif full_mesh_path is not None:
+        full = mb.load_mesh(full_mesh_path, scale=1.0, native_symmetry_plane=None)
+        full_provenance = {
+            "source": "caller_supplied_full_mesh",
+            "path": str(full_mesh_path.resolve()),
+            "sha256": hashlib.sha256(full_mesh_path.read_bytes()).hexdigest(),
+            "native_symmetry_plane": None,
+        }
+    elif reflect_quarter_to_full:
+        full, full_provenance = _expanded_full_mesh_from_quarter(quarter)
     geometry_distance = _validate_matched_inputs(
         raw_config,
         meridian,
@@ -308,8 +430,26 @@ def _build_inputs(config_path: Path, quarter_mesh_path: Path, angle_count: int):
     geometry_distance["generating_curve_reference_refinement"] = (
         _GENERATING_CURVE_REFERENCE_REFINEMENT
     )
+    full_geometry_distance = None
+    full_geometry_distances: list[dict[str, Any]] = []
+    meshes_to_validate = full_meshes or (
+        [(full, full_provenance)] if full is not None else []
+    )
+    for full_candidate, _ in meshes_to_validate:
+        full_geometry_distances.append(_validate_full_matched_input(
+            raw_config,
+            meridian,
+            full_candidate,
+            generating_curve_reference=reference_meridian,
+        ))
+    if full_geometry_distances:
+        full_geometry_distance = full_geometry_distances[0]
     meridian_source_area, quarter_source_area = _source_areas(meridian, quarter)
     quarter_velocity_scale = meridian_source_area / quarter_source_area
+    full_source_area = _full_source_area(full) if full is not None else None
+    full_velocity_scale = (
+        meridian_source_area / full_source_area if full_source_area is not None else None
+    )
     frame = mb.ObservationFrame(
         axis=np.array([0.0, 0.0, 1.0]),
         origin=np.zeros(3),
@@ -345,7 +485,58 @@ def _build_inputs(config_path: Path, quarter_mesh_path: Path, angle_count: int):
         metal_native_assembly_mode="corrected",
         dense_solve_implementation="cgetrf_cgetrs",
     )
-    return meridian, quarter, axisym_config, quarter_config, geometry_distance
+    full_config = (
+        mb.SolveConfig(
+            **{
+                **common,
+                "velocity_sources": {TAG_SOURCE: full_velocity_scale},
+            },
+            mesh_scale=1.0,
+            # An explicitly full mesh must be solved directly.  Do not infer
+            # a symmetry plane from its appearance or its file name.
+            native_symmetry_plane=None,
+            metal_native_assembly_mode="corrected",
+            dense_solve_implementation="cgetrf_cgetrs",
+        )
+        if full is not None
+        else None
+    )
+    full_mesh_ladder = None
+    if full_meshes:
+        full_mesh_ladder = []
+        for (full_candidate, provenance), geometry_distance_candidate in zip(
+            full_meshes, full_geometry_distances, strict=True
+        ):
+            source_area = _full_source_area(full_candidate)
+            velocity_scale = meridian_source_area / source_area
+            config = replace(
+                full_config,
+                velocity_sources={TAG_SOURCE: velocity_scale},
+            )
+            full_mesh_ladder.append(
+                {
+                    "mesh": full_candidate,
+                    "config": config,
+                    "provenance": provenance,
+                    "source_area_m2": source_area,
+                    "velocity_scale_for_equal_volume_velocity": velocity_scale,
+                    "geometry_contract": geometry_distance_candidate,
+                }
+            )
+    return (
+        meridian,
+        quarter,
+        full,
+        axisym_config,
+        quarter_config,
+        full_config,
+        geometry_distance,
+        full_geometry_distance,
+        full_source_area,
+        full_velocity_scale,
+        full_provenance,
+        full_mesh_ladder,
+    )
 
 
 def _source_areas(meridian: Any, quarter: Any) -> tuple[float, float]:
@@ -369,6 +560,20 @@ def _source_areas(meridian: Any, quarter: Any) -> tuple[float, float]:
         )
     )
     return meridian_source_area, quarter_source_area
+
+
+def _full_source_area(full: Any) -> float:
+    """Return the actual source area of an unsymmetrized full-domain mesh."""
+    vertices = np.asarray(full.grid.vertices, dtype=np.float64).T
+    triangles = np.asarray(full.grid.elements, dtype=np.int64).T
+    corners = vertices[triangles]
+    triangle_areas = 0.5 * np.linalg.norm(
+        np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]),
+        axis=1,
+    )
+    return float(
+        np.sum(triangle_areas[np.asarray(full.physical_tags) == TAG_SOURCE])
+    )
 
 
 def _point_to_segment_distances(
@@ -415,7 +620,7 @@ def _quarter_edge_scale(quarter: Any) -> dict[str, float]:
 
 
 def _meridian_quarter_geometry_distance(meridian: Any, quarter: Any) -> dict[str, Any]:
-    """Measure the quarter surface against its tagged meridian generating curve.
+    """Measure a 3-D surface against its tagged meridian generating curve.
 
     Each quarter-triangle corner is projected to ``(rho, z)`` and compared only
     against meridian segments with the same physical tag.  That catches a
@@ -459,7 +664,7 @@ def _meridian_quarter_geometry_distance(meridian: Any, quarter: Any) -> dict[str
 
     combined = np.concatenate(all_distances)
     return {
-        "method": "tagged_quarter_triangle_corners_projected_to_rho_z",
+        "method": "tagged_3d_triangle_corners_projected_to_rho_z",
         "sample_count": int(combined.size),
         "max_distance_m": float(np.max(combined)),
         "rms_distance_m": float(np.sqrt(np.mean(np.square(combined)))),
@@ -675,16 +880,7 @@ def _validate_matched_inputs(
     generating_curve_reference: Any | None = None,
     generating_curve_reference_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if str(raw_config.get("mode", "")).strip().lower() != "freestanding":
-        raise ValueError("matched benchmark currently requires mode='freestanding'")
-    cross_section = dict(raw_config.get("cross_section") or {})
-    morph = dict(raw_config.get("morph") or {})
-    if not np.isclose(float(cross_section.get("exponent", 2.0)), 2.0) or not np.isclose(
-        float(cross_section.get("aspectRatio", 1.0)), 1.0
-    ):
-        raise ValueError("matched benchmark requires a circular cross section")
-    if not np.isclose(float(morph.get("morphTarget", 0.0)), 0.0):
-        raise ValueError("matched benchmark does not support morphed geometry")
+    _validate_benchmark_geometry_config(raw_config)
 
     meridian_tags = {int(tag) for tag in np.unique(meridian.physical_tags)}
     quarter_tags = {int(tag) for tag in np.unique(quarter.physical_tags)}
@@ -736,6 +932,141 @@ def _validate_matched_inputs(
             f"contract within {_GEOMETRY_DISTANCE_TOLERANCE_M:.6g} m"
         )
     return {"geometry_contract_checked": True, **geometry_distance}
+
+
+def _validate_benchmark_geometry_config(raw_config: dict[str, Any]) -> None:
+    """Validate the shared analytic geometry assumptions of all 3-D arms."""
+    if str(raw_config.get("mode", "")).strip().lower() != "freestanding":
+        raise ValueError("matched benchmark currently requires mode='freestanding'")
+    cross_section = dict(raw_config.get("cross_section") or {})
+    morph = dict(raw_config.get("morph") or {})
+    if not np.isclose(float(cross_section.get("exponent", 2.0)), 2.0) or not np.isclose(
+        float(cross_section.get("aspectRatio", 1.0)), 1.0
+    ):
+        raise ValueError("matched benchmark requires a circular cross section")
+    if not np.isclose(float(morph.get("morphTarget", 0.0)), 0.0):
+        raise ValueError("matched benchmark does not support morphed geometry")
+
+
+def _validate_full_mesh_watertight(full: Any) -> None:
+    """Reject reduced, open, or inconsistently oriented caller full meshes."""
+    triangles = np.asarray(full.grid.elements, dtype=np.int64).T
+    if triangles.ndim != 2 or triangles.shape[1] != 3:
+        raise ValueError("full mesh must contain triangular elements")
+    if triangles.size == 0:
+        raise ValueError("full mesh must contain at least one triangle")
+    if np.any(triangles < 0) or np.any(triangles >= full.grid.vertices.shape[1]):
+        raise ValueError("full mesh contains an out-of-range vertex index")
+    if np.any(
+        (triangles[:, 0] == triangles[:, 1])
+        | (triangles[:, 1] == triangles[:, 2])
+        | (triangles[:, 2] == triangles[:, 0])
+    ):
+        raise ValueError("full mesh contains a degenerate triangle index")
+
+    edge_counts: Counter[tuple[int, int]] = Counter()
+    oriented_edges: dict[tuple[int, int], list[int]] = {}
+    for triangle in triangles:
+        for start, end in (
+            (int(triangle[0]), int(triangle[1])),
+            (int(triangle[1]), int(triangle[2])),
+            (int(triangle[2]), int(triangle[0])),
+        ):
+            edge = (min(start, end), max(start, end))
+            edge_counts[edge] += 1
+            oriented_edges.setdefault(edge, []).append(1 if start < end else -1)
+    nonmanifold = [edge for edge, count in edge_counts.items() if count != 2]
+    if nonmanifold:
+        raise ValueError(
+            "full mesh must be watertight: every undirected edge must occur exactly "
+            f"twice; found {len(nonmanifold)} offending edges (first {nonmanifold[0]})"
+        )
+    inconsistent = [
+        edge for edge, directions in oriented_edges.items() if sum(directions) != 0
+    ]
+    if inconsistent:
+        raise ValueError(
+            "full mesh must have consistently oriented closed faces; shared edge "
+            f"{inconsistent[0]} has matching traversal directions"
+        )
+
+
+def _validate_full_matched_input(
+    raw_config: dict[str, Any],
+    meridian: Any,
+    full: Any,
+    *,
+    generating_curve_reference: Any | None = None,
+) -> dict[str, Any]:
+    """Validate an explicitly full domain without attributing symmetry to it."""
+    _validate_benchmark_geometry_config(raw_config)
+    _validate_full_mesh_watertight(full)
+
+    meridian_tags = {int(tag) for tag in np.unique(meridian.physical_tags)}
+    full_tags = {int(tag) for tag in np.unique(full.physical_tags)}
+    if meridian_tags != {1, TAG_SOURCE} or full_tags != {1, TAG_SOURCE}:
+        raise ValueError(
+            "full comparison requires only rigid-wall tag 1 and source tag 2; "
+            f"got meridian={sorted(meridian_tags)}, full={sorted(full_tags)}"
+        )
+    vertices = np.asarray(full.grid.vertices, dtype=np.float64).T
+    # A caller must not accidentally label a reduced mesh as full. This permits
+    # arbitrary topology but requires the physical revolution to occupy both
+    # sides of both mirror planes in the fixed benchmark coordinate frame.
+    if (
+        np.min(vertices[:, 0]) >= -1.0e-6
+        or np.max(vertices[:, 0]) <= 1.0e-6
+        or np.min(vertices[:, 1]) >= -1.0e-6
+        or np.max(vertices[:, 1]) <= 1.0e-6
+    ):
+        raise ValueError("full mesh must span both X and Y sides of the benchmark frame")
+    meridian_rho_max = float(np.max(meridian.nodes[:, 0]))
+    full_rho_max = float(np.max(np.hypot(vertices[:, 0], vertices[:, 1])))
+    if not np.isclose(full_rho_max, meridian_rho_max, rtol=0.01, atol=1.0e-5):
+        raise ValueError("full mesh radial extent does not match the meridian")
+    if not np.allclose(
+        [np.min(vertices[:, 2]), np.max(vertices[:, 2])],
+        [np.min(meridian.nodes[:, 1]), np.max(meridian.nodes[:, 1])],
+        rtol=0.01,
+        atol=5.0e-4,
+    ):
+        raise ValueError("full mesh axial extent does not match the meridian")
+
+    meridian_source_area = float(
+        np.sum(
+            meridian.segment_geometry().area_weights[
+                np.asarray(meridian.physical_tags) == TAG_SOURCE
+            ]
+        )
+    )
+    full_source_area = _full_source_area(full)
+    if not np.isclose(
+        full_source_area, meridian_source_area, rtol=0.05, atol=1.0e-10
+    ):
+        raise ValueError("full mesh source area does not match the meridian")
+    if generating_curve_reference is None:
+        return {
+            "geometry_contract_checked": False,
+            "coarse_meridian_panel_distance": _meridian_quarter_geometry_distance(
+                meridian, full
+            ),
+        }
+    reference_distance = _meridian_quarter_geometry_distance(
+        generating_curve_reference, full
+    )
+    if reference_distance["max_distance_m"] > _GEOMETRY_DISTANCE_TOLERANCE_M:
+        raise ValueError(
+            "full mesh does not match the high-resolution generating curve within "
+            f"{_GEOMETRY_DISTANCE_TOLERANCE_M:.6g} m"
+        )
+    return {
+        "geometry_contract_checked": True,
+        "coarse_meridian_panel_distance": _meridian_quarter_geometry_distance(
+            meridian, full
+        ),
+        "generating_curve_reference_distance": reference_distance,
+        "full_source_area_m2": full_source_area,
+    }
 
 
 def _subdivide_meridian(meridian: Any, factor: int):
@@ -822,14 +1153,36 @@ def _requested_convergence_ladder_factors(
     return tuple(sorted(set(requested + (candidate_factor,))))
 
 
+def _finite_directivity_db(value: Any, *, label: str) -> np.ndarray:
+    """Return a finite directivity array with a documented deep-null floor.
+
+    A true zero pressure legitimately becomes ``-inf`` dB.  A finite floor
+    keeps its difference observable and the JSON report standards-compliant;
+    NaN and positive infinity instead identify an invalid solve and fail closed.
+    """
+    directivity = np.asarray(value, dtype=np.float64)
+    if np.any(np.isnan(directivity)) or np.any(np.isposinf(directivity)):
+        raise RuntimeError(f"{label} directivity contains NaN or positive infinity")
+    return np.maximum(directivity, _DIRECTIVITY_DB_FLOOR)
+
+
+def _max_directivity_difference(
+    candidate_db: np.ndarray, reference_db: np.ndarray, mask: np.ndarray
+) -> float:
+    """Return a finite masked difference, including an empty-mask convention."""
+    if not np.any(mask):
+        return 0.0
+    return float(np.max(np.abs(candidate_db[mask] - reference_db[mask])))
+
+
 def _accuracy_by_frequency(
     axisym: Any, quarter: Any, frequencies_hz: Any
 ) -> list[dict[str, Any]]:
     """Expose frequency-local errors so a few high-frequency rows cannot hide."""
     axisym_pressure = np.asarray(axisym.pressure_complex, dtype=np.complex128)
     quarter_pressure = np.asarray(quarter.pressure_complex, dtype=np.complex128)
-    axisym_db = np.asarray(axisym.directivity_db, dtype=np.float64)
-    quarter_db = np.asarray(quarter.directivity_db, dtype=np.float64)
+    axisym_db = _finite_directivity_db(axisym.directivity_db, label="candidate")
+    quarter_db = _finite_directivity_db(quarter.directivity_db, label="reference")
     if axisym_pressure.shape != quarter_pressure.shape:
         raise RuntimeError("matched comparison returned different pressure shapes")
     frequencies = np.asarray(frequencies_hz, dtype=np.float64)
@@ -842,7 +1195,14 @@ def _accuracy_by_frequency(
         adb = np.ravel(axisym_db[index])
         qdb = np.ravel(quarter_db[index])
         pressure_scale = max(float(np.linalg.norm(qp)), 1.0e-30)
-        db_mask = (adb >= -40.0) & (qdb >= -40.0)
+        # Keep the historical intersection mask for continuity, but also
+        # report a fixed-reference mask. The intersection can discard a lobe
+        # precisely when the candidate moves or loses it, hiding the error.
+        reference_db_mask = qdb >= -40.0
+        candidate_db_mask = adb >= -40.0
+        db_mask = candidate_db_mask & reference_db_mask
+        union_db_mask = candidate_db_mask | reference_db_mask
+        candidate_only_db_mask = candidate_db_mask & ~reference_db_mask
         amplitude_floor = 1.0e-4 * float(np.max(np.abs(qp)))
         phase_diagnostics = _phase_region_diagnostics(ap, qp, amplitude_floor)
         phase_diagnostics_1e3 = _phase_region_diagnostics(
@@ -858,9 +1218,35 @@ def _accuracy_by_frequency(
                     np.linalg.norm(ap - qp) / pressure_scale
                 ),
                 "directivity_max_abs_db_above_minus_40": float(
-                    np.max(np.abs(adb[db_mask] - qdb[db_mask]))
-                    if np.any(db_mask)
-                    else 0.0
+                    _max_directivity_difference(adb, qdb, db_mask)
+                ),
+                "directivity_max_abs_db_reference_mask_above_minus_40": float(
+                    _max_directivity_difference(adb, qdb, reference_db_mask)
+                ),
+                "directivity_max_abs_db_union_mask_above_minus_40": float(
+                    _max_directivity_difference(adb, qdb, union_db_mask)
+                ),
+                "directivity_reference_mask_sample_count_above_minus_40": int(
+                    np.count_nonzero(reference_db_mask)
+                ),
+                "directivity_candidate_mask_sample_count_above_minus_40": int(
+                    np.count_nonzero(candidate_db_mask)
+                ),
+                "directivity_intersection_mask_sample_count_above_minus_40": int(
+                    np.count_nonzero(db_mask)
+                ),
+                "directivity_union_mask_sample_count_above_minus_40": int(
+                    np.count_nonzero(union_db_mask)
+                ),
+                "directivity_candidate_only_mask_sample_count_above_minus_40": int(
+                    np.count_nonzero(candidate_only_db_mask)
+                ),
+                "directivity_candidate_only_max_abs_db_above_minus_40": float(
+                    _max_directivity_difference(adb, qdb, candidate_only_db_mask)
+                ),
+                "directivity_reference_mask_coverage_by_candidate": float(
+                    np.count_nonzero(db_mask)
+                    / max(np.count_nonzero(reference_db_mask), 1)
                 ),
                 # This field is the official qualification metric.  Keep its
                 # name and reference-only -80 dB mask stable; the following
@@ -954,12 +1340,20 @@ def _accuracy(axisym: Any, quarter: Any) -> dict[str, float]:
         np.linalg.norm(np.abs(axisym_pressure) - np.abs(quarter_pressure))
         / magnitude_scale
     )
-    axisym_db = np.asarray(axisym.directivity_db, dtype=np.float64)
-    quarter_db = np.asarray(quarter.directivity_db, dtype=np.float64)
+    axisym_db = _finite_directivity_db(axisym.directivity_db, label="candidate")
+    quarter_db = _finite_directivity_db(quarter.directivity_db, label="reference")
+    if axisym_db.shape != quarter_db.shape:
+        raise RuntimeError(
+            "matched comparison returned different directivity shapes: "
+            f"{axisym_db.shape} versus {quarter_db.shape}"
+        )
     directivity_max_abs_db = float(np.max(np.abs(axisym_db - quarter_db)))
     directivity_mask = (axisym_db >= -40.0) & (quarter_db >= -40.0)
-    directivity_max_abs_db_above_minus_40 = float(
-        np.max(np.abs(axisym_db[directivity_mask] - quarter_db[directivity_mask]))
+    reference_mask = quarter_db >= -40.0
+    candidate_mask = axisym_db >= -40.0
+    union_mask = candidate_mask | reference_mask
+    directivity_max_abs_db_above_minus_40 = _max_directivity_difference(
+        axisym_db, quarter_db, directivity_mask
     )
     phase_diagnostics = _phase_region_diagnostics(
         axisym_pressure,
@@ -973,6 +1367,12 @@ def _accuracy(axisym: Any, quarter: Any) -> dict[str, float]:
         "directivity_max_abs_db": directivity_max_abs_db,
         "directivity_max_abs_db_above_minus_40": (
             directivity_max_abs_db_above_minus_40
+        ),
+        "directivity_max_abs_db_reference_mask_above_minus_40": (
+            _max_directivity_difference(axisym_db, quarter_db, reference_mask)
+        ),
+        "directivity_max_abs_db_union_mask_above_minus_40": (
+            _max_directivity_difference(axisym_db, quarter_db, union_mask)
         ),
         "phase_rms_degrees_above_floor": phase_rms_deg,
     }
@@ -1061,8 +1461,89 @@ def _passes_overall_qualification(
     half_second: bool,
     compact_cpu_parity: bool,
     numerical_gate: bool,
+    per_frequency_numerical_gate: bool,
 ) -> bool:
-    return speed_ratio and half_second and compact_cpu_parity and numerical_gate
+    return (
+        speed_ratio
+        and half_second
+        and compact_cpu_parity
+        and numerical_gate
+        and per_frequency_numerical_gate
+    )
+
+
+def _per_frequency_numerical_gate(
+    rows: list[dict[str, Any]], numerical_gate: dict[str, float]
+) -> dict[str, Any]:
+    """Apply existing budgets to every requested frequency independently.
+
+    This is deliberately additive to the historical aggregate L2 gate. It
+    makes the unresolved upper band visible instead of allowing a low-energy
+    failing row to be diluted by all other frequencies.
+    """
+    failures: list[dict[str, Any]] = []
+    for row in rows:
+        checks = {
+            "pressure_relative_l2": (
+                row["pressure_relative_l2"]
+                <= numerical_gate["max_pressure_relative_l2"]
+            ),
+            "directivity_reference_mask": (
+                row["directivity_max_abs_db_reference_mask_above_minus_40"]
+                <= numerical_gate["max_directivity_error_db_above_minus_40"]
+            ),
+            # Keep the legacy overlap check visible, retain the fixed-reference
+            # check, and add a union check.  The union catches a new candidate
+            # lobe that the fixed-reference mask cannot see.
+            "directivity_legacy_intersection_mask": (
+                row["directivity_max_abs_db_above_minus_40"]
+                <= numerical_gate["max_directivity_error_db_above_minus_40"]
+            ),
+            "directivity_union_mask": (
+                row["directivity_max_abs_db_union_mask_above_minus_40"]
+                <= numerical_gate["max_directivity_error_db_above_minus_40"]
+            ),
+            "phase_rms_degrees": (
+                row["phase_rms_degrees_above_floor"]
+                <= numerical_gate["max_phase_rms_degrees_above_floor"]
+            ),
+        }
+        if not all(checks.values()):
+            failures.append(
+                {
+                    "frequency_hz": row["frequency_hz"],
+                    "failed_checks": [name for name, passed in checks.items() if not passed],
+                    "metrics": {
+                        "pressure_relative_l2": row["pressure_relative_l2"],
+                        "directivity_max_abs_db_reference_mask_above_minus_40": (
+                            row[
+                                "directivity_max_abs_db_reference_mask_above_minus_40"
+                            ]
+                        ),
+                        "directivity_max_abs_db_above_minus_40": row[
+                            "directivity_max_abs_db_above_minus_40"
+                        ],
+                        "directivity_max_abs_db_union_mask_above_minus_40": row[
+                            "directivity_max_abs_db_union_mask_above_minus_40"
+                        ],
+                        "phase_rms_degrees_above_floor": row[
+                            "phase_rms_degrees_above_floor"
+                        ],
+                    },
+                }
+            )
+    return {
+        "all_frequencies_pass": not failures,
+        "frequency_count": len(rows),
+        "failed_frequency_count": len(failures),
+        "failures": failures,
+        "directivity_metrics": [
+            "legacy_intersection_mask_above_minus_40_db",
+            "fixed_reference_mask_above_minus_40_db",
+            "union_mask_above_minus_40_db",
+        ],
+        "qualification_effect": "additive_to_aggregate_gate",
+    }
 
 
 def _run_meridian_convergence_ladder(
@@ -1214,6 +1695,147 @@ def _run_resonance_comparison(
     }
 
 
+def _full_3d_comparison_diagnostics(
+    *,
+    full: Any | None,
+    full_result: Any | None,
+    axisym_result: Any,
+    quarter_result: Any,
+    frequencies: np.ndarray,
+    full_provenance: dict[str, Any] | None,
+    full_source_area: float | None,
+    full_velocity_scale: float | None,
+    full_geometry_distance: dict[str, Any] | None,
+    full_median_seconds: float | None,
+) -> dict[str, Any]:
+    """Report the optional full-domain control without changing any gate."""
+    if full is None or full_result is None:
+        return {
+            "enabled": False,
+            "qualification_effect": "none",
+            "reason": "provide --full-mesh or --reflect-quarter-to-full",
+        }
+    if full_provenance is None or full_source_area is None or full_velocity_scale is None:
+        raise RuntimeError("full-domain comparison is missing input provenance")
+    return {
+        "enabled": True,
+        # This wording is intentionally machine-readable so downstream result
+        # consumers cannot accidentally interpret a full-mesh diagnostic as a
+        # replacement for the established quarter qualification oracle.
+        "qualification_effect": "none",
+        "full_mesh": {
+            **full_provenance,
+            "vertices": int(full.info.n_vertices),
+            "triangles": int(full.info.n_triangles),
+            "source_area_m2": full_source_area,
+            "velocity_scale_for_equal_volume_velocity": full_velocity_scale,
+            "geometry_contract": full_geometry_distance,
+        },
+        "timing": {
+            # Full solves are one diagnostic pass after the paired timed arms,
+            # so this is intentionally not presented as a comparable median.
+            "full_3d_diagnostic_wall_seconds": full_median_seconds,
+            "timing_role": "after_paired_axisymmetric_quarter_qualification_arms",
+        },
+        "quarter_3d_vs_full_3d": _accuracy(quarter_result, full_result),
+        "quarter_3d_vs_full_3d_by_frequency": _accuracy_by_frequency(
+            quarter_result, full_result, frequencies
+        ),
+        "axisymmetric_vs_full_3d": _accuracy(axisym_result, full_result),
+        "axisymmetric_vs_full_3d_by_frequency": _accuracy_by_frequency(
+            axisym_result, full_result, frequencies
+        ),
+    }
+
+
+def _run_full_mesh_convergence_ladder(
+    *,
+    rungs: list[dict[str, Any]] | None,
+    candidate_result: Any | None,
+    axisym_result: Any,
+    quarter_result: Any,
+    frequencies: np.ndarray,
+    solve: Callable[[Any, np.ndarray, Any], Any],
+) -> dict[str, Any]:
+    """Compare caller-ordered independently remeshed full-domain rungs.
+
+    The caller explicitly declares order with ``--full-mesh-ladder``.  We do
+    not infer refinement from triangle count: local sizing and topology can
+    make that unsafe.  This remains evidence about the full reference only;
+    it never changes the Axisym qualification predicate.
+    """
+    if rungs is None:
+        return {
+            "enabled": False,
+            "qualification_effect": "none",
+            "reason": "request --full-mesh-ladder with caller-ordered coarse-to-fine meshes",
+        }
+    if candidate_result is None:
+        raise RuntimeError("full mesh ladder requires its first rung result")
+    if len(rungs) < 2:
+        raise RuntimeError("full mesh ladder requires at least two rungs")
+    results = [candidate_result]
+    timing_records: list[dict[str, Any] | None] = [None]
+    for rung in rungs[1:]:
+        result, timing = _timed(
+            lambda rung=rung: solve(rung["mesh"], frequencies, rung["config"])
+        )
+        results.append(result)
+        timing_records.append(timing)
+    finest = results[-1]
+    rows: list[dict[str, Any]] = []
+    for index, (rung, result, timing) in enumerate(
+        zip(rungs, results, timing_records, strict=True)
+    ):
+        mesh = rung["mesh"]
+        row = {
+            "rung": index,
+            "mesh": {
+                **rung["provenance"],
+                "vertices": int(mesh.info.n_vertices),
+                "triangles": int(mesh.info.n_triangles),
+                "source_area_m2": rung["source_area_m2"],
+                "velocity_scale_for_equal_volume_velocity": rung[
+                    "velocity_scale_for_equal_volume_velocity"
+                ],
+                "geometry_contract": rung["geometry_contract"],
+            },
+            "additional_timing": timing,
+            "full_3d_vs_finest_full_3d": _accuracy(result, finest),
+            "full_3d_vs_finest_full_3d_by_frequency": _accuracy_by_frequency(
+                result, finest, frequencies
+            ),
+        }
+        if index == 0:
+            row["full_3d_vs_previous_full_3d"] = None
+            row["full_3d_vs_previous_full_3d_by_frequency"] = None
+        else:
+            previous = results[index - 1]
+            # The finer rung is always the reference, matching the
+            # coarse-to-fine caller contract and the per-frequency masks.
+            row["full_3d_vs_previous_full_3d"] = _accuracy(previous, result)
+            row["full_3d_vs_previous_full_3d_by_frequency"] = _accuracy_by_frequency(
+                previous, result, frequencies
+            )
+        rows.append(row)
+    return {
+        "enabled": True,
+        "qualification_effect": "none",
+        "ordering": "caller_supplied_coarse_to_fine",
+        "reference_rung": len(rungs) - 1,
+        "timed_candidate_rung": 0,
+        "axisymmetric_vs_finest_full_3d": _accuracy(axisym_result, finest),
+        "axisymmetric_vs_finest_full_3d_by_frequency": _accuracy_by_frequency(
+            axisym_result, finest, frequencies
+        ),
+        "quarter_3d_vs_finest_full_3d": _accuracy(quarter_result, finest),
+        "quarter_3d_vs_finest_full_3d_by_frequency": _accuracy_by_frequency(
+            quarter_result, finest, frequencies
+        ),
+        "rows": rows,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     chief_points: np.ndarray | None = None
@@ -1230,13 +1852,23 @@ def main(argv: list[str] | None = None) -> int:
     (
         base_meridian,
         quarter,
+        full,
         axisym_config,
         quarter_config,
+        full_config,
         geometry_distance,
+        full_geometry_distance,
+        full_source_area,
+        full_velocity_scale,
+        full_provenance,
+        full_mesh_ladder,
     ) = _build_inputs(
         args.config,
         args.quarter_mesh,
         args.angles,
+        args.full_mesh,
+        args.reflect_quarter_to_full,
+        args.full_mesh_ladder,
     )
     ladder_factors = _requested_convergence_ladder_factors(
         args.meridian_refinement_factors, args.meridian_refinement_factor
@@ -1251,6 +1883,11 @@ def main(argv: list[str] | None = None) -> int:
 
     def quarter_call():
         return mb.solve_frequencies(quarter, frequencies, quarter_config)
+
+    def full_call():
+        if full is None or full_config is None:
+            raise RuntimeError("full-domain solve requested without a full mesh")
+        return mb.solve_frequencies(full, frequencies, full_config)
 
     axisym_warmup, axisym_cold = _timed(axisym_call)
     quarter_warmup, quarter_cold = _timed(quarter_call)
@@ -1270,6 +1907,18 @@ def main(argv: list[str] | None = None) -> int:
 
     axisym_median = _median_wall(records["axisymmetric"])
     quarter_median = _median_wall(records["quarter_3d"])
+    # Full-domain controls are deliberately outside the paired qualification
+    # loop.  A large dense full solve can perturb memory pressure and GPU/CPU
+    # scheduling, making the Axisym/quarter timing ratio incomparable.
+    full_diagnostic_timing: dict[str, Any] | None = None
+    if full is not None:
+        full_result, full_diagnostic_timing = _timed(full_call)
+        last_results["full_3d"] = full_result
+    full_median = (
+        float(full_diagnostic_timing["wall_seconds"])
+        if full_diagnostic_timing is not None
+        else None
+    )
     ratio = axisym_median / quarter_median
     axisym_candidate = last_results["axisymmetric"]
     os.environ["HORNLAB_CIRCSYM_ASSEMBLY_BACKEND"] = "cpu"
@@ -1283,18 +1932,55 @@ def main(argv: list[str] | None = None) -> int:
     cross_solver_difference = _accuracy(
         last_results["axisymmetric"], last_results["quarter_3d"]
     )
+    full_3d_comparison = _full_3d_comparison_diagnostics(
+        full=full,
+        full_result=last_results.get("full_3d"),
+        axisym_result=last_results["axisymmetric"],
+        quarter_result=last_results["quarter_3d"],
+        frequencies=frequencies,
+        full_provenance=full_provenance,
+        full_source_area=full_source_area,
+        full_velocity_scale=full_velocity_scale,
+        full_geometry_distance=full_geometry_distance,
+        full_median_seconds=full_median,
+    )
+    full_3d_convergence_ladder = _run_full_mesh_convergence_ladder(
+        rungs=full_mesh_ladder,
+        candidate_result=last_results.get("full_3d"),
+        axisym_result=last_results["axisymmetric"],
+        quarter_result=last_results["quarter_3d"],
+        frequencies=frequencies,
+        solve=mb.solve_frequencies,
+    )
     numerical_gate = {
         "max_pressure_relative_l2": args.max_pressure_rel_l2,
         "max_directivity_error_db_above_minus_40": args.max_directivity_error_db,
         "max_phase_rms_degrees_above_floor": args.max_phase_rms_deg,
     }
+    cross_solver_difference_by_frequency = _accuracy_by_frequency(
+        last_results["axisymmetric"], last_results["quarter_3d"], frequencies
+    )
     passes_numerical_gate = (
         cross_solver_difference["pressure_relative_l2"] <= args.max_pressure_rel_l2
         and cross_solver_difference["directivity_max_abs_db_above_minus_40"]
         <= args.max_directivity_error_db
+        and cross_solver_difference[
+            "directivity_max_abs_db_reference_mask_above_minus_40"
+        ]
+        <= args.max_directivity_error_db
+        and cross_solver_difference[
+            "directivity_max_abs_db_union_mask_above_minus_40"
+        ]
+        <= args.max_directivity_error_db
         and cross_solver_difference["phase_rms_degrees_above_floor"]
         <= args.max_phase_rms_deg
     )
+    per_frequency_numerical_gate = _per_frequency_numerical_gate(
+        cross_solver_difference_by_frequency, numerical_gate
+    )
+    passes_per_frequency_numerical_gate = per_frequency_numerical_gate[
+        "all_frequencies_pass"
+    ]
     passes_speed_ratio = ratio < args.qualification_ratio
     passes_half_second = axisym_median <= 0.5
     compact_cpu_parity = _axisym_parity(axisym_candidate, compact_cpu_reference)
@@ -1401,6 +2087,15 @@ def main(argv: list[str] | None = None) -> int:
                 quarter_velocity_scale
             ),
             "quarter_meridian_geometry_distance": geometry_distance,
+            "full_mesh": (
+                str(args.full_mesh.resolve()) if args.full_mesh is not None else None
+            ),
+            "full_mesh_ladder": (
+                [str(path.resolve()) for path in args.full_mesh_ladder]
+                if args.full_mesh_ladder is not None
+                else None
+            ),
+            "reflect_quarter_to_full": args.reflect_quarter_to_full,
         },
         "benchmark_provenance": {
             "quarter_3d": {
@@ -1426,11 +2121,13 @@ def main(argv: list[str] | None = None) -> int:
         "warmup_excluded": {
             "axisymmetric": axisym_cold,
             "quarter_3d": quarter_cold,
+            "full_3d": None,
         },
         "runs": records,
         "summary": {
             "axisymmetric_median_seconds": axisym_median,
             "quarter_3d_median_seconds": quarter_median,
+            "full_3d_diagnostic_wall_seconds": full_median,
             "axisymmetric_over_quarter_ratio": ratio,
             "faster_than_quarter": ratio < 1.0,
             "qualification_ratio": args.qualification_ratio,
@@ -1438,18 +2135,21 @@ def main(argv: list[str] | None = None) -> int:
             "passes_half_second_target": passes_half_second,
             "passes_compact_cpu_parity": passes_compact_cpu_parity,
             "passes_numerical_gate": passes_numerical_gate,
+            "passes_per_frequency_numerical_gate": passes_per_frequency_numerical_gate,
             "passes_overall_qualification": _passes_overall_qualification(
                 speed_ratio=passes_speed_ratio,
                 half_second=passes_half_second,
                 compact_cpu_parity=passes_compact_cpu_parity,
                 numerical_gate=passes_numerical_gate,
+                per_frequency_numerical_gate=passes_per_frequency_numerical_gate,
             ),
         },
         "numerical_gate": numerical_gate,
         "cross_solver_difference": cross_solver_difference,
-        "cross_solver_difference_by_frequency": _accuracy_by_frequency(
-            last_results["axisymmetric"], last_results["quarter_3d"], frequencies
-        ),
+        "cross_solver_difference_by_frequency": cross_solver_difference_by_frequency,
+        "per_frequency_numerical_gate": per_frequency_numerical_gate,
+        "full_3d_comparison": full_3d_comparison,
+        "full_3d_convergence_ladder": full_3d_convergence_ladder,
         "meridian_convergence_ladder": meridian_convergence_ladder,
         "resonance_comparison": resonance_comparison,
         "candidate_vs_64_point_axisymmetric": _accuracy(
@@ -1463,7 +2163,7 @@ def main(argv: list[str] | None = None) -> int:
         },
     }
     if args.json:
-        print(json.dumps(_jsonable(payload), indent=2, sort_keys=True))
+        print(json.dumps(_jsonable(payload), indent=2, sort_keys=True, allow_nan=False))
     else:
         summary = payload["summary"]
         print(
