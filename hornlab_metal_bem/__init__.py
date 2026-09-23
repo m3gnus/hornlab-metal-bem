@@ -67,8 +67,8 @@ def native_config(**overrides) -> SolveConfig:
     """Return the supported strict native Metal solve configuration.
 
     Keyword overrides are passed to ``SolveConfig``. The native Metal path
-    supports standard Neumann solves only; unsupported general-solver options
-    are intentionally not exported from this namespace.
+    supports opt-in Burton-Miller exterior Neumann solves as well as the
+    existing standard and complex-k paths.
     """
     values = {
         "metal_native_assembly_mode": "corrected",

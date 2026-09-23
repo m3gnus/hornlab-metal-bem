@@ -111,7 +111,7 @@ class BoundaryLabBackend:
     capabilities: SolverCapabilities = field(
         default_factory=lambda: SolverCapabilities(
             supports_spherical_sampling=True,
-            supports_burton_miller=False,
+            supports_burton_miller=True,
             supports_flat_target_normalization=True,
             supports_channel_resynthesis=True,
             supports_cancellation=True,
@@ -399,12 +399,10 @@ def solve_config_from_boundary_lab(
             radiators=radiators,
         ),
         "velocity_mode": VelocityMode.VELOCITY,
-        # Boundary Lab's Burton-Miller toggle requests fictitious-eigenvalue
-        # robustness. The Metal core has no Burton-Miller operator, but its
-        # complex-wavenumber formulation solves the same non-uniqueness, so map
-        # the intent onto complex_k rather than silently ignoring it.
+        # The explicit Boundary Lab toggle requests the native real-k
+        # Burton-Miller formulation and inherits its capability refusals.
         "formulation": (
-            BIEFormulation.COMPLEX_K
+            BIEFormulation.BURTON_MILLER
             if bool(_first(simulation_config, "use_burton_miller", default=False))
             else BIEFormulation.STANDARD
         ),

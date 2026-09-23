@@ -657,7 +657,7 @@ class SolveConfig:
             if self.impedance_sources or self.impedance_source_callback is not None:
                 raise ValueError("burton_miller requires prescribed-Neumann boundaries; Robin/impedance is unsupported")
             if self.ground_plane is not None or self.circsym_baffle_z is not None:
-                raise ValueError("burton_miller reference supports exterior full/half/quarter symmetry only")
+                raise ValueError("burton_miller supports exterior full/half/quarter symmetry only")
             if self.chief_points is not None:
                 raise ValueError("burton_miller does not compose with CHIEF points")
         if not (

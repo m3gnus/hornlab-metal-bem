@@ -88,10 +88,6 @@ def _build_frequency_grid(config: SolveConfig) -> NDArray[np.float64]:
 
 def should_route_native_metal(config: SolveConfig) -> bool:
     """Return true when the native Metal path can run this config."""
-    if config.formulation == BIEFormulation.BURTON_MILLER:
-        raise AssemblyBackendUnavailable(
-            "burton_miller is reference-only; the native Swift/Metal helper does not implement it"
-        )
     if (
         config.native_symmetry_plane is not None
         and config.native_symmetry_plane not in NATIVE_SYMMETRY_PLANES
@@ -268,10 +264,6 @@ def _k_values_for_native(
     frequencies: NDArray[np.float64],
     config: SolveConfig,
 ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-    if config.formulation == BIEFormulation.BURTON_MILLER:
-        raise AssemblyBackendUnavailable(
-            "burton_miller is reference-only; the native Swift/Metal helper does not implement it"
-        )
     k_real = (
         2.0 * np.pi * frequencies / float(config.speed_of_sound)
     ).astype(np.float32)
@@ -1151,6 +1143,7 @@ def run_sweep_native_metal(
                 k_values,
                 neumann_rows,
                 field_points,
+                formulation=config.formulation,
                 k_imag_f32=k_imag_values,
                 impedance_sources=impedance_sources_arg,
                 batch_id="all_observation_planes",
@@ -1304,6 +1297,7 @@ def run_sweep_native_metal(
                 k_values,
                 neumann_rows,
                 field_points,
+                formulation=config.formulation,
                 k_imag_f32=k_imag_values,
                 impedance_sources=impedance_sources_arg,
                 batch_id="all_observation_planes",
@@ -1713,6 +1707,7 @@ def run_sweep_native_metal_multi_source(
             k_values,
             per_source_neumann[0],
             field_points,
+            formulation=config.formulation,
             k_imag_f32=k_imag_values,
             impedance_sources=impedance_sources_arg,
             batch_id="all_observation_planes",

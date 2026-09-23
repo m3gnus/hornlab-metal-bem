@@ -53,11 +53,17 @@ outward velocity gives `q = +iρωv_n`. `H` uses the weak surface-curl product
 and `−k²(n·n′)` Green term, including reflected curls for half and quarter
 symmetry. `evaluate_burton_miller_exterior()` evaluates `Dp − Sq` at real `k`.
 
-This is a double-precision **reference only**. The Swift/Metal helper does not
-implement BM yet and refuses its formulation explicitly. The config also
+The double-precision reference is a small-mesh numerical oracle. The native
+Swift helper assembles BM into one dense float32 matrix and per-drive RHS,
+using one quadrature decision for S, D, K′, and regularised H in each pair.
+Coincident, adjacent, and reflected image pairs use paired Duffy quadrature;
+near disjoint pairs receive bounded refinement. The helper
+refuses disjoint faces closer than the float32 near limit (centre distance
+below 0.001 times local face scale), where regular Metal quadrature cannot
+be reliably corrected after atomic accumulation. The config still
 refuses coupled infinite-baffle, Robin/impedance, ground-plane and CHIEF
 combinations. CircSym refuses BM. The default remains `standard`; native BM
-assembly and near quadrature are pending.
+is opt-in and evaluates the exterior field with real k.
 
 `solve(mesh, config=None)` and `solve_frequencies(mesh, frequencies_hz,
 config=None)` share the same execution flow:

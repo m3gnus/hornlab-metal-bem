@@ -276,7 +276,7 @@ def run_sweep_circsym(
     by scaled least squares when CHIEF rows are appended.
     """
     if config.formulation == BIEFormulation.BURTON_MILLER:
-        raise ValueError("burton_miller reference supports triangle meshes only; CircSym does not implement it")
+        raise ValueError("burton_miller supports full-3D triangle meshes only; CircSym does not implement it")
     if not isinstance(meridian, MeridianMesh):
         raise TypeError("meridian must be a MeridianMesh")
     if config.return_surface_traces:
@@ -1147,7 +1147,7 @@ def solve_circsym(
     if config is None:
         config = SolveConfig(formulation=BIEFormulation.COMPLEX_K)
     if config.formulation == BIEFormulation.BURTON_MILLER:
-        raise ValueError("burton_miller reference supports triangle meshes only; CircSym does not implement it")
+        raise ValueError("burton_miller supports full-3D triangle meshes only; CircSym does not implement it")
     return run_sweep_circsym(meridian, _build_frequency_grid(config), config)
 
 
@@ -1160,7 +1160,7 @@ def solve_circsym_frequencies(
     if config is None:
         config = SolveConfig(formulation=BIEFormulation.COMPLEX_K)
     if config.formulation == BIEFormulation.BURTON_MILLER:
-        raise ValueError("burton_miller reference supports triangle meshes only; CircSym does not implement it")
+        raise ValueError("burton_miller supports full-3D triangle meshes only; CircSym does not implement it")
     return run_sweep_circsym(
         meridian, np.asarray(frequencies_hz, dtype=np.float64), config
     )

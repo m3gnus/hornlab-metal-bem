@@ -203,8 +203,8 @@ func validateSession(_ manifest: [String: Any]) throws -> [String: Any] {
     }
     if let assemblyScope = manifest["assembly_scope"] as? [String: Any],
        let formulation = assemblyScope["formulation"] as? String,
-       formulation != "standard_neumann" {
-        try fail("assembly_scope.formulation \(formulation) is unsupported by the native helper; burton_miller is reference-only")
+       formulation != "standard_neumann" && formulation != "burton_miller" {
+        try fail("assembly_scope.formulation \(formulation) is unsupported by the native helper")
     }
 
     let mesh = try requireObject(manifest, "mesh")
@@ -4340,6 +4340,124 @@ kernel void assemble_matrix_pair_atomic(
     }
 }
 
+inline float3 bm_surface_curl(
+    device const float *px,
+    device const float *py,
+    device const float *pz,
+    device const int *triangles,
+    device const float *areas,
+    int nTriangles,
+    int tri,
+    int local,
+    int mask
+) {
+    int first = tri_vertex(triangles, nTriangles, tri, (local + 1) % 3);
+    int second = tri_vertex(triangles, nTriangles, tri, (local + 2) % 3);
+    float3 edge = float3(px[second]-px[first], py[second]-py[first], pz[second]-pz[first]);
+    float3 curl = -edge / (2.0f * areas[tri]);
+    int parity = ((mask & 1) != 0) + ((mask & 2) != 0) + ((mask & 4) != 0);
+    return mirror_point(curl, mask) * ((parity & 1) != 0 ? -1.0f : 1.0f);
+}
+
+// Add the BM H matrix and K' RHS directly to the standard D-M/2, S*q
+// buffers. The helper never materializes S, D, K' or H as full operators.
+kernel void assemble_bm_hk_pair_atomic(
+    device atomic_float *aRe [[buffer(0)]],
+    device atomic_float *aIm [[buffer(1)]],
+    device atomic_float *rhsRe [[buffer(2)]],
+    device atomic_float *rhsIm [[buffer(3)]],
+    device const float *px [[buffer(4)]],
+    device const float *py [[buffer(5)]],
+    device const float *pz [[buffer(6)]],
+    device const int *triangles [[buffer(7)]],
+    device const int *p1Local2Global [[buffer(8)]],
+    device const float *normals [[buffer(9)]],
+    device const float *areas [[buffer(10)]],
+    device const float *qRe [[buffer(11)]],
+    device const float *qIm [[buffer(12)]],
+    constant Params &params [[buffer(13)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    int pairCount = params.nTriangles * params.nTriangles;
+    if (gid >= uint(pairCount)) return;
+    int testTri = int(gid) / params.nTriangles;
+    int trialTri = int(gid) - testTri * params.nTriangles;
+    float jac = (2.0f * areas[testTri]) * (2.0f * areas[trialTri]);
+    float3 testNormal = float3(normals[testTri], normals[params.nTriangles+testTri],
+                               normals[2*params.nTriangles+testTri]);
+    float3 sourceNormal = float3(normals[trialTri], normals[params.nTriangles+trialTri],
+                                 normals[2*params.nTriangles+trialTri]);
+    float3 testCurls[3];
+    float3 sourceCurls[3];
+    for (int i=0; i<3; ++i) {
+        testCurls[i] = bm_surface_curl(px,py,pz,triangles,areas,params.nTriangles,testTri,i,0);
+        sourceCurls[i] = bm_surface_curl(px,py,pz,triangles,areas,params.nTriangles,trialTri,i,0);
+    }
+    float2 matrix[9];
+    float2 rhs[3];
+    for (int i=0; i<9; ++i) matrix[i] = float2(0.0f);
+    for (int i=0; i<3; ++i) rhs[i] = float2(0.0f);
+    float3 sourcePoints[6];
+    for (int b=0; b<6; ++b)
+        sourcePoints[b] = point_on_triangle(px,py,pz,triangles,params.nTriangles,
+                                            trialTri,qx[b],qy[b]);
+    for (int a=0; a<6; ++a) {
+        float3 x = point_on_triangle(px,py,pz,triangles,params.nTriangles,testTri,qx[a],qy[a]);
+        float tb[3] = {1.0f-qx[a]-qy[a], qx[a], qy[a]};
+        for (int b=0; b<6; ++b) {
+            float sb[3] = {1.0f-qx[b]-qy[b], qx[b], qy[b]};
+            float weight = qw[a]*qw[b]*jac;
+            for (int mask=0; mask<=7; ++mask) {
+                if (mask != 0 && !has_image_mask(SYMMETRY_PLANE, mask)) continue;
+                if (mask == 0 && testTri == trialTri && a == b) continue;
+                float3 y = mirror_point(sourcePoints[b], mask);
+                float3 delta = y-x;
+                float r2 = dot(delta,delta);
+                if (r2 <= 1.0e-14f) continue;
+                float r = sqrt(r2);
+                float2 g = helmholtz_g(delta,params.k,0.0f)*weight;
+                float2 derivative = c_mul(g,float2(-1.0f/r2,params.k/r));
+                float3 imageNormal = mirror_normal(sourceNormal,mask);
+                float normalProduct = -params.k*params.k*dot(testNormal,imageNormal);
+                float2 kp = derivative*(-dot(delta,testNormal));
+                float2 etaK = float2(-kp.y/params.k,kp.x/params.k);
+                for (int i=0; i<3; ++i) {
+                    rhs[i] += etaK*tb[i];
+                    for (int j=0; j<3; ++j) {
+                        float3 imageCurl = mirror_point(sourceCurls[j],mask);
+                        int parity = ((mask & 1) != 0) + ((mask & 2) != 0)
+                            + ((mask & 4) != 0);
+                        if ((parity & 1) != 0) imageCurl = -imageCurl;
+                        float factor = dot(testCurls[i],imageCurl)
+                            + normalProduct*tb[i]*sb[j];
+                        float2 h = g*factor;
+                        matrix[i*3+j] += float2(h.y/params.k,-h.x/params.k);
+                    }
+                }
+            }
+        }
+    }
+    if (testTri == trialTri) {
+        for (int i=0; i<3; ++i)
+            rhs[i].y += areas[testTri]/(6.0f*params.k);
+    }
+    float rowWeight = symmetry_row_weight();
+    float2 q = float2(qRe[trialTri],qIm[trialTri]);
+    for (int i=0; i<3; ++i) {
+        int row = p1Local2Global[testTri*3+i];
+        float2 value = c_mul(rhs[i],q)*rowWeight;
+        atomic_fetch_add_explicit(&rhsRe[row],value.x,memory_order_relaxed);
+        atomic_fetch_add_explicit(&rhsIm[row],value.y,memory_order_relaxed);
+        for (int j=0; j<3; ++j) {
+            int col = p1Local2Global[trialTri*3+j];
+            int idx = row*params.nDof+col;
+            float2 delta = matrix[i*3+j]*rowWeight;
+            atomic_fetch_add_explicit(&aRe[idx],delta.x,memory_order_relaxed);
+            atomic_fetch_add_explicit(&aIm[idx],delta.y,memory_order_relaxed);
+        }
+    }
+}
+
 kernel void evaluate_field_regular(
     device float *outRe [[buffer(0)]],
     device float *outIm [[buffer(1)]],
@@ -5660,6 +5778,7 @@ struct ResidentMetalPipelines {
     let library: MTLLibrary
     let matrixPipeline: MTLComputePipelineState
     let pairAtomicPipeline: MTLComputePipelineState
+    let bmHKPipeline: MTLComputePipelineState
     let rhsPipeline: MTLComputePipelineState
     let apertureSlpPipeline: MTLComputePipelineState
     let apertureAverageSlpPipeline: MTLComputePipelineState
@@ -5744,6 +5863,11 @@ final class ResidentMetalPipelineCache: @unchecked Sendable {
             name: "assemble_matrix_pair_atomic",
             symmetryPlaneCode: symmetryPlaneCode
         )
+        let bmHKFunction = try residentKernelFunction(
+            library: libraryLoad.library,
+            name: "assemble_bm_hk_pair_atomic",
+            symmetryPlaneCode: symmetryPlaneCode
+        )
         let rhsFunction = try residentKernelFunction(
             library: libraryLoad.library,
             name: "assemble_rhs_source_regular",
@@ -5778,6 +5902,7 @@ final class ResidentMetalPipelineCache: @unchecked Sendable {
             library: libraryLoad.library,
             matrixPipeline: try device.makeComputePipelineState(function: matrixFunction),
             pairAtomicPipeline: try device.makeComputePipelineState(function: pairAtomicFunction),
+            bmHKPipeline: try device.makeComputePipelineState(function: bmHKFunction),
             rhsPipeline: try device.makeComputePipelineState(function: rhsFunction),
             apertureSlpPipeline: try device.makeComputePipelineState(function: apertureSlpFunction),
             apertureAverageSlpPipeline: try device.makeComputePipelineState(function: apertureAverageSlpFunction),
@@ -5828,6 +5953,7 @@ final class ResidentMetalContext {
     let library: MTLLibrary
     let matrixPipeline: MTLComputePipelineState
     let pairAtomicPipeline: MTLComputePipelineState
+    let bmHKPipeline: MTLComputePipelineState
     let rhsPipeline: MTLComputePipelineState
     let apertureSlpPipeline: MTLComputePipelineState
     let apertureAverageSlpPipeline: MTLComputePipelineState
@@ -6013,6 +6139,7 @@ final class ResidentMetalContext {
         self.library = pipelines.library
         self.matrixPipeline = pipelines.matrixPipeline
         self.pairAtomicPipeline = pipelines.pairAtomicPipeline
+        self.bmHKPipeline = pipelines.bmHKPipeline
         self.rhsPipeline = pipelines.rhsPipeline
         self.apertureSlpPipeline = pipelines.apertureSlpPipeline
         self.apertureAverageSlpPipeline = pipelines.apertureAverageSlpPipeline
@@ -6545,6 +6672,62 @@ final class ResidentMetalContext {
                 "regular_assembly_implementation": dispatch.implementation,
                 "matrix": dispatch.matrix,
                 "rhs": dispatch.rhs,
+            ]
+        )
+    }
+
+    func assembleBurtonMillerRegularMetal(
+        neumann: [Complex32], k: Float
+    ) throws -> MetalAssemblyOutput {
+        let slot = try outputSlot(0)
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            try fail("failed to create Burton-Miller command buffer")
+        }
+        commandBuffer.label = "hornlab resident Burton-Miller regular assembly"
+        let base = try encodeRegularAssembly(
+            commandBuffer: commandBuffer, slot: slot, neumann: neumann, k: k
+        )
+        let qRe = try makeBuffer(device, neumann.map { $0.re }, label: "bm_q_re")
+        let qIm = try makeBuffer(device, neumann.map { $0.im }, label: "bm_q_im")
+        var params = MetalKernelParams(
+            nDof: Int32(geom.p1DofCount), nTriangles: Int32(geom.nTriangles),
+            maxInc: Int32(incidence.maxInc), symmetryPlane: geom.symmetryPlaneCode,
+            k: k, kImag: 0, hasRobin: 0
+        )
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            try fail("failed to create Burton-Miller Metal encoder")
+        }
+        encoder.label = "BM H and K' fused pair contribution"
+        encoder.setBuffer(slot.aRe, offset: 0, index: 0)
+        encoder.setBuffer(slot.aIm, offset: 0, index: 1)
+        encoder.setBuffer(slot.rhsRe, offset: 0, index: 2)
+        encoder.setBuffer(slot.rhsIm, offset: 0, index: 3)
+        encoder.setBuffer(px, offset: 0, index: 4)
+        encoder.setBuffer(py, offset: 0, index: 5)
+        encoder.setBuffer(pz, offset: 0, index: 6)
+        encoder.setBuffer(triangles, offset: 0, index: 7)
+        encoder.setBuffer(p1Local2Global, offset: 0, index: 8)
+        encoder.setBuffer(normals, offset: 0, index: 9)
+        encoder.setBuffer(areas, offset: 0, index: 10)
+        encoder.setBuffer(qRe, offset: 0, index: 11)
+        encoder.setBuffer(qIm, offset: 0, index: 12)
+        encoder.setBytes(&params, length: MemoryLayout<MetalKernelParams>.stride, index: 13)
+        let bmDispatch = try dispatch1D(
+            encoder: encoder, pipeline: bmHKPipeline,
+            count: geom.nTriangles*geom.nTriangles, kernel: "bm_hk_pairs"
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error {
+            try fail("resident Metal Burton-Miller assembly failed: \(error)")
+        }
+        return MetalAssemblyOutput(
+            arrays: readAssemblyArrays(slot: slot),
+            dispatch: [
+                "regular_assembly_implementation": base.implementation,
+                "matrix": base.matrix, "rhs": base.rhs,
+                "bm_hk_pairs": bmDispatch,
             ]
         )
     }
@@ -9113,7 +9296,16 @@ func assembleStandardNeumann(
     let aImDesc = try requireObject(outputs, "A_imag_f32")
     let rhsReDesc = try requireObject(outputs, "rhs_real_f32")
     let rhsImDesc = try requireObject(outputs, "rhs_imag_f32")
-    let run = try assembleRegular(geom: geom, neumann: neumann, k: k, kImag: kImag)
+    let formulation = (payload["formulation"] as? String) ?? "standard"
+    let run: AssemblyRun
+    if formulation == "burton_miller" {
+        if kImag != 0 { try fail("burton_miller requires real k") }
+        run = try assembleBurtonMillerMetal(geom: geom, neumann: neumann, k: k)
+    } else if formulation == "standard" {
+        run = try assembleRegular(geom: geom, neumann: neumann, k: k, kImag: kImag)
+    } else {
+        try fail("unsupported native formulation \(formulation)")
+    }
     try writeF32(try descriptorPath(root: geom.root, descriptor: aReDesc), run.arrays.aRe)
     try writeF32(try descriptorPath(root: geom.root, descriptor: aImDesc), run.arrays.aIm)
     try writeF32(try descriptorPath(root: geom.root, descriptor: rhsReDesc), run.arrays.rhsRe)
@@ -9159,6 +9351,9 @@ func assembleStandardNeumann(
         "rhs_real_f32": try requireString(rhsReDesc, "path"),
         "rhs_imag_f32": try requireString(rhsImDesc, "path"),
     ]
+    if formulation == "burton_miller" {
+        result["formulation"] = formulation
+    }
     if let parity = run.parity {
         result["reference_parity"] = parity
     }
@@ -9707,7 +9902,22 @@ func assembleSolveEvaluateStandardNeumannBatch(
     // corrections keep the strictly sequential path: they exist to
     // cross-check the optimized kernels, not to be fast.
     let regularImplementation = try requestedRegularAssemblyImplementation()
-    let pipelineAssembly = (regularImplementation == "entrywise"
+    let hasBurtonMiller = cases.contains { ($0["formulation"] as? String) == "burton_miller" }
+    if hasBurtonMiller && extraSourceCount > 0 {
+        try fail("burton_miller extra_sources is unsupported")
+    }
+    for (index, casePayload) in cases.enumerated() {
+        let formulation = (casePayload["formulation"] as? String) ?? "standard"
+        if formulation != "standard" && formulation != "burton_miller" {
+            try fail("unsupported native formulation \(formulation)")
+        }
+        if formulation == "burton_miller" && (caseKImag[index] != 0
+            || caseRobinBetas[index] != nil || caseApertureTags[index] != nil
+            || chiefPoints != nil) {
+            try fail("burton_miller requires exterior prescribed-Neumann real-k without CHIEF")
+        }
+    }
+    let pipelineAssembly = !hasBurtonMiller && (regularImplementation == "entrywise"
             || regularImplementation == "pair_atomic")
         && (assemblyMode == "optimized"
             || (assemblyMode == "corrected" && duffyMode == "gpu_blocks"))
@@ -9715,7 +9925,7 @@ func assembleSolveEvaluateStandardNeumannBatch(
     // dispatches and the RHS-only correction folds are wired there. The
     // reference/parity/CPU-Duffy debug paths recompute the RHS inside their
     // full-quadrature assembly and stay single-source by contract.
-    if extraSourceCount > 0 && !pipelineAssembly {
+    if extraSourceCount > 0 && !pipelineAssembly && !hasBurtonMiller {
         try fail(
             "extra_sources requires the pipelined optimized/corrected assembly "
                 + "path (entrywise or pair_atomic implementation with gpu_blocks "
@@ -10044,7 +10254,20 @@ func assembleSolveEvaluateStandardNeumannBatch(
         let apertureCoupling: ApertureCoupling?
         let extraRhs: [(re: [Float], im: [Float])]
         let solve: MultiDenseSolveRun
-        if pipelineAssembly && solveConcurrency > 1 {
+        if (casePayload["formulation"] as? String) == "burton_miller" {
+            assembly = try assembleBurtonMillerMetal(
+                geom: geom, neumann: neumann, k: k,
+                residentContext: context
+            )
+            extraRhs = []
+            apertureCoupling = nil
+            solve = try solveDenseForCase(
+                assembly: assembly,
+                extraRhs: extraRhs,
+                apertureCoupling: nil,
+                caseIndex: caseIndex
+            )
+        } else if pipelineAssembly && solveConcurrency > 1 {
             try pumpSubmissions(upTo: caseIndex)
             let solved = try solveResults.wait(caseIndex)
             assembly = solved.assembly

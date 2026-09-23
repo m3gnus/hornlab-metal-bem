@@ -138,17 +138,12 @@ def test_bm_capability_refusals(kwargs, message):
         SolveConfig(formulation=BIEFormulation.BURTON_MILLER, **kwargs)
 
 
-def test_bm_native_and_circsym_refuse_without_fallback():
+def test_bm_native_routes_and_circsym_refuses_without_fallback():
     config = SolveConfig(formulation=BIEFormulation.BURTON_MILLER)
     assert SolveConfig().formulation == BIEFormulation.STANDARD
-    with pytest.raises(AssemblyBackendUnavailable, match="reference-only"):
-        should_route_native_metal(config)
-    with pytest.raises(AssemblyBackendUnavailable, match="reference-only"):
-        _k_values_for_native(np.array([100.]), config)
-    with pytest.raises(ValueError, match="reference-only"):
-        MetalNativeStandardSession.assemble_solve_evaluate_standard_neumann_batch(
-            None, None, None, None, None, formulation="burton_miller",
-        )
+    assert should_route_native_metal(config)
+    k_real, k_imag = _k_values_for_native(np.array([100.]), config)
+    assert k_real[0] > 0 and k_imag[0] == 0
     from hornlab_metal_bem.circsym import solve_circsym, run_sweep_circsym
     with pytest.raises(ValueError, match="CircSym"):
         solve_circsym(None, config)

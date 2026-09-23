@@ -18,7 +18,10 @@ PACKAGE_DIR = ROOT / "hornlab_metal_bem" / "metal" / "native_helper"
 MAIN_SWIFT = PACKAGE_DIR / "Sources" / "HornlabMetalBemNative" / "main.swift"
 RESOURCE_DIR = PACKAGE_DIR / "Sources" / "HornlabMetalBemNative" / "Resources"
 METALLIB = RESOURCE_DIR / "regular_assembly.metallib"
-HELPER_BUILD_INPUTS = (MAIN_SWIFT, PACKAGE_DIR / "Package.swift")
+HELPER_BUILD_INPUTS = (
+    *sorted((PACKAGE_DIR / "Sources" / "HornlabMetalBemNative").glob("*.swift")),
+    PACKAGE_DIR / "Package.swift",
+)
 
 
 def _payload(**values: Any) -> dict[str, Any]:

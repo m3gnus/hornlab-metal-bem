@@ -117,6 +117,7 @@ class AssemblyPayload:
     # operator this op has always assembled; positive damps interior resonances
     # the same way the fused solve batch's `complex_k` formulation does.
     k_imag_f32: float = 0.0
+    formulation: str = "standard"
     schema: str = METAL_STANDARD_SCHEMA
     op: str = "assemble_standard_neumann"
     index_base: int = INDEX_BASE
@@ -130,6 +131,7 @@ class AssemblyPayload:
             "frequency_hz": float(self.frequency_hz),
             "k_real_f32": float(np.float32(self.k_real_f32)),
             "k_imag_f32": float(np.float32(self.k_imag_f32)),
+            **({"formulation": "burton_miller"} if self.formulation == "burton_miller" else {}),
             "index_base": self.index_base,
             "neumann_dp0": {
                 key: descriptor.to_manifest()
@@ -682,10 +684,9 @@ def _validate_geometry_manifest(manifest: dict[str, Any]) -> None:
     scope = manifest.get("assembly_scope")
     if isinstance(scope, dict):
         formulation = scope.get("formulation")
-        if formulation is not None and formulation != "standard_neumann":
+        if formulation is not None and formulation not in {"standard_neumann", "burton_miller"}:
             raise ValueError(
-                f"assembly_scope.formulation {formulation} is unsupported by the native helper; "
-                "burton_miller is reference-only"
+                f"assembly_scope.formulation {formulation} is unsupported by the native helper"
             )
     mesh = _require_descriptor_group(
         manifest.get("mesh"),

@@ -233,11 +233,11 @@ def test_boundary_lab_metadata_angles_match_solved_grid_for_non_divisible_step()
     np.testing.assert_allclose(session.metadata.polar_angle_deg, solved)
 
 
-def test_burton_miller_maps_to_complex_k_formulation():
+def test_burton_miller_maps_to_native_formulation():
     on, _ = solve_config_from_boundary_lab({"use_burton_miller": True})
     off, _ = solve_config_from_boundary_lab({"use_burton_miller": False})
     absent, _ = solve_config_from_boundary_lab({})
-    assert on.formulation == "complex_k"
+    assert on.formulation == "burton_miller"
     assert off.formulation == "standard"
     assert absent.formulation == "standard"
 

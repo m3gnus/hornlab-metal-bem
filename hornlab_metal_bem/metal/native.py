@@ -1004,6 +1004,7 @@ class MetalNativeStandardSession:
         k_real: float,
         neumann_dp0: NDArray[Any],
         *,
+        formulation: str = "standard",
         k_imag: float = 0.0,
         operation_id: str | None = None,
     ) -> Any:
@@ -1033,6 +1034,10 @@ class MetalNativeStandardSession:
         k_imag_value = float(np.float32(k_imag))
         if not np.isfinite(k_imag_value) or k_imag_value < 0.0:
             raise ValueError("k_imag must be finite and non-negative")
+        if formulation not in {"standard", "burton_miller"}:
+            raise ValueError("unsupported native formulation")
+        if formulation == "burton_miller" and k_imag_value != 0.0:
+            raise ValueError("burton_miller requires real k")
         neumann = _require_complex_vector(
             "neumann_dp0",
             neumann_dp0,
@@ -1069,6 +1074,7 @@ class MetalNativeStandardSession:
             frequency_hz=frequency_hz,
             k_real_f32=float(np.float32(k_real)),
             k_imag_f32=k_imag_value,
+            formulation=formulation,
             neumann_dp0=neumann_desc,
             outputs=outputs,
         )
@@ -1080,6 +1086,8 @@ class MetalNativeStandardSession:
             result_path=result_path,
         )
         result = read_json_manifest(result_path)
+        if formulation == "burton_miller" and result.get("formulation") != "burton_miller":
+            raise RuntimeError("native helper did not acknowledge burton_miller formulation")
         _warn_if_zero_image_duffy_pairs(result)
         # Fail loudly rather than silently returning a real-k operator when a
         # shift was requested: an older helper simply ignores the new field, and
@@ -1384,10 +1392,8 @@ class MetalNativeStandardSession:
         helper binary with multi-source support; the per-case ``multi_source``
         acknowledgement fails loudly on a stale binary.
         """
-        if formulation == "burton_miller":
-            raise ValueError(
-                "burton_miller is reference-only; the native Swift/Metal helper does not implement it"
-            )
+        if formulation not in {"standard", "complex_k", "burton_miller"}:
+            raise ValueError("unsupported native formulation")
         from .session import (
             BatchAssemblySolveFieldPayload,
             read_json_manifest,
@@ -1523,6 +1529,15 @@ class MetalNativeStandardSession:
         expect_multi_source = n_extra_sources > 0
         aperture_tag_value = self.geometry_payload.aperture_tag
         expect_coupled_ib = aperture_tag_value is not None
+        if formulation == "burton_miller":
+            if expect_coupled_ib:
+                raise ValueError("burton_miller does not support coupled infinite-baffle solves")
+            if any(expect_robin_per_case):
+                raise ValueError("burton_miller requires prescribed-Neumann boundaries")
+            if any(expect_complex_k_per_case) or chief_points is not None:
+                raise ValueError("burton_miller requires real k and no CHIEF points")
+            if expect_multi_source:
+                raise ValueError("burton_miller extra_neumann_dp0 is unsupported")
 
         points_3xn = _require_observation_points_3xn(observation_points)
         n_obs = int(points_3xn.shape[1])
@@ -1645,6 +1660,7 @@ class MetalNativeStandardSession:
                     "case_id": case_id,
                     "frequency_hz": float(freq),
                     "k_real_f32": float(np.float32(kval)),
+                    **({"formulation": "burton_miller"} if formulation == "burton_miller" else {}),
                     "k_imag_f32": float(np.float32(kimag)),
                     "field_k_real_f32": float(np.float32(kval)),
                     "neumann_dp0": _descriptor_manifests(neumann),
@@ -1717,6 +1733,7 @@ class MetalNativeStandardSession:
                 expect_chief=expect_chief,
                 expect_multi_source=expect_multi_source,
                 expect_coupled_ib=expect_coupled_ib,
+                expect_bm=formulation == "burton_miller",
             )
 
         self._run_native_helper(
@@ -1741,6 +1758,7 @@ class MetalNativeStandardSession:
                 expect_chief=expect_chief,
                 expect_multi_source=expect_multi_source,
                 expect_coupled_ib=expect_coupled_ib,
+                expect_bm=formulation == "burton_miller",
             )
             for idx, case_result in enumerate(case_results)
         ]
@@ -1755,6 +1773,7 @@ class MetalNativeStandardSession:
         expect_chief: bool = False,
         expect_multi_source: bool = False,
         expect_coupled_ib: bool = False,
+        expect_bm: bool = False,
     ) -> Any:
         from .session import DenseSolveFieldResult, ExtraSourceSolveResult
 
@@ -1765,6 +1784,8 @@ class MetalNativeStandardSession:
             case_result,
             batch_diagnostics=batch_diagnostics,
         )
+        if expect_bm and diagnostics.get("assembly_mode") != "burton_miller":
+            raise RuntimeError("native helper did not acknowledge burton_miller formulation")
         _warn_if_zero_image_duffy_pairs(case_result)
         if expect_complex_k and diagnostics.get("complex_k") is not True:
             raise RuntimeError(
@@ -1909,6 +1930,7 @@ class MetalNativeStandardSession:
         expect_chief: bool = False,
         expect_multi_source: bool = False,
         expect_coupled_ib: bool = False,
+        expect_bm: bool = False,
     ) -> list[Any]:
         """Run one batch helper invocation, firing callbacks per case.
 
@@ -1944,6 +1966,7 @@ class MetalNativeStandardSession:
                     expect_chief=expect_chief,
                     expect_multi_source=expect_multi_source,
                     expect_coupled_ib=expect_coupled_ib,
+                    expect_bm=expect_bm,
                 )
                 solved_fields.append(solved)
                 if on_case_result(len(solved_fields) - 1, solved) is False:
@@ -1978,6 +2001,7 @@ class MetalNativeStandardSession:
                 expect_chief=expect_chief,
                 expect_multi_source=expect_multi_source,
                 expect_coupled_ib=expect_coupled_ib,
+                expect_bm=expect_bm,
             )
             solved_fields.append(solved)
             if on_case_result(index, solved) is False:
