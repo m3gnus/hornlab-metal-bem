@@ -327,7 +327,7 @@ def test_impedance_source_callback_skips_unknown_mesh_tag():
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
-        ({"formulation": "burton_miller"}, "formulation"),
+        ({"formulation": "unknown"}, "formulation"),
         ({"complex_k_shift": -0.1}, "complex_k_shift"),
         ({"impedance_sources": {-1: 0.05 + 0.0j}}, "impedance_sources"),
         ({"impedance_sources": {True: 0.05 + 0.0j}}, "impedance_sources"),

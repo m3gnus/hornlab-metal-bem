@@ -92,6 +92,7 @@ SourceProfile = (
 class BIEFormulation:
     STANDARD = "standard"
     COMPLEX_K = "complex_k"
+    BURTON_MILLER = "burton_miller"
 
 
 NativeSymmetryPlane = Literal["yz", "xz", "xy", "yz+xz"]
@@ -323,7 +324,7 @@ class SolveConfig:
     freq_spacing: Literal["log", "linear"] = "log"
 
     # Boundary condition
-    formulation: Literal["standard", "complex_k"] = BIEFormulation.STANDARD
+    formulation: Literal["standard", "complex_k", "burton_miller"] = BIEFormulation.STANDARD
     complex_k_shift: float = 0.005
     velocity_mode: Literal["velocity", "acceleration"] = VelocityMode.ACCELERATION
     # Direction the prescribed source velocity acts in. "normal" (default) drives
@@ -567,8 +568,8 @@ class SolveConfig:
             raise ValueError(
                 "mesh_elements_per_wavelength_min must be finite and positive"
             )
-        if self.formulation not in {BIEFormulation.STANDARD, BIEFormulation.COMPLEX_K}:
-            raise ValueError("formulation must be 'standard' or 'complex_k'")
+        if self.formulation not in {BIEFormulation.STANDARD, BIEFormulation.COMPLEX_K, BIEFormulation.BURTON_MILLER}:
+            raise ValueError("formulation must be 'standard', 'complex_k', or 'burton_miller'")
         if not (
             math.isfinite(self.complex_k_shift) and self.complex_k_shift >= 0
         ):
@@ -650,6 +651,15 @@ class SolveConfig:
                     "ground_plane does not compose with the coupled "
                     "infinite-baffle aperture_tag mode"
                 )
+        if self.formulation == BIEFormulation.BURTON_MILLER:
+            if self.aperture_tag is not None or self.circsym_aperture_tag is not None:
+                raise ValueError("burton_miller does not support coupled infinite-baffle solves")
+            if self.impedance_sources or self.impedance_source_callback is not None:
+                raise ValueError("burton_miller requires prescribed-Neumann boundaries; Robin/impedance is unsupported")
+            if self.ground_plane is not None or self.circsym_baffle_z is not None:
+                raise ValueError("burton_miller reference supports exterior full/half/quarter symmetry only")
+            if self.chief_points is not None:
+                raise ValueError("burton_miller does not compose with CHIEF points")
         if not (
             math.isfinite(self.ground_plane_min_clearance_m)
             and self.ground_plane_min_clearance_m >= 0.0

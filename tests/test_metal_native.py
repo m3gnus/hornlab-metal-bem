@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -23,6 +24,29 @@ from hornlab_metal_bem.metal.geometry import build_metal_geometry_buffers
 from hornlab_metal_bem.metal.geometry import MetalGeometryError
 from hornlab_metal_bem.metal.geometry import validate_native_symmetry_plane
 from hornlab_metal_bem.validation.native_symmetry import orbit_reduce_matrix_rhs
+
+
+def test_compiled_helper_refuses_burton_miller_session(tmp_path):
+    """The native binary itself must reject a BM request before assembly."""
+    runtime = discover_native_runtime(run_smoke_test=True)
+    if not runtime.available:
+        pytest.skip("Swift/Metal native helper unavailable")
+    if runtime.helper_executable_path is None:
+        pytest.skip("compiled native helper unavailable")
+    manifest = tmp_path / "session.json"
+    manifest.write_text(json.dumps({
+        "schema": "hornlab.metal.standard.v1",
+        "op": "create_session",
+        "index_base": 0,
+        "matrix_layout": "row_major_c",
+        "assembly_scope": {"formulation": "burton_miller"},
+    }), encoding="utf-8")
+    completed = subprocess.run(
+        [str(runtime.helper_executable_path), "validate_session", str(manifest), str(tmp_path / "result.json")],
+        capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode != 0
+    assert "burton_miller is reference-only" in completed.stderr
 
 
 def _write_native_entrypoint(root: Path) -> Path:

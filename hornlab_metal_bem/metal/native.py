@@ -1341,6 +1341,7 @@ class MetalNativeStandardSession:
         neumann_dp0: NDArray[Any],
         observation_points: NDArray[Any],
         *,
+        formulation: str = "standard",
         k_imag_f32: NDArray[Any] | None = None,
         impedance_sources: (
             dict[int, complex]
@@ -1383,6 +1384,10 @@ class MetalNativeStandardSession:
         helper binary with multi-source support; the per-case ``multi_source``
         acknowledgement fails loudly on a stale binary.
         """
+        if formulation == "burton_miller":
+            raise ValueError(
+                "burton_miller is reference-only; the native Swift/Metal helper does not implement it"
+            )
         from .session import (
             BatchAssemblySolveFieldPayload,
             read_json_manifest,

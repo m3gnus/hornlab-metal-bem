@@ -41,6 +41,24 @@ pressure reductions.
 
 ## Public API Flow
 
+### Burton–Miller reference
+
+`SolveConfig(formulation="burton_miller")` names an opt-in, real-wavenumber
+exterior prescribed-Neumann formulation. For small triangle meshes,
+`burton_miller_reference.assemble_burton_miller_reference()` returns the
+individual Galerkin blocks and the system
+`(½M − D + ηH)p = [−S − η(K′ + ½M₁₀)]q`, with `η = i/k`. The outgoing Green
+function is `exp(ikr)/(4πr)` under the package's `exp(-iωt)` time convention;
+outward velocity gives `q = +iρωv_n`. `H` uses the weak surface-curl product
+and `−k²(n·n′)` Green term, including reflected curls for half and quarter
+symmetry. `evaluate_burton_miller_exterior()` evaluates `Dp − Sq` at real `k`.
+
+This is a double-precision **reference only**. The Swift/Metal helper does not
+implement BM yet and refuses its formulation explicitly. The config also
+refuses coupled infinite-baffle, Robin/impedance, ground-plane and CHIEF
+combinations. CircSym refuses BM. The default remains `standard`; native BM
+assembly and near quadrature are pending.
+
 `solve(mesh, config=None)` and `solve_frequencies(mesh, frequencies_hz,
 config=None)` share the same execution flow:
 
