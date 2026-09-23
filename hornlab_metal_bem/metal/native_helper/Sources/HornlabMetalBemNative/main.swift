@@ -201,9 +201,9 @@ func validateSession(_ manifest: [String: Any]) throws -> [String: Any] {
     if try requireString(manifest, "matrix_layout") != "row_major_c" {
         try fail("expected row_major_c matrix layout")
     }
-    let assemblyScope = try requireObject(manifest, "assembly_scope")
-    let formulation = try requireString(assemblyScope, "formulation")
-    if formulation != "standard_neumann" {
+    if let assemblyScope = manifest["assembly_scope"] as? [String: Any],
+       let formulation = assemblyScope["formulation"] as? String,
+       formulation != "standard_neumann" {
         try fail("assembly_scope.formulation \(formulation) is unsupported by the native helper; burton_miller is reference-only")
     }
 

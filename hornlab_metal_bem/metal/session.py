@@ -679,6 +679,14 @@ def _require_descriptor_group(
 def _validate_geometry_manifest(manifest: dict[str, Any]) -> None:
     if manifest.get("matrix_layout") != MATRIX_LAYOUT_ROW_MAJOR_C:
         raise ValueError("create_session manifest must use row_major_c layout")
+    scope = manifest.get("assembly_scope")
+    if isinstance(scope, dict):
+        formulation = scope.get("formulation")
+        if formulation is not None and formulation != "standard_neumann":
+            raise ValueError(
+                f"assembly_scope.formulation {formulation} is unsupported by the native helper; "
+                "burton_miller is reference-only"
+            )
     mesh = _require_descriptor_group(
         manifest.get("mesh"),
         name="mesh",

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import subprocess
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from hornlab_metal_bem.metal import discover_native_runtime
 from hornlab_metal_bem.metal import session as metal_session
 from hornlab_metal_bem.metal.geometry import build_metal_geometry_buffers
 from hornlab_metal_bem.metal.session import (
@@ -119,6 +122,71 @@ def test_session_manifest_json_shape_and_relative_paths(tmp_path):
     manifest_text = (work_dir / "session.json").read_text(encoding="utf-8")
     assert "runs/scratch" not in manifest_text
     assert "metal-bem-probe" not in manifest_text
+
+
+@pytest.mark.parametrize("missing", ["assembly_scope", "formulation"])
+def test_python_session_validator_preserves_standard_default(tmp_path, missing):
+    work_dir, _ = _write_geometry_payload(tmp_path)
+    manifest = read_json_manifest(work_dir / "session.json")
+    if missing == "assembly_scope":
+        del manifest["assembly_scope"]
+    else:
+        del manifest["assembly_scope"]["formulation"]
+
+    assert payload_to_manifest(manifest) == manifest
+
+
+def test_python_session_validator_refuses_explicit_burton_miller(tmp_path):
+    work_dir, _ = _write_geometry_payload(tmp_path)
+    manifest = read_json_manifest(work_dir / "session.json")
+    manifest["assembly_scope"]["formulation"] = "burton_miller"
+
+    with pytest.raises(ValueError, match="burton_miller is reference-only"):
+        payload_to_manifest(manifest)
+
+
+def test_release_helper_preserves_default_and_refuses_burton_miller(tmp_path):
+    runtime = discover_native_runtime(run_smoke_test=True)
+    if not runtime.available:
+        pytest.skip("Swift/Metal native helper unavailable")
+    helper = Path(metal_session.__file__).parent / "native_helper" / ".build" / "release" / "HornlabMetalBemNative"
+    assert helper.is_file(), "release native helper must be built"
+
+    work_dir, _ = _write_geometry_payload(tmp_path)
+    standard = read_json_manifest(work_dir / "session.json")
+    results = []
+    for name, manifest in (
+        ("standard", standard),
+        ("missing_scope", {key: value for key, value in standard.items() if key != "assembly_scope"}),
+        ("missing_formulation", {
+            **standard,
+            "assembly_scope": {
+                key: value for key, value in standard["assembly_scope"].items()
+                if key != "formulation"
+            },
+        }),
+    ):
+        manifest_path = work_dir / f"{name}.json"
+        result_path = work_dir / f"{name}-result.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        completed = subprocess.run(
+            [str(helper), "validate_session", str(manifest_path), str(result_path)],
+            capture_output=True, text=True, check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        results.append(result_path.read_bytes())
+
+    assert results[0] == results[1] == results[2]
+
+    standard["assembly_scope"]["formulation"] = "burton_miller"
+    manifest_path = work_dir / "burton-miller.json"
+    manifest_path.write_text(json.dumps(standard), encoding="utf-8")
+    completed = subprocess.run(
+        [str(helper), "validate_session", str(manifest_path), str(work_dir / "burton-miller-result.json")],
+        capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode != 0
+    assert "burton_miller is reference-only" in completed.stderr
 
 
 def test_geometry_manifest_carries_aperture_tag(tmp_path):
