@@ -2585,7 +2585,12 @@ func centroidDistanceSquared(_ a: TriangleNearMetrics, _ b: TriangleNearMetrics)
     return dx * dx + dy * dy + dz * dz
 }
 
-func buildNearPairList(geom: Geometry, threshold: Double) throws -> NearPairList {
+// With `originalTestOnly`, only pairs whose test face is the original (mask 0)
+// are listed. Reflections are isometries, so (a, b) and (0, a^b) give the same
+// block; callers that use this weight each pair by the image count.
+func buildNearPairList(
+    geom: Geometry, threshold: Double, originalTestOnly: Bool = false
+) throws -> NearPairList {
     let imageMasks: [Int]
     if geom.symmetryPlane == nil {
         imageMasks = [0]
@@ -2612,7 +2617,7 @@ func buildNearPairList(geom: Geometry, threshold: Double) throws -> NearPairList
                 continue
             }
             let trialMetric = trialMetrics[trial]
-            for testImageMask in imageMasks {
+            for testImageMask in (originalTestOnly ? [0] : imageMasks) {
                 guard let testMetrics = metricsByMask[testImageMask] else {
                     continue
                 }
@@ -4359,9 +4364,30 @@ inline float3 bm_surface_curl(
     return mirror_point(curl, mask) * ((parity & 1) != 0 ? -1.0f : 1.0f);
 }
 
-// Add the BM H matrix and K' RHS directly to the standard D-M/2, S*q
-// buffers. The helper never materializes S, D, K' or H as full operators.
-kernel void assemble_bm_hk_pair_atomic(
+inline bool bm_pair_excluded(
+    device const uint *excluded,
+    device const int *maskSlots,
+    int nTriangles,
+    int testTri,
+    int trialTri,
+    int mask
+) {
+    int slot = maskSlots[mask];
+    if (slot < 0) {
+        return false;
+    }
+    ulong index = (ulong(slot) * ulong(nTriangles) + ulong(testTri)) * ulong(nTriangles)
+        + ulong(trialTri);
+    return ((excluded[index >> 5] >> uint(index & 31)) & 1u) != 0u;
+}
+
+// Fused Burton-Miller far-field assembly, one thread per (test, source)
+// triangle pair: (D - M/2 - (i/k) H) into A and (S + (i/k)(K' + M10/2)) q into
+// the RHS, for the original source and every symmetry image. Singular and near
+// (test, source, image) triples are flagged in `excluded`; the helper adds
+// their float64 blocks on the CPU, so a large float32 regular value is never
+// cancelled by a later correction. A and the RHS must be zero-filled first.
+kernel void assemble_bm_pair_atomic(
     device atomic_float *aRe [[buffer(0)]],
     device atomic_float *aIm [[buffer(1)]],
     device atomic_float *rhsRe [[buffer(2)]],
@@ -4376,12 +4402,15 @@ kernel void assemble_bm_hk_pair_atomic(
     device const float *qRe [[buffer(11)]],
     device const float *qIm [[buffer(12)]],
     constant Params &params [[buffer(13)]],
+    device const uint *excluded [[buffer(14)]],
+    device const int *maskSlots [[buffer(15)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    int pairCount = params.nTriangles * params.nTriangles;
-    if (gid >= uint(pairCount)) return;
-    int testTri = int(gid) / params.nTriangles;
-    int trialTri = int(gid) - testTri * params.nTriangles;
+    uint nTri = uint(params.nTriangles);
+    if (gid >= nTri * nTri) return;
+    int testTri = int(gid / nTri);
+    int trialTri = int(gid - uint(testTri) * nTri);
+    float k = params.k;
     float jac = (2.0f * areas[testTri]) * (2.0f * areas[trialTri]);
     float3 testNormal = float3(normals[testTri], normals[params.nTriangles+testTri],
                                normals[2*params.nTriangles+testTri]);
@@ -4393,61 +4422,75 @@ kernel void assemble_bm_hk_pair_atomic(
         testCurls[i] = bm_surface_curl(px,py,pz,triangles,areas,params.nTriangles,testTri,i,0);
         sourceCurls[i] = bm_surface_curl(px,py,pz,triangles,areas,params.nTriangles,trialTri,i,0);
     }
+    float3 testPoints[6];
+    float3 sourcePoints[6];
+    for (int a=0; a<6; ++a) {
+        testPoints[a] = point_on_triangle(px,py,pz,triangles,params.nTriangles,
+                                          testTri,qx[a],qy[a]);
+        sourcePoints[a] = point_on_triangle(px,py,pz,triangles,params.nTriangles,
+                                            trialTri,qx[a],qy[a]);
+    }
     float2 matrix[9];
     float2 rhs[3];
     for (int i=0; i<9; ++i) matrix[i] = float2(0.0f);
     for (int i=0; i<3; ++i) rhs[i] = float2(0.0f);
-    float3 sourcePoints[6];
-    for (int b=0; b<6; ++b)
-        sourcePoints[b] = point_on_triangle(px,py,pz,triangles,params.nTriangles,
-                                            trialTri,qx[b],qy[b]);
-    for (int a=0; a<6; ++a) {
-        float3 x = point_on_triangle(px,py,pz,triangles,params.nTriangles,testTri,qx[a],qy[a]);
-        float tb[3] = {1.0f-qx[a]-qy[a], qx[a], qy[a]};
-        for (int b=0; b<6; ++b) {
-            float sb[3] = {1.0f-qx[b]-qy[b], qx[b], qy[b]};
-            float weight = qw[a]*qw[b]*jac;
-            for (int mask=0; mask<=7; ++mask) {
-                if (mask != 0 && !has_image_mask(SYMMETRY_PLANE, mask)) continue;
-                if (mask == 0 && testTri == trialTri && a == b) continue;
+    for (int mask=0; mask<=7; ++mask) {
+        if (mask != 0 && !has_image_mask(SYMMETRY_PLANE, mask)) continue;
+        if (bm_pair_excluded(excluded, maskSlots, params.nTriangles,
+                             testTri, trialTri, mask)) continue;
+        float3 imageNormal = mirror_normal(sourceNormal, mask);
+        int parity = ((mask & 1) != 0) + ((mask & 2) != 0) + ((mask & 4) != 0);
+        float curlSign = (parity & 1) != 0 ? -1.0f : 1.0f;
+        float curlDots[9];
+        for (int i=0; i<3; ++i)
+            for (int j=0; j<3; ++j)
+                curlDots[i*3+j] = dot(testCurls[i],
+                                      mirror_point(sourceCurls[j], mask)*curlSign);
+        float normalProduct = -k*k*dot(testNormal, imageNormal);
+        for (int a=0; a<6; ++a) {
+            float3 x = testPoints[a];
+            float tb[3] = {1.0f-qx[a]-qy[a], qx[a], qy[a]};
+            for (int b=0; b<6; ++b) {
                 float3 y = mirror_point(sourcePoints[b], mask);
                 float3 delta = y-x;
                 float r2 = dot(delta,delta);
                 if (r2 <= 1.0e-14f) continue;
+                float sb[3] = {1.0f-qx[b]-qy[b], qx[b], qy[b]};
                 float r = sqrt(r2);
-                float2 g = helmholtz_g(delta,params.k,0.0f)*weight;
-                float2 derivative = c_mul(g,float2(-1.0f/r2,params.k/r));
-                float3 imageNormal = mirror_normal(sourceNormal,mask);
-                float normalProduct = -params.k*params.k*dot(testNormal,imageNormal);
+                float2 g = helmholtz_g(delta,k,0.0f)*(qw[a]*qw[b]*jac);
+                float2 derivative = c_mul(g,float2(-1.0f/r2,k/r));
+                float2 d = derivative*dot(delta,imageNormal);
                 float2 kp = derivative*(-dot(delta,testNormal));
-                float2 etaK = float2(-kp.y/params.k,kp.x/params.k);
+                float2 rhsTerm = g + float2(-kp.y/k,kp.x/k);
                 for (int i=0; i<3; ++i) {
-                    rhs[i] += etaK*tb[i];
+                    rhs[i] += rhsTerm*tb[i];
                     for (int j=0; j<3; ++j) {
-                        float3 imageCurl = mirror_point(sourceCurls[j],mask);
-                        int parity = ((mask & 1) != 0) + ((mask & 2) != 0)
-                            + ((mask & 4) != 0);
-                        if ((parity & 1) != 0) imageCurl = -imageCurl;
-                        float factor = dot(testCurls[i],imageCurl)
-                            + normalProduct*tb[i]*sb[j];
-                        float2 h = g*factor;
-                        matrix[i*3+j] += float2(h.y/params.k,-h.x/params.k);
+                        float2 h = g*(curlDots[i*3+j] + normalProduct*tb[i]*sb[j]);
+                        matrix[i*3+j] += d*(tb[i]*sb[j]) + float2(h.y/k,-h.x/k);
                     }
                 }
             }
         }
     }
     if (testTri == trialTri) {
-        for (int i=0; i<3; ++i)
-            rhs[i].y += areas[testTri]/(6.0f*params.k);
+        float area = areas[testTri];
+        for (int i=0; i<3; ++i) {
+            rhs[i].y += area/(6.0f*k);
+            for (int j=0; j<3; ++j)
+                matrix[i*3+j].x -= 0.5f*area*(i == j ? 0.16666666666666666f
+                                                     : 0.08333333333333333f);
+        }
     }
     float rowWeight = symmetry_row_weight();
     float2 q = float2(qRe[trialTri],qIm[trialTri]);
+    bool driven = q.x != 0.0f || q.y != 0.0f;
     for (int i=0; i<3; ++i) {
         int row = p1Local2Global[testTri*3+i];
-        float2 value = c_mul(rhs[i],q)*rowWeight;
-        atomic_fetch_add_explicit(&rhsRe[row],value.x,memory_order_relaxed);
-        atomic_fetch_add_explicit(&rhsIm[row],value.y,memory_order_relaxed);
+        if (driven) {
+            float2 value = c_mul(rhs[i],q)*rowWeight;
+            atomic_fetch_add_explicit(&rhsRe[row],value.x,memory_order_relaxed);
+            atomic_fetch_add_explicit(&rhsIm[row],value.y,memory_order_relaxed);
+        }
         for (int j=0; j<3; ++j) {
             int col = p1Local2Global[trialTri*3+j];
             int idx = row*params.nDof+col;
@@ -5778,7 +5821,7 @@ struct ResidentMetalPipelines {
     let library: MTLLibrary
     let matrixPipeline: MTLComputePipelineState
     let pairAtomicPipeline: MTLComputePipelineState
-    let bmHKPipeline: MTLComputePipelineState
+    let bmPairPipeline: MTLComputePipelineState
     let rhsPipeline: MTLComputePipelineState
     let apertureSlpPipeline: MTLComputePipelineState
     let apertureAverageSlpPipeline: MTLComputePipelineState
@@ -5863,9 +5906,9 @@ final class ResidentMetalPipelineCache: @unchecked Sendable {
             name: "assemble_matrix_pair_atomic",
             symmetryPlaneCode: symmetryPlaneCode
         )
-        let bmHKFunction = try residentKernelFunction(
+        let bmPairFunction = try residentKernelFunction(
             library: libraryLoad.library,
-            name: "assemble_bm_hk_pair_atomic",
+            name: "assemble_bm_pair_atomic",
             symmetryPlaneCode: symmetryPlaneCode
         )
         let rhsFunction = try residentKernelFunction(
@@ -5902,7 +5945,7 @@ final class ResidentMetalPipelineCache: @unchecked Sendable {
             library: libraryLoad.library,
             matrixPipeline: try device.makeComputePipelineState(function: matrixFunction),
             pairAtomicPipeline: try device.makeComputePipelineState(function: pairAtomicFunction),
-            bmHKPipeline: try device.makeComputePipelineState(function: bmHKFunction),
+            bmPairPipeline: try device.makeComputePipelineState(function: bmPairFunction),
             rhsPipeline: try device.makeComputePipelineState(function: rhsFunction),
             apertureSlpPipeline: try device.makeComputePipelineState(function: apertureSlpFunction),
             apertureAverageSlpPipeline: try device.makeComputePipelineState(function: apertureAverageSlpFunction),
@@ -5953,7 +5996,7 @@ final class ResidentMetalContext {
     let library: MTLLibrary
     let matrixPipeline: MTLComputePipelineState
     let pairAtomicPipeline: MTLComputePipelineState
-    let bmHKPipeline: MTLComputePipelineState
+    let bmPairPipeline: MTLComputePipelineState
     let rhsPipeline: MTLComputePipelineState
     let apertureSlpPipeline: MTLComputePipelineState
     let apertureAverageSlpPipeline: MTLComputePipelineState
@@ -6009,6 +6052,9 @@ final class ResidentMetalContext {
     var fieldOutRe: MTLBuffer?
     var fieldOutIm: MTLBuffer?
     var fieldOutCount = 0
+    // Frequency-independent Burton-Miller pair lists, faces and the GPU
+    // exclusion mask, built on first use and reused for every case.
+    var burtonMillerCache: BurtonMillerGeometryCache?
     private var alternateOutputSlot: AssemblyOutputSlot?
     // Per-slot extra RHS output buffers for multi-source cases, grown on
     // demand to the batch's extra-source count. Keyed by slot parity (0/1)
@@ -6139,7 +6185,7 @@ final class ResidentMetalContext {
         self.library = pipelines.library
         self.matrixPipeline = pipelines.matrixPipeline
         self.pairAtomicPipeline = pipelines.pairAtomicPipeline
-        self.bmHKPipeline = pipelines.bmHKPipeline
+        self.bmPairPipeline = pipelines.bmPairPipeline
         self.rhsPipeline = pipelines.rhsPipeline
         self.apertureSlpPipeline = pipelines.apertureSlpPipeline
         self.apertureAverageSlpPipeline = pipelines.apertureAverageSlpPipeline
@@ -6676,28 +6722,42 @@ final class ResidentMetalContext {
         )
     }
 
-    func assembleBurtonMillerRegularMetal(
-        neumann: [Complex32], k: Float
-    ) throws -> MetalAssemblyOutput {
+    /// Encode and commit the fused Burton-Miller far-field assembly. Pairs
+    /// flagged in `excluded` are left to the caller's float64 blocks. The
+    /// command buffer runs while the caller computes those blocks on the CPU;
+    /// `finishBurtonMillerFarField` waits for it and reads A and the RHS.
+    func beginBurtonMillerFarField(
+        neumann: [Complex32], k: Float, excluded: MTLBuffer, maskSlots: MTLBuffer
+    ) throws -> (commandBuffer: MTLCommandBuffer, slot: AssemblyOutputSlot,
+                 dispatch: [String: Any]) {
         let slot = try outputSlot(0)
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             try fail("failed to create Burton-Miller command buffer")
         }
-        commandBuffer.label = "hornlab resident Burton-Miller regular assembly"
-        let base = try encodeRegularAssembly(
-            commandBuffer: commandBuffer, slot: slot, neumann: neumann, k: k
-        )
+        commandBuffer.label = "hornlab resident Burton-Miller far-field assembly"
+        let n = geom.p1DofCount
+        guard let blitEncoder = commandBuffer.makeBlitCommandEncoder() else {
+            try fail("failed to create Metal blit encoder")
+        }
+        blitEncoder.label = "Burton-Miller zero fill"
+        let matrixBytes = n * n * MemoryLayout<Float>.stride
+        let rhsBytes = n * MemoryLayout<Float>.stride
+        blitEncoder.fill(buffer: slot.aRe, range: 0..<matrixBytes, value: 0)
+        blitEncoder.fill(buffer: slot.aIm, range: 0..<matrixBytes, value: 0)
+        blitEncoder.fill(buffer: slot.rhsRe, range: 0..<rhsBytes, value: 0)
+        blitEncoder.fill(buffer: slot.rhsIm, range: 0..<rhsBytes, value: 0)
+        blitEncoder.endEncoding()
         let qRe = try makeBuffer(device, neumann.map { $0.re }, label: "bm_q_re")
         let qIm = try makeBuffer(device, neumann.map { $0.im }, label: "bm_q_im")
         var params = MetalKernelParams(
-            nDof: Int32(geom.p1DofCount), nTriangles: Int32(geom.nTriangles),
+            nDof: Int32(n), nTriangles: Int32(geom.nTriangles),
             maxInc: Int32(incidence.maxInc), symmetryPlane: geom.symmetryPlaneCode,
             k: k, kImag: 0, hasRobin: 0
         )
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             try fail("failed to create Burton-Miller Metal encoder")
         }
-        encoder.label = "BM H and K' fused pair contribution"
+        encoder.label = "BM fused far-field pair contribution"
         encoder.setBuffer(slot.aRe, offset: 0, index: 0)
         encoder.setBuffer(slot.aIm, offset: 0, index: 1)
         encoder.setBuffer(slot.rhsRe, offset: 0, index: 2)
@@ -6712,24 +6772,26 @@ final class ResidentMetalContext {
         encoder.setBuffer(qRe, offset: 0, index: 11)
         encoder.setBuffer(qIm, offset: 0, index: 12)
         encoder.setBytes(&params, length: MemoryLayout<MetalKernelParams>.stride, index: 13)
-        let bmDispatch = try dispatch1D(
-            encoder: encoder, pipeline: bmHKPipeline,
-            count: geom.nTriangles*geom.nTriangles, kernel: "bm_hk_pairs"
+        encoder.setBuffer(excluded, offset: 0, index: 14)
+        encoder.setBuffer(maskSlots, offset: 0, index: 15)
+        let dispatch = try dispatch1D(
+            encoder: encoder, pipeline: bmPairPipeline,
+            count: geom.nTriangles*geom.nTriangles, kernel: "bm_pairs"
         )
         encoder.endEncoding()
         commandBuffer.commit()
+        return (commandBuffer, slot, dispatch)
+    }
+
+    func finishBurtonMillerFarField(
+        commandBuffer: MTLCommandBuffer, slot: AssemblyOutputSlot
+    ) throws -> (arrays: AssemblyArrays, gpuSeconds: Double) {
         commandBuffer.waitUntilCompleted()
         if let error = commandBuffer.error {
             try fail("resident Metal Burton-Miller assembly failed: \(error)")
         }
-        return MetalAssemblyOutput(
-            arrays: readAssemblyArrays(slot: slot),
-            dispatch: [
-                "regular_assembly_implementation": base.implementation,
-                "matrix": base.matrix, "rhs": base.rhs,
-                "bm_hk_pairs": bmDispatch,
-            ]
-        )
+        let gpuSeconds = max(0, commandBuffer.gpuEndTime - commandBuffer.gpuStartTime)
+        return (readAssemblyArrays(slot: slot), gpuSeconds)
     }
 
     func assembleRegularBlockStagedMetal(
@@ -9300,6 +9362,9 @@ func assembleStandardNeumann(
     let run: AssemblyRun
     if formulation == "burton_miller" {
         if kImag != 0 { try fail("burton_miller requires real k") }
+        if geom.apertureTag != nil {
+            try fail("burton_miller does not support coupled infinite-baffle solves")
+        }
         run = try assembleBurtonMillerMetal(geom: geom, neumann: neumann, k: k)
     } else if formulation == "standard" {
         run = try assembleRegular(geom: geom, neumann: neumann, k: k, kImag: kImag)

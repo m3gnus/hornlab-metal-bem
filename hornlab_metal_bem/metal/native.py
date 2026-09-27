@@ -1038,6 +1038,8 @@ class MetalNativeStandardSession:
             raise ValueError("unsupported native formulation")
         if formulation == "burton_miller" and k_imag_value != 0.0:
             raise ValueError("burton_miller requires real k")
+        if formulation == "burton_miller" and self.geometry_payload.aperture_tag is not None:
+            raise ValueError("burton_miller does not support coupled infinite-baffle solves")
         neumann = _require_complex_vector(
             "neumann_dp0",
             neumann_dp0,

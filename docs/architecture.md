@@ -54,13 +54,25 @@ and `−k²(n·n′)` Green term, including reflected curls for half and quarter
 symmetry. `evaluate_burton_miller_exterior()` evaluates `Dp − Sq` at real `k`.
 
 The double-precision reference is a small-mesh numerical oracle. The native
-Swift helper assembles BM into one dense float32 matrix and per-drive RHS,
-using one quadrature decision for S, D, K′, and regularised H in each pair.
-Coincident, adjacent, and reflected image pairs use paired Duffy quadrature;
-near disjoint pairs receive bounded refinement. The helper
-refuses disjoint faces closer than the float32 near limit (centre distance
-below 0.001 times local face scale), where regular Metal quadrature cannot
-be reliably corrected after atomic accumulation. The config still
+Swift helper assembles BM into one dense float32 matrix and per-drive RHS.
+Well-separated pairs are integrated on the GPU in float32; every singular
+(shared vertex, edge or face, including reflected seam images) and near
+(centre distance below 1.5 face sizes) triangle pair is excluded there and
+integrated completely in float64 on the CPU, so a thin wall never relies on a
+large float32 value minus a correction. Singular pairs use Sauter–Schwab
+(Duffy) rules whose order follows the pair's closeness (1/aspect, and the
+distance of each non-shared vertex from the other face); slivers and close
+caps use the adaptive path instead. The adaptive path takes the source
+integral in polar coordinates about the projection of the test point, with
+sinh-transformed Gauss rules along each fan edge and each ray (their cost
+grows only logarithmically as a gap closes or a point nears an edge), and grades the test face
+anisotropically, parallel and across each source edge and the line where the
+test plane cuts the source, to a relative tolerance of 1e-5. The pair lists,
+quadrature orders and GPU exclusion mask are frequency-independent and built
+once per session. The helper refuses only faces that share no vertex yet lie
+within 1e-6 of their size (the surface touches, intersects or coincides with
+itself); single assembly and batches both refuse coupled infinite-baffle
+sessions. The config still
 refuses coupled infinite-baffle, Robin/impedance, ground-plane and CHIEF
 combinations. CircSym refuses BM. The default remains `standard`; native BM
 is opt-in and evaluates the exterior field with real k.
