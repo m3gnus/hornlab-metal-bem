@@ -127,7 +127,6 @@ def test_reference_rejects_scalar_neumann_and_handles_small_triangle():
 
 @pytest.mark.parametrize("kwargs, message", [
     ({"aperture_tag": 3}, "coupled infinite-baffle"),
-    ({"circsym_aperture_tag": 3}, "coupled infinite-baffle"),
     ({"impedance_sources": {4: 0.1}}, "Robin/impedance"),
     ({"impedance_source_callback": lambda _: {4: 0.1}}, "Robin/impedance"),
     ({"ground_plane": "xy"}, "full/half/quarter"),
@@ -138,17 +137,12 @@ def test_bm_capability_refusals(kwargs, message):
         SolveConfig(formulation=BIEFormulation.BURTON_MILLER, **kwargs)
 
 
-def test_bm_native_routes_and_circsym_refuses_without_fallback():
+def test_bm_native_routes():
     config = SolveConfig(formulation=BIEFormulation.BURTON_MILLER)
     assert SolveConfig().formulation == BIEFormulation.STANDARD
     assert should_route_native_metal(config)
     k_real, k_imag = _k_values_for_native(np.array([100.]), config)
     assert k_real[0] > 0 and k_imag[0] == 0
-    from hornlab_metal_bem.circsym import solve_circsym, run_sweep_circsym
-    with pytest.raises(ValueError, match="CircSym"):
-        solve_circsym(None, config)
-    with pytest.raises(ValueError, match="CircSym"):
-        run_sweep_circsym(None, np.array([100.]), config)
 
 
 @pytest.mark.parametrize("k, ceiling", [(0.5, .06), (1.5, .07), (np.pi, .13), (3.25, .14)])

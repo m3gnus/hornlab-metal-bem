@@ -438,20 +438,3 @@ def test_multi_source_matches_sequential_solves_under_a_ground_plane():
             sequential.pressure_complex,
             rtol=2.0e-4, atol=1.0e-12,
         )
-
-
-def test_axisymmetric_solves_refuse_a_ground_plane_instead_of_ignoring_it():
-    from hornlab_metal_bem.circsym import MeridianMesh, run_sweep_circsym
-
-    nodes = np.array([[0.0, 0.0], [0.1, 0.0], [0.1, 0.1]], dtype=np.float64)
-    segments = np.array([[0, 1], [1, 2]], dtype=np.int32)
-    meridian = MeridianMesh(
-        nodes=nodes,
-        segments=segments,
-        physical_tags=np.array([2, 1], dtype=np.int32),
-    )
-    with pytest.raises(ValueError, match="circsym_baffle_z"):
-        run_sweep_circsym(
-            meridian, np.array([500.0]),
-            metal_bem.SolveConfig(ground_plane="xy"),
-        )

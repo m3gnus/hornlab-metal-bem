@@ -1,4 +1,6 @@
-# Axisymmetric qualification prototype
+# Axisymmetric qualification prototype (historical)
+
+Historical record: the CircSym implementation was removed on 2026-09-28. The results below do not describe a supported solver path.
 
 Date: 2026-09-09. Status: **positive geometry and qualification-infrastructure
 work retained; Axisymmetric remains disabled in the UI and AUTO routing.**

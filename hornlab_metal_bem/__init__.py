@@ -24,7 +24,6 @@ from .assembly import (
     combine_bodies,
     rotation_matrix,
 )
-from .circsym import CircSymCancelled, MeridianMesh
 from .field_traces import evaluate_exterior_from_traces
 from .mesh import LoadedMesh, MeshError, load_mesh
 from .observation import ObservationFrame, infer_frame
@@ -34,8 +33,6 @@ __all__ = [
     "native_config",
     "solve",
     "solve_frequencies",
-    "solve_circsym",
-    "solve_circsym_frequencies",
     "solve_multi_source",
     "combine_bodies",
     "rotation_matrix",
@@ -43,8 +40,6 @@ __all__ = [
     "CombinedMesh",
     "evaluate_exterior_from_traces",
     "load_mesh",
-    "MeridianMesh",
-    "CircSymCancelled",
     "SolveConfig",
     "SolveResult",
     "ObservationConfig",
@@ -248,27 +243,6 @@ def solve_frequencies(
 
     should_route_native_metal(config)
     return run_sweep_native_metal(loaded, freqs, frame, config)
-
-
-def solve_circsym(
-    meridian: MeridianMesh,
-    config: SolveConfig | None = None,
-) -> SolveResult:
-    """Run a pure-Python axisymmetric m=0 BEM frequency sweep."""
-    from .circsym import solve_circsym as _solve_circsym
-
-    return _solve_circsym(meridian, config)
-
-
-def solve_circsym_frequencies(
-    meridian: MeridianMesh,
-    frequencies_hz: list[float] | np.ndarray,
-    config: SolveConfig | None = None,
-) -> SolveResult:
-    """Run a pure-Python axisymmetric m=0 BEM solve at caller frequencies."""
-    from .circsym import solve_circsym_frequencies as _solve_circsym_frequencies
-
-    return _solve_circsym_frequencies(meridian, frequencies_hz, config)
 
 
 def solve_multi_source(

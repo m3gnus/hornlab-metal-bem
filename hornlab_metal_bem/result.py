@@ -24,8 +24,7 @@ class SolveResult:
     Array dimensions use ``F`` for frequency count, ``P`` for observation
     plane count, and ``N`` for points or angles per plane. Complex values use
     the solver's :math:`e^{-i\omega t}` phase convention, whose Green's
-    function is therefore the outgoing :math:`e^{+ikr}/4{\pi}r` (verified in
-    ``circsym._evaluate_near_remainder`` and the C/Metal kernels beside it).
+    function is therefore the outgoing :math:`e^{+ikr}/4{\pi}r`.
 
     A reference documenting an :math:`e^{-jkr}` kernel -- ABEC3 among them --
     uses the opposite :math:`e^{+j{\omega}t}` time factor and returns the

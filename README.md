@@ -16,10 +16,7 @@ Use the `hornlab_metal_bem` namespace for all new integrations.
 
 ## Status
 
-The full-3D native backend is Apple Silicon/macOS only. The axisymmetric
-meridian (`solve_circsym*`) formulation is portable: it runs on macOS, Windows,
-and Linux through compiled CPU kernels, and opportunistically uses Metal on
-Apple Silicon. It does not route Windows users through the full-3D Metal helper.
+The native full-3D backend requires Apple Silicon and macOS.
 
 The solver uses a NumPy-only mesh/grid/function-space loader and does not
 depend on `bempp-cl`. There is no OpenCL/Bempp fallback path in this package.
@@ -52,74 +49,6 @@ Recent ASRO2 corrected-quarter benchmark (HornLab, Apple M-series):
 - corrected assembly matches the subdivided-quadrature reference to `< 1e-4`
   relative L2 (matrix and RHS), and the `yz+xz` quarter matches the
   full-domain solve
-
-For a reproducible axisymmetric benchmark, including the exact backend and
-quadrature order used, run:
-
-```bash
-python scripts/bench_circsym.py --json
-python scripts/bench_circsym.py --fixture infinite-baffle --backend cpu --json
-```
-
-For the conditional axisymmetric-vs-quarter-domain qualification, provide a
-mesher configuration and the matching already-generated quarter surface mesh:
-
-```bash
-PYTHONPATH=.:../hornlab-waveguide-mesher \
-python scripts/bench_axisymmetric_vs_quarter.py \
-  --config path/to/rosse-config.json \
-  --quarter-mesh path/to/rosse-quarter.msh \
-  --repeats 5 --json
-```
-
-The comparison excludes mesh generation from both arms, runs one excluded
-warm-up per solver, alternates paired warm runs, and requires speed, compact-CPU
-parity, aggregate cross-solver physics gates, and the same physics budgets at
-every requested frequency for overall qualification. It also normalizes source
-velocity for equal physical volume velocity and reports frequency-local errors.
-Directivity retains the historical intersection-mask metric and additionally
-reports a fixed-reference mask plus mask-membership coverage, so a disappearing
-or displaced lobe cannot be hidden by the candidate mask. The JSON records
-tagged quarter-to-meridian geometric
-distance at both the solved coarse panels and an 8x finer same-config generating
-curve; these are scale-aware discretization diagnostics, not a blanket geometry
-rejection. The shared flat mouth-closure contract remains a separate strict
-check. It also records significant-field and null-region phase separately (the existing
-1e-4 significant-field phase gate remains authoritative; 1e-3 and 1e-2 floors
-are additional diagnostics), and full-3D near-quadrature plus dense-solve
-provenance. To run a fixed-geometry CircSym convergence ladder,
-use `--meridian-refinement-factors 1,2,4,8`; each rung uniformly subdivides the
-already-built straight meridian panels, preserving their tags, normals, and
-surface area. Select `--meridian-refinement-factor 4` as well when timing the
-four-times-refined rung (for example, 52 to 208 segments), rather than using a
-coarse timing to characterize it. The Numba CPU field implementation is the portable
-default; `--cpu-field numpy` remains available for diagnosis. Changing azimuth
-order must be judged against the harness's unchanged 64-point CircSym reference,
-not from timing alone.
-
-Optional unrestricted full-domain controls are diagnostic-only and never relax
-or replace the qualification gates. Use `--reflect-quarter-to-full` to isolate
-native symmetry, seams, and source normalization on exactly reflected
-triangles; `--full-mesh path.msh` for one independently generated full mesh; or
-`--full-mesh-ladder coarse.msh,...,fine.msh` for consecutive and finest-rung
-convergence comparisons. Full meshes are always solved without native symmetry,
-and the report records their hashes, geometry checks, source scaling, P1 DOF
-counts, and timings.
-
-For a separate resonance diagnostic, supply points known to lie in the excluded
-solid interior enclosed by the exterior boundary—typically wall material, never
-the horn air cavity—and run `--resonance-comparison --chief-points points.json`.
-The caller is responsible for verifying placement; the harness cannot prove it
-from an arbitrary exterior mesh. This makes paired real-k+CHIEF solves and a
-complex-k shift ladder for both Axisymmetric and quarter-3D arms. It is
-reporting-only and cannot change the Axisymmetric qualification result. The
-harness intentionally refuses to infer CHIEF locations from arbitrary geometry.
-
-The default fixture is a closed free-standing conical horn swept from 400 Hz to
-16 kHz. `--target-edge-mm`, `--frequencies`, `--angles`, and `--repeat` expose
-the workload without hiding it behind a machine-specific preset. CI separately
-checks free-standing and coupled infinite-baffle numerical goldens on macOS,
-Windows, and Linux.
 
 ## Inputs
 
@@ -307,42 +236,6 @@ exposes experimental opt-in `formulation="complex_k"` and
 legacy OpenCL/Bempp fallback configuration or Burton-Miller as user-facing
 features.
 
-## CircSym Axisymmetric Solver
-
-`solve_circsym()` and `solve_circsym_frequencies()` run the axisymmetric
-`m=0` DP0 meridian solver for circular bodies of revolution. Use it only for
-circular/axisymmetric geometries; non-round cross sections, morphing, and
-enclosures are outside the current validity envelope. Infinite-baffle CircSym
-is supported for circular waveguides via `SolveConfig.circsym_aperture_tag`,
-which names the flush `z=0` aperture segments and switches the solve to the
-exact coupled path (interior meridian BEM + analytic Rayleigh half-space
-aperture coupling). Prefer the full 3D coupled solve (`aperture_tag`) for
-production directivity; the CircSym IB path is for fast axisymmetric
-impedance/validation sweeps. It requires one closed interior-channel meridian
-entirely behind the baffle, with a contiguous mouth-to-axis aperture at global
-`z=0` whose normals point `-Z`. Complex-k regularization and Robin/admittance
-walls are supported; CHIEF points are rejected until their coupled augmented
-constraints are implemented. Generated observation arcs honor `origin="mouth"`
-or `origin="throat"`.
-
-The legacy `circsym_baffle_z` image kernel is intentionally limited to a
-coplanar flat Rayleigh sheet (such as a baffled piston). It is not a recessed
-horn model: use `circsym_aperture_tag` for a flush-mounted waveguide. Bare,
-zero-thickness open meridians are rejected because the current one-trace BIE is
-a closed-surface formulation; finite-thickness freestanding meridians that
-close on the symmetry axis remain supported.
-
-With the wavelength-scaled meridian budget, CircSym is intended for waveguide
-sweeps up to roughly 30-40 kHz when the meridian resolves the requested band.
-The default `complex_k` formulation avoids closed-surface irregular
-frequencies, but the complex shift adds an `O(shift)` bias to surface
-impedance, about 0.03 dB for the default shift. Observation fields are still
-evaluated with the real acoustic wavenumber.
-
-The returned `impedance` is the area-weighted average pressure on the driven
-source cap per unit drive. It is not a throat-plane radiation impedance and is
-not normalized by `rho*c`.
-
 Use `solve_frequencies(mesh, frequencies_hz, config=None)` when frequency order
 comes from the caller instead of a generated sweep.
 
@@ -402,7 +295,7 @@ Key result fields:
 - `observation_points`: `(P, N, 3)` observation coordinates in metres
 - `observation_planes`: plane names matching axis `P`
 - `surface_pressure_avg`: source-tag keyed average surface pressure arrays
-  (always populated, including CircSym coupled-IB solves)
+  (always populated)
 - `surface_pressure_complex`: optional `(F, n_p1_dofs)` solved surface pressure
   when `return_surface_pressure=True` or `return_surface_traces=True`
 - `surface_neumann_complex`: optional `(F, n_dp0_dofs)` total `dp/dn`, including
@@ -435,8 +328,7 @@ Retained traces use the solver's `e^{-i omega t}` phase convention. Evaluate
 one frequency at arbitrary `(N, 3)` exterior points with
 `evaluate_exterior_from_traces(mesh, frequency_hz, k_real, pressure_p1,
 neumann_dp0, points_xyz, symmetry_plane=...)`. The mesh and symmetry must match
-the solve. Coupled infinite-baffle and CircSym trace evaluation are not part of
-this full-3D Phase 0 API.
+the solve. Coupled infinite-baffle trace evaluation is outside this API.
 
 ## Install For Development
 

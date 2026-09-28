@@ -74,7 +74,7 @@ within 1e-6 of their size (the surface touches, intersects or coincides with
 itself); single assembly and batches both refuse coupled infinite-baffle
 sessions. The config still
 refuses coupled infinite-baffle, Robin/impedance, ground-plane and CHIEF
-combinations. CircSym refuses BM. The default remains `standard`; native BM
+combinations. The default remains `standard`; native BM
 is opt-in and evaluates the exterior field with real k.
 
 `solve(mesh, config=None)` and `solve_frequencies(mesh, frequencies_hz,

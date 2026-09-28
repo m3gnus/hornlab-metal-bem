@@ -49,8 +49,7 @@ jobs:
       #
       # Nothing is subtracted. Every file either passes without a GPU or skips
       # itself through discover_native_runtime(run_smoke_test=True); none needs
-      # licensed data, and the only fixture in the repository is one JSON
-      # golden. So there is no --ignore list here, and the reason is that no
+      # licensed data. So there is no --ignore list here, and the reason is that no
       # file earned a place on one -- not that nobody looked.
       #
       # Measured on run 33679469356, whole suite vs the old six-file list:
@@ -82,9 +81,6 @@ jobs:
       #
       #   tests/test_coupled_ib_mesh_load.py -- importorskip on hornlab_mesher,
       #     a sibling package this repository does not depend on.
-      #
-      #   The runtime C kernel tests -- skipif os.name != "posix", which is
-      #     most of the 20 extra skips windows-latest reports over ubuntu.
       #
       # -rs prints every skip with its reason, so the above stays visible in
       # the log instead of being something you have to already know.

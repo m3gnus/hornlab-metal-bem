@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from scipy.special import j1
+from scipy.special import j1, struve
 
 import hornlab_metal_bem as metal_bem
-from hornlab_metal_bem.circsym import MeridianMesh
 from hornlab_metal_bem.config import ObservationConfig, SolveConfig, VelocityMode
 from hornlab_metal_bem.mesh import LoadedMesh, make_pure_grid
 from hornlab_metal_bem.metal import discover_native_runtime
@@ -144,35 +143,6 @@ def _first_crossing_deg(
     raise AssertionError(f"no {target_db} dB crossing")
 
 
-def _resample_polyline(points: np.ndarray, target_edge: float) -> np.ndarray:
-    out = [points[0]]
-    for a, b in zip(points[:-1], points[1:], strict=True):
-        count = max(1, int(np.ceil(float(np.linalg.norm(b - a)) / target_edge)))
-        for step in range(1, count + 1):
-            out.append(a + (b - a) * (step / count))
-    return np.asarray(out, dtype=np.float64)
-
-
-def _straight_channel_meridian(
-    radius: float,
-    depth: float,
-    *,
-    target_edge: float,
-) -> MeridianMesh:
-    cap = _resample_polyline(np.array([[0.0, -depth], [radius, -depth]]), target_edge)
-    wall = _resample_polyline(np.array([[radius, -depth], [radius, 0.0]]), target_edge)
-    aperture = _resample_polyline(np.array([[radius, 0.0], [0.0, 0.0]]), target_edge)
-    points = np.vstack([cap, wall[1:], aperture[1:]])
-    tags = np.concatenate(
-        [
-            np.full(len(cap) - 1, TAG_THROAT, dtype=np.int32),
-            np.full(len(wall) - 1, TAG_WALL, dtype=np.int32),
-            np.full(len(aperture) - 1, TAG_APERTURE, dtype=np.int32),
-        ]
-    )
-    return MeridianMesh.from_polyline(points, tags)
-
-
 def _straight_channel_mesh(
     radius: float,
     depth: float,
@@ -214,8 +184,8 @@ def _straight_channel_mesh(
         triangles.append([bottom0, top1, top0])
         tags.extend([TAG_WALL, TAG_WALL])
 
-    # Coupled-IB 3D meshes use the same interior-domain orientation as the
-    # CircSym meridian: source +Z into the cavity, wall normals inward, and
+    # Coupled-IB 3D meshes use interior-domain orientation:
+    # source +Z into the cavity, wall normals inward, and
     # aperture -Z into the cavity. Rayleigh exterior evaluation is selected by
     # aperture_tag rather than aperture triangle winding.
     triangles_arr = np.asarray(triangles, dtype=np.int32)[:, [0, 2, 1]]
@@ -283,7 +253,7 @@ def test_uniform_full3d_rayleigh_disc_matches_baffled_piston_analytic():
     ) < 0.3
 
 
-def test_native_coupled_ib_straight_circular_channel_matches_circsym(
+def test_native_coupled_ib_straight_channel_matches_analytic_piston(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
@@ -314,28 +284,22 @@ def test_native_coupled_ib_straight_circular_channel_matches_circsym(
         metal_native_assembly_mode="corrected",
         dense_solve_dtype="float64",
     )
-    circsym_config = SolveConfig(
-        velocity_sources={TAG_THROAT: 1.0},
-        velocity_mode=VelocityMode.VELOCITY,
-        circsym_aperture_tag=TAG_APERTURE,
-        observation=observation,
-    )
-
     native_result = metal_bem.solve_frequencies(
         _straight_channel_mesh(radius, depth, rings=5, sectors=32),
         frequencies_hz,
         native_config,
     )
-    circsym_result = metal_bem.solve_circsym_frequencies(
-        _straight_channel_meridian(radius, depth, target_edge=radius / 5.0),
-        frequencies_hz,
-        circsym_config,
-    )
-
     native_directivity = native_result.directivity_db[:, 0, :]
-    circsym_directivity = circsym_result.directivity_db[:, 0, :]
-    max_error_db = float(
-        np.max(np.abs(native_directivity - circsym_directivity))
+    angles = native_result.observation_angles_deg
+    for index, frequency in enumerate(frequencies_hz):
+        ka = 2.0 * np.pi * frequency * radius / _SPEED_OF_SOUND
+        airy_db = 20.0 * np.log10(_airy_directivity(ka, angles))
+        np.testing.assert_allclose(native_directivity[index], airy_db, atol=0.15)
+    _assert_outward_baffled_piston(
+        _coupled_ib_absolute_sign_scale(
+            native_result.pressure_complex, frequencies_hz, radius,
+            observation.distance_m, angles,
+        )
     )
 
     assert all(entry.get("coupled_ib") is True for entry in native_result.native_diagnostics)
@@ -343,8 +307,8 @@ def test_native_coupled_ib_straight_circular_channel_matches_circsym(
         entry.get("aperture_velocity_basis") == "DP0"
         for entry in native_result.native_diagnostics
     )
+    _assert_piston_radiation_impedance(native_result.impedance, frequencies_hz, radius)
     assert native_directivity[:, -1].min() > -20.0
-    assert max_error_db < 0.05
 
 
 @pytest.mark.slow
@@ -398,7 +362,7 @@ def test_native_coupled_channel_surface_and_hemisphere_power_agree():
     assert float(np.max(np.abs(agreement_db))) < 0.2
 
 
-def test_native_coupled_ib_deep_circular_channel_matches_circsym(
+def test_native_coupled_ib_deep_channel_mesh_convergence(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
@@ -429,46 +393,42 @@ def test_native_coupled_ib_deep_circular_channel_matches_circsym(
         metal_native_assembly_mode="corrected",
         dense_solve_dtype="float64",
     )
-    circsym_config = SolveConfig(
-        velocity_sources={TAG_THROAT: 1.0},
-        velocity_mode=VelocityMode.VELOCITY,
-        circsym_aperture_tag=TAG_APERTURE,
-        observation=observation,
-    )
-
     native_result = metal_bem.solve_frequencies(
         _straight_channel_mesh(radius, depth, rings=5, sectors=32),
         frequencies_hz,
         native_config,
     )
-    circsym_result = metal_bem.solve_circsym_frequencies(
-        _straight_channel_meridian(radius, depth, target_edge=radius / 5.0),
+    refined_result = metal_bem.solve_frequencies(
+        _straight_channel_mesh(radius, depth, rings=7, sectors=48),
         frequencies_hz,
-        circsym_config,
+        native_config,
     )
-
-    native_directivity = native_result.directivity_db[:, 0, :]
-    circsym_directivity = circsym_result.directivity_db[:, 0, :]
-    max_error_db = float(
-        np.max(np.abs(native_directivity - circsym_directivity))
-    )
+    max_error_db = float(np.max(np.abs(
+        native_result.directivity_db - refined_result.directivity_db
+    )))
 
     assert all(entry.get("coupled_ib") is True for entry in native_result.native_diagnostics)
     assert max_error_db < 0.8
 
 
 # ---------------------------------------------------------------------------
-# Absolute-pressure (sign/phase) gate.
-#
-# All the parity checks above compare NORMALIZED directivity, which is invariant
-# to a global sign/phase on the radiated field. A 180 deg inversion of the
-# coupled-IB Rayleigh field therefore slips through them silently (and native and
-# CircSym shared the same convention, so native-vs-CircSym could not catch it).
-# These tests pin the ABSOLUTE pressure convention of the coupled solve against
-# the established flat-piston Rayleigh convention, so a +/- drift fails loudly.
+# Absolute-pressure (sign/phase) gate against a baffled piston. Normalized
+# directivity alone cannot catch global phase or sign errors in IB coupling.
 
 _SPEED_OF_SOUND = 343.0
 _AIR_DENSITY = SolveConfig().air_density
+
+
+def _assert_piston_radiation_impedance(
+    measured: np.ndarray, frequencies_hz: np.ndarray, radius: float,
+) -> None:
+    """Shallow-channel source impedance approaches a rigid baffled piston."""
+    ka = 2.0 * np.pi * frequencies_hz * radius / _SPEED_OF_SOUND
+    resistance = _AIR_DENSITY * _SPEED_OF_SOUND * (1.0 - j1(2.0 * ka) / ka)
+    # This solver uses exp(-i omega t), hence negative mass-like reactance.
+    reactance = -_AIR_DENSITY * _SPEED_OF_SOUND * struve(1, 2.0 * ka) / ka
+    np.testing.assert_allclose(measured.real, resistance, rtol=0.20)
+    np.testing.assert_allclose(measured.imag, reactance, rtol=0.20)
 
 
 def _analytic_baffled_piston(radius: float, points: np.ndarray, k: float) -> np.ndarray:
@@ -533,36 +493,8 @@ def _assert_outward_baffled_piston(scales: list[tuple[complex, float]]) -> None:
         assert resid < 0.03, f"directivity shape off analytic piston (resid={resid:.3%})"
 
 
-def test_circsym_coupled_ib_radiates_outward_absolute_sign():
-    radius, depth, distance = 0.04, 0.003, 1.5
-    frequencies_hz = np.array([800.0, 2000.0], dtype=np.float64)
-    angles = np.linspace(0.0, 90.0, 10)
-    config = SolveConfig(
-        velocity_sources={TAG_THROAT: 1.0},
-        velocity_mode=VelocityMode.VELOCITY,
-        circsym_aperture_tag=TAG_APERTURE,
-        observation=ObservationConfig(
-            distance_m=distance,
-            angle_min_deg=0.0,
-            angle_max_deg=90.0,
-            angle_count=angles.size,
-            planes=["horizontal"],
-            origin="mouth",
-        ),
-    )
-    result = metal_bem.solve_circsym_frequencies(
-        _straight_channel_meridian(radius, depth, target_edge=radius / 5.0),
-        frequencies_hz,
-        config,
-    )
-    _assert_outward_baffled_piston(
-        _coupled_ib_absolute_sign_scale(
-            result.pressure_complex, frequencies_hz, radius, distance, angles
-        )
-    )
-
-
-def test_native_coupled_ib_radiates_outward_absolute_sign():
+@pytest.mark.parametrize("velocity_mode", [VelocityMode.VELOCITY, VelocityMode.ACCELERATION])
+def test_native_coupled_ib_radiates_outward_absolute_sign(velocity_mode: str):
     status = discover_native_runtime(run_smoke_test=True)
     if not status.available:
         pytest.skip(
@@ -574,7 +506,7 @@ def test_native_coupled_ib_radiates_outward_absolute_sign():
     angles = np.linspace(0.0, 90.0, 10)
     config = SolveConfig(
         velocity_sources={TAG_THROAT: 1.0},
-        velocity_mode=VelocityMode.VELOCITY,
+        velocity_mode=velocity_mode,
         aperture_tag=TAG_APERTURE,
         observation=ObservationConfig(
             distance_m=distance,
@@ -592,58 +524,11 @@ def test_native_coupled_ib_radiates_outward_absolute_sign():
         frequencies_hz,
         config,
     )
+    if velocity_mode == VelocityMode.ACCELERATION:
+        # a = -i*omega*v under exp(-i*omega*t); recover unit velocity.
+        result.pressure_complex *= -1j * 2.0 * np.pi * frequencies_hz[:, None, None]
     _assert_outward_baffled_piston(
         _coupled_ib_absolute_sign_scale(
             result.pressure_complex, frequencies_hz, radius, distance, angles
         )
     )
-
-
-def test_circsym_coupled_ib_acceleration_drive_absolute_sign():
-    """Acceleration drive a*cos(omega t): p = rho*a*(half-space single layer).
-
-    Under e^{-i omega t} the velocity phasor for a*cos(omega t) is
-    v = a/(-i omega), so p = -i*omega*rho*SL(v) = rho*a*SL(unit). Before
-    2026-07-09 the mapping used v = a/(+i omega) (the e^{+j omega t} rule),
-    which inverted every acceleration-driven field; the inversion was found by
-    comparing un-normalized pressure exports against ABEC3 (global -1, both the
-    3D coupled-IB and CircSym paths). Magnitudes, normalized directivity, and
-    impedance are invariant to it, so only this absolute gate protects it.
-    """
-    radius, depth, distance = 0.04, 0.003, 1.5
-    frequencies_hz = np.array([800.0, 2000.0], dtype=np.float64)
-    angles = np.linspace(0.0, 90.0, 10)
-    config = SolveConfig(
-        velocity_sources={TAG_THROAT: 1.0},
-        velocity_mode=VelocityMode.ACCELERATION,
-        circsym_aperture_tag=TAG_APERTURE,
-        observation=ObservationConfig(
-            distance_m=distance,
-            angle_min_deg=0.0,
-            angle_max_deg=90.0,
-            angle_count=angles.size,
-            planes=["horizontal"],
-            origin="mouth",
-        ),
-    )
-    result = metal_bem.solve_circsym_frequencies(
-        _straight_channel_meridian(radius, depth, target_edge=radius / 5.0),
-        frequencies_hz,
-        config,
-    )
-    pts = np.column_stack(
-        [
-            distance * np.sin(np.deg2rad(angles)),
-            np.zeros_like(angles),
-            distance * np.cos(np.deg2rad(angles)),
-        ]
-    )
-    verts, tris = _triangulated_disc(radius, rings=20, sectors=128)
-    for i, f in enumerate(frequencies_hz):
-        k = 2.0 * np.pi * float(f) / _SPEED_OF_SOUND
-        analytic = _AIR_DENSITY * _rayleigh_pressure_uniform_disc(verts, tris, pts, k)
-        measured = result.pressure_complex[i, 0, :]
-        scale = complex(np.vdot(analytic, measured) / np.vdot(analytic, analytic))
-        assert scale.real > 0.5, f"acceleration field inverted (scale={scale:+.3f})"
-        assert abs(scale.imag) < 0.30, f"unexpected phase (scale={scale:+.3f})"
-        assert 0.8 < abs(scale) < 1.3, f"magnitude off (scale={scale:+.3f})"

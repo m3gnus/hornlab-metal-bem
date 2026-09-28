@@ -3,8 +3,8 @@
 The frame-relative sphere grid must stay aligned with the polar arcs: a grid
 point at (theta=90, phi=0) is by construction the same physical location as
 the horizontal arc's 90-degree point, so both must return the same pressure
-from the same solved system. CircSym gets the same parity check plus a
-pulsating-sphere physics check (p ~ e^{ikd}/d about the sphere centre).
+from the same solved system. A full-3D pulsating sphere also checks
+the outgoing spherical wave (p ~ e^{ikd}/d about its centre).
 """
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ import pytest
 
 import hornlab_metal_bem as metal_bem
 from hornlab_metal_bem._constants import SPEED_OF_SOUND
-from hornlab_metal_bem.circsym import MeridianMesh
 from hornlab_metal_bem.config import ObservationConfig, SolveConfig, VelocityMode
 from hornlab_metal_bem.mesh import LoadedMesh, make_pure_grid
 from hornlab_metal_bem.observation import ObservationFrame
@@ -136,14 +135,6 @@ def _quarter_capped_sphere_mesh() -> LoadedMesh:
             physical_groups={1: "rigid", 2: "cap"},
             bounding_box_m=(vertices.min(axis=0), vertices.max(axis=0)),
         ),
-    )
-
-
-def _pulsating_sphere_meridian(radius: float, *, segments: int = 64) -> MeridianMesh:
-    theta = np.linspace(0.0, np.pi, segments + 1)
-    return MeridianMesh.from_polyline(
-        np.column_stack([radius * np.sin(theta), radius * np.cos(theta)]),
-        tags=2,
     )
 
 
@@ -380,16 +371,9 @@ def test_native_yz_xz_balloon_dedupe_matches_full_evaluation():
     assert full.native_diagnostics[0]["sphere_symmetry_dedupe"] is False
 
 
-def test_circsym_sphere_grid_matches_arcs_and_point_source_decay():
-    meridian = metal_bem.MeridianMesh.from_polyline(
-        np.column_stack(
-            [
-                0.1 * np.sin(np.linspace(0.0, np.pi, 49)),
-                0.1 * np.cos(np.linspace(0.0, np.pi, 49)),
-            ]
-        ),
-        tags=2,
-    )
+def test_native_pulsating_sphere_grid_matches_arcs_and_point_source_decay():
+    _require_native()
+    radius = 0.1
     observation = metal_bem.ObservationConfig(
         planes=["horizontal", "vertical"],
         angle_min_deg=0.0,
@@ -398,9 +382,16 @@ def test_circsym_sphere_grid_matches_arcs_and_point_source_decay():
         distance_m=2.0,
         sphere_grid=(7, 12),
     )
-    config = metal_bem.native_config(observation=observation)
+    config = metal_bem.native_config(
+        observation=observation,
+        velocity_sources={2: 1.0},
+        frame_override=_sphere_frame(),
+        dense_solve_dtype="float64",
+    )
     frequency = 1200.0
-    result = metal_bem.solve_circsym_frequencies(meridian, [frequency], config)
+    result = metal_bem.solve_frequencies(
+        _pulsating_sphere_mesh(radius), [frequency], config
+    )
 
     n_points = 7 * 12
     assert result.sphere_pressure_complex is not None
@@ -419,7 +410,7 @@ def test_circsym_sphere_grid_matches_arcs_and_point_source_decay():
     ) < 0.1
     diagnostics = result.native_diagnostics[0]
     assert diagnostics["sphere_targets"] == n_points
-    assert diagnostics["sphere_evaluation_targets"] == 7
+    assert 0 < diagnostics["sphere_evaluation_targets"] <= n_points
 
     angles = np.asarray(result.observation_angles_deg)
     arc_90 = int(np.argmin(np.abs(angles - 90.0)))
@@ -438,21 +429,21 @@ def test_circsym_sphere_grid_matches_arcs_and_point_source_decay():
     d = np.linalg.norm(np.asarray(result.sphere_points), axis=1)
     normalized = sphere[0] * d * np.exp(-1j * k * d)
     magnitudes = np.abs(normalized)
-    assert magnitudes.max() / magnitudes.min() == pytest.approx(1.0, abs=0.02)
-    np.testing.assert_array_equal(
+    assert magnitudes.max() / magnitudes.min() == pytest.approx(1.0, abs=0.03)
+    np.testing.assert_allclose(
         sphere[0].reshape(7, 12),
         np.repeat(sphere[0].reshape(7, 12)[:, :1], 12, axis=1),
+        rtol=0.03,
     )
 
 
 @pytest.mark.slow
-def test_native_full3d_pulsating_sphere_matches_circsym_through_16khz():
-    """Qualify CircSym against full-3D Metal on a closed round body.
+def test_native_full3d_pulsating_sphere_matches_analytic_through_16khz():
+    """Qualify full-3D Metal against a closed round body.
 
     This gate intentionally includes an HF case and compares un-normalized
     complex pressure, not only response shape.  The analytic spherical-wave
-    reference prevents two implementations from passing through a shared
-    amplitude or phase error; the complete 0..180-degree arc also pins the
+    reference catches amplitude or phase error; the complete 0..180-degree arc pins the
     integrated directivity index.
     """
     _require_native()
@@ -480,14 +471,7 @@ def test_native_full3d_pulsating_sphere_matches_circsym_through_16khz():
         frequencies_hz,
         SolveConfig(**common),
     )
-    circsym = metal_bem.solve_circsym_frequencies(
-        _pulsating_sphere_meridian(radius),
-        frequencies_hz,
-        SolveConfig(**common),
-    )
-
     native_pressure = native.pressure_complex[:, 0, :]
-    circsym_pressure = circsym.pressure_complex[:, 0, :]
     analytic = _analytic_pulsating_sphere_pressure(
         frequencies_hz,
         radius,
@@ -495,31 +479,17 @@ def test_native_full3d_pulsating_sphere_matches_circsym_through_16khz():
         SolveConfig().air_density,
     )
 
-    # Both discretizations must independently recover the analytic level and
-    # phase.  This is stricter and more diagnostic than normalized-pattern-only
-    # parity, especially for a nominally omnidirectional radiator.
-    for measured in (native_pressure[:, 0], circsym_pressure[:, 0]):
-        level_error_db = 20.0 * np.log10(np.abs(measured / analytic))
-        phase_error_deg = np.rad2deg(np.angle(measured / analytic))
-        assert float(np.max(np.abs(level_error_db))) < 0.5
-        assert float(np.max(np.abs(phase_error_deg))) < 5.0
-
-    parity_ratio = native_pressure / circsym_pressure
-    assert float(np.max(np.abs(20.0 * np.log10(np.abs(parity_ratio))))) < 0.5
-    assert float(np.max(np.abs(np.rad2deg(np.angle(parity_ratio))))) < 5.0
-    assert float(np.max(np.abs(native.directivity_db - circsym.directivity_db))) < 0.5
+    measured = native_pressure[:, 0]
+    level_error_db = 20.0 * np.log10(np.abs(measured / analytic))
+    phase_error_deg = np.rad2deg(np.angle(measured / analytic))
+    assert float(np.max(np.abs(level_error_db))) < 0.5
+    assert float(np.max(np.abs(phase_error_deg))) < 5.0
 
     native_di = _axisymmetric_directivity_index_db(
         native_pressure,
         native.observation_angles_deg,
     )
-    circsym_di = _axisymmetric_directivity_index_db(
-        circsym_pressure,
-        circsym.observation_angles_deg,
-    )
-    assert float(np.max(np.abs(native_di - circsym_di))) < 0.1
     assert float(np.max(np.abs(native_di))) < 0.1
-    assert float(np.max(np.abs(circsym_di))) < 0.1
 
     # Rotational invariance is part of the model contract, not merely expected
     # from the analytic solution.
@@ -528,12 +498,6 @@ def test_native_full3d_pulsating_sphere_matches_circsym_through_16khz():
         native.pressure_complex[:, 1, :],
         rtol=2.0e-3,
         atol=1.0e-8,
-    )
-    np.testing.assert_allclose(
-        circsym.pressure_complex[:, 0, :],
-        circsym.pressure_complex[:, 1, :],
-        rtol=1.0e-10,
-        atol=1.0e-10,
     )
 
 

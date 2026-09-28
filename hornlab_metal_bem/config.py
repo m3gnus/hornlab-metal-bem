@@ -401,15 +401,6 @@ class SolveConfig:
     # boundary rows; override only to bias the interior constraint harder/softer.
     chief_weight: float = 1.0
 
-    # Axisymmetric pure-Python solver option. None is free field; a finite
-    # z-coordinate enables a same-sign rigid/Neumann image source plane for
-    # body-of-revolution m=0 solves.
-    circsym_baffle_z: float | None = None
-    # Axisymmetric exact infinite-baffle coupled solve. Names the meridian
-    # segment tag that represents the flush mouth-aperture disc; None keeps the
-    # existing CircSym path unchanged.
-    circsym_aperture_tag: int | None = None
-
     # Observation
     observation: ObservationConfig = field(default_factory=ObservationConfig)
 
@@ -420,7 +411,7 @@ class SolveConfig:
 
     # Native Metal controls
     # Full-3D native Metal coupled infinite-baffle solve. Names the physical tag
-    # for the flush z=0 aperture triangles. Independent of circsym_aperture_tag.
+    # for the flush z=0 aperture triangles.
     aperture_tag: int | None = None
     native_symmetry_plane: NativeSymmetryPlane | None = None
     # Rigid (Neumann) infinite half-space boundary, named for the coordinate
@@ -537,11 +528,6 @@ class SolveConfig:
     # any other return value, including None, continues.
     on_frequency_result: Callable[[int, float, dict], bool] | None = None
 
-    # Fine-grained CircSym cancellation checkpoint. Called within expensive
-    # assembly and field-evaluation blocks. Return exactly False to cancel;
-    # callers may instead raise their own runtime-specific cancellation exception.
-    should_continue: Callable[[], bool | None] | None = None
-
     def __post_init__(self) -> None:
         if self.freq_spacing not in {"log", "linear"}:
             raise ValueError("freq_spacing must be 'log' or 'linear'")
@@ -616,19 +602,6 @@ class SolveConfig:
                 raise ValueError("chief_points must be finite")
         if not (math.isfinite(self.chief_weight) and self.chief_weight > 0):
             raise ValueError("chief_weight must be finite and positive")
-        if self.circsym_baffle_z is not None and not math.isfinite(
-            float(self.circsym_baffle_z)
-        ):
-            raise ValueError("circsym_baffle_z must be finite or None")
-        if self.circsym_aperture_tag is not None:
-            if (
-                isinstance(self.circsym_aperture_tag, bool)
-                or not isinstance(self.circsym_aperture_tag, Integral)
-                or self.circsym_aperture_tag <= 0
-            ):
-                raise ValueError(
-                    "circsym_aperture_tag must be a positive int or None"
-                )
         if self.aperture_tag is not None:
             if (
                 isinstance(self.aperture_tag, bool)
@@ -660,11 +633,11 @@ class SolveConfig:
                     "infinite-baffle aperture_tag mode"
                 )
         if self.formulation == BIEFormulation.BURTON_MILLER:
-            if self.aperture_tag is not None or self.circsym_aperture_tag is not None:
+            if self.aperture_tag is not None:
                 raise ValueError("burton_miller does not support coupled infinite-baffle solves")
             if self.impedance_sources or self.impedance_source_callback is not None:
                 raise ValueError("burton_miller requires prescribed-Neumann boundaries; Robin/impedance is unsupported")
-            if self.ground_plane is not None or self.circsym_baffle_z is not None:
+            if self.ground_plane is not None:
                 raise ValueError("burton_miller supports exterior full/half/quarter symmetry only")
             if self.chief_points is not None:
                 raise ValueError("burton_miller does not compose with CHIEF points")
