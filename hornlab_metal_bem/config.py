@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import math
 from numbers import Integral
-from typing import TYPE_CHECKING, Callable, Literal
+from typing import TYPE_CHECKING, Callable, Literal, Mapping
 
 from ._constants import AIR_DENSITY, SPEED_OF_SOUND
 
@@ -157,6 +157,14 @@ def _validated_velocity_sources(
             raise ValueError(f"{field_name} weights must be finite complex numbers")
         validated[tag_int] = weight
     return validated
+
+
+def _impedance_source_tag(sources: Mapping[int, object]) -> int:
+    """Choose the lowest driven source tag, falling back to the lowest key."""
+    return min(
+        (tag for tag, weight in sources.items() if weight != 0),
+        default=min(sources, default=2),
+    )
 
 
 def _resolve_velocity_sources(

@@ -111,7 +111,7 @@ def _observation_config() -> metal_bem.ObservationConfig:
 # infer identical observation frames; the zero-velocity tag is undriven.
 _SOURCES = [
     {2: 1.0, 3: 0.0},
-    {3: 1.0, 2: 0.0},
+    {2: 0.0, 3: 1.0},
 ]
 _FREQUENCIES = [180.0, 240.0, 320.0]
 
@@ -188,11 +188,54 @@ def test_multi_source_matches_sequential_solves():
             ),
         )
         _assert_results_match(multi_result, sequential)
+        assert multi_result.surface_pressure_avg is not None
+        driven_tags = [tag for tag, weight in source.items() if weight != 0]
+        impedance_tag = min(driven_tags) if driven_tags else min(source, default=2)
+        # The sequential solve uses the same implementation, so parity alone
+        # cannot detect both paths selecting a listed zero-weight tag.
+        np.testing.assert_allclose(
+            multi_result.impedance,
+            multi_result.surface_pressure_avg[impedance_tag],
+            rtol=2.0e-4,
+            atol=1.0e-6,
+        )
         # Multi-source diagnostics still acknowledge the shared factorization.
         assert multi_result.native_diagnostics
     # The shared-cost attribution: only source 0 carries assembly seconds.
     assert multi_results[0].timings["assembly_s"] > 0.0
     assert multi_results[1].timings["assembly_s"] == 0.0
+
+
+@pytest.mark.slow
+def test_single_solve_padded_source_uses_driven_tag_and_zero_fallback():
+    _require_native()
+    mesh = _two_cap_sphere_mesh()
+    source = {2: 0.0, 3: 1.0}
+    result = metal_bem.solve(
+        mesh,
+        _configs(
+            freq_min_hz=180.0,
+            freq_max_hz=180.0,
+            freq_count=1,
+            velocity_sources=source,
+        ),
+    )
+
+    assert result.surface_pressure_avg is not None
+    assert not np.allclose(
+        result.surface_pressure_avg[2], result.surface_pressure_avg[3],
+        rtol=2.0e-4, atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        result.impedance,
+        result.surface_pressure_avg[3],
+        rtol=2.0e-4,
+        atol=1.0e-6,
+    )
+
+    from hornlab_metal_bem.config import _impedance_source_tag
+
+    assert _impedance_source_tag({2: 0.0, 3: 0.0}) == 2
 
 
 @pytest.mark.slow

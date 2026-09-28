@@ -30,6 +30,7 @@ from .config import (
     NATIVE_GROUND_PLANES,
     NATIVE_SYMMETRY_PLANES,
     SolveConfig,
+    _impedance_source_tag,
     _validated_impedance_sources,
     _validated_velocity_sources,
 )
@@ -1095,7 +1096,7 @@ def run_sweep_native_metal(
     solver_log: list[dict] = []
     completed_freqs: list[float] = []
     on_axis_idx = int(np.argmin(np.abs(angles_deg)))
-    impedance_source_tag = min(config.velocity_sources.keys(), default=2)
+    impedance_source_tag = _impedance_source_tag(config.velocity_sources)
     n_planes, n_angles, _ = obs_points.shape
     sphere_points_arr, sphere_theta_deg, sphere_phi_deg = _resolve_sphere_observation(
         frame, config.observation
@@ -1515,7 +1516,7 @@ def run_sweep_native_metal_multi_source(
         frame.source_center,
     )
     impedance_source_tags = [
-        min(source.keys(), default=2) for source in sources
+        _impedance_source_tag(source) for source in sources
     ]
     impedance_sources_arg = _impedance_sources_for_frequencies(
         mesh.physical_tags, frequencies, config

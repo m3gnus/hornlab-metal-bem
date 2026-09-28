@@ -17,6 +17,7 @@ from .config import (
     SourceProfile,
     TaperProfile,
     VelocityMode,
+    _impedance_source_tag,
 )
 from .assembly import (
     BodyPlacement,
@@ -191,7 +192,7 @@ def _resolve_frame(loaded: LoadedMesh, config: SolveConfig) -> ObservationFrame:
     frame = infer_frame(
         loaded.grid,
         loaded.physical_tags,
-        source_tag=min(config.velocity_sources.keys(), default=2),
+        source_tag=_impedance_source_tag(config.velocity_sources),
         origin_at=config.observation.origin,
         symmetry_plane=config.native_symmetry_plane,
     )
