@@ -238,6 +238,25 @@ def test_single_solve_padded_source_uses_driven_tag_and_zero_fallback():
     assert _impedance_source_tag({2: 0.0, 3: 0.0}) == 2
 
 
+def test_padded_zero_weight_source_does_not_move_observation_frame():
+    mesh = _two_cap_sphere_mesh()
+    source = {2: 0.0, 3: 1.0}
+    config = _configs(velocity_sources=source)
+
+    from hornlab_metal_bem.observation import infer_frame
+
+    frame = metal_bem._resolve_frame(mesh, config)
+    baseline = infer_frame(
+        mesh.grid,
+        mesh.physical_tags,
+        source_tag=min(source),
+        origin_at=config.observation.origin,
+        symmetry_plane=config.native_symmetry_plane,
+    )
+    np.testing.assert_allclose(frame.source_center, baseline.source_center)
+    np.testing.assert_allclose(frame.axis, baseline.axis)
+
+
 @pytest.mark.slow
 def test_multi_source_matches_sequential_float64_and_chief():
     _require_native()
