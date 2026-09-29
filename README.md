@@ -213,6 +213,21 @@ Common fields:
   dome/cone/diaphragm; a flat disc reduces exactly to `NORMAL`; one tag covering
   both front/back faces of a thin diaphragm gives the dipole path because axial
   preserves the opposite per-face signs)
+- `source_axes`, optional `{tag: (x, y, z)}` giving each axial source its own
+  piston axis in mesh coordinates (normalized on use). Default `None` keeps the
+  legacy behaviour: the observation-frame axis with one area-weighted sign vote
+  per tag, which makes the drive depend on tag grouping and on the plotting
+  frame. With `source_axes` every axial tag needs an entry (`ValueError`
+  otherwise), the per-face drive is `weight * (n_hat . axis)` with no sign vote
+  (an axis against the outward normals drives the faces negative; the caller
+  owns polarity), no symmetry projection (on a `native_symmetry_plane` solve the
+  axis must lie in the symmetry subspace or a `ValueError` asks for the full
+  model) and no dependence on the observation frame. `TaperProfile`,
+  `AnnularProfile` and `CallableProfile` still use the frame axis and refuse an
+  entry in `source_axes`. In `solve_multi_source`, `source_axes` must cover every
+  axial tag of every source and `velocity_sources` must list those tags.
+  Axial motion with a degenerate resolved axis now raises instead of silently
+  running as uniform normal
 - `source_velocity_profiles`, optional per-tag overrides for `source_motion`:
   `NormalProfile`, `AxialProfile`, `TaperProfile(kind="raised_cosine"|"linear",
   start=0.7)`, `AnnularProfile(r_inner, r_outer)`, plus `PerFaceProfile(weights)`

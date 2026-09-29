@@ -10,6 +10,8 @@
 - Add `scripts/schur_race_stress/` (manual stress reproduction of the legacy LAPACK failure; not run in CI).
 - Add tests that the built helper links no legacy LAPACK symbol and that a large-aperture coupled-IB batch solves identically at solve concurrency 6 and 1.
 - Refuse `aperture_tag` (coupled infinite baffle) with any `metal_native_assembly_mode` other than `"corrected"` (`"optimized"`, `"parity"`, `"reference"`): those modes omit the singular aperture integrals at real k and are wrong at resonance (`"optimized"`: about 0.9 dB and 17 degrees on a 100 mm channel). `SolveConfig` raises `ValueError`; the native helper fails with a clear message. Use `"corrected"` (the default).
+- Add `SolveConfig.source_axes`, an optional per-source piston axis `{tag: (x, y, z)}`. Each axial source moves along its own axis with per-face scale `n_hat . axis`, no area-weighted sign vote, no symmetry projection and no dependence on the observation frame; an axis outside the symmetry subspace of a reduced solve raises `ValueError`. `source_axes=None` (default) leaves every existing solve unchanged. `solve_multi_source` honours it and requires an axis for every axial tag.
+- Axial source motion with a degenerate or non-finite resolved axis now raises `ValueError` instead of silently running as uniform normal.
 - Correct a native-helper comment that called `complex_k` the default coupled-IB formulation; the default is `standard`.
 
 ## 0.2.0 — 2026-09-28

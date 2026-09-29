@@ -14,6 +14,7 @@ from .config import (
     SourceMotion,
     TaperProfile,
     VelocityMode,
+    _normalized_source_axes,
     _resolve_velocity_sources,
 )
 from .observation import _project_to_symmetry_subspace
@@ -44,14 +45,21 @@ def _build_axial_face_scale(
     rectify per-face signs -- a future front/back dipole tag keeps its opposite
     faces opposite.
 
-    Returns ``None`` when the axis is degenerate or no source face is present, so
-    the caller keeps the bit-for-bit uniform-normal path.
+    Returns ``None`` when no source face is present, so the caller keeps the
+    bit-for-bit uniform-normal path. A degenerate or non-finite axis with source
+    faces present raises ``ValueError`` (never a silent fall back to normal).
     """
     axis = np.asarray(axis, dtype=np.float64).reshape(-1)
-    if axis.shape[0] != 3:
-        return None
-    axis_norm = float(np.linalg.norm(axis))
+    axis_norm = (
+        float(np.linalg.norm(axis)) if axis.shape[0] == 3 else float("nan")
+    )
     if not np.isfinite(axis_norm) or axis_norm <= 1e-12:
+        if any(
+            np.any(physical_tags == int(t)) for t in source_tags
+        ):
+            raise ValueError(
+                "axial source motion needs a finite, non-zero axis"
+            )
         return None
     axis = axis / axis_norm
 
@@ -182,12 +190,10 @@ def _build_source_face_scale(
     if all(isinstance(profile, NormalProfile) for profile in effective_profiles.values()):
         return None
 
+    # Explicit per-source axes (SolveConfig.source_axes) drive axial tags with
+    # no sign vote, no symmetry projection and no observation-frame input.
+    explicit_axes = _normalized_source_axes(config) or {}
     axis_unit = _normalize_profile_axis(axis)
-    if axis_unit is None and all(
-        isinstance(profile, (NormalProfile, AxialProfile))
-        for profile in effective_profiles.values()
-    ):
-        return None
     axis_required = any(
         isinstance(profile, (TaperProfile, AnnularProfile, CallableProfile))
         for profile in effective_profiles.values()
@@ -202,6 +208,17 @@ def _build_source_face_scale(
     elements = np.asarray(grid.elements.T, dtype=np.int32)
     n_faces = elements.shape[0]
     face_indices_by_tag = _face_indices_for_tags(physical_tags, source_tags)
+    if axis_unit is None:
+        for tag in source_tags:
+            if (
+                face_indices_by_tag[tag].size
+                and isinstance(effective_profiles[tag], AxialProfile)
+                and tag not in explicit_axes
+            ):
+                raise ValueError(
+                    f"axial source motion for tag {tag} needs a finite, "
+                    "non-zero axis; the resolved axis is degenerate"
+                )
     vertices = None
 
     scale = np.zeros(n_faces, dtype=np.complex128)
@@ -237,11 +254,12 @@ def _build_source_face_scale(
             mags = np.linalg.norm(raw, axis=1)
 
             if isinstance(profile, AxialProfile):
-                values = (
-                    np.ones(idx.size, dtype=np.float64)
-                    if axis_unit is None
-                    else _tag_axial_projection(raw, mags, axis_unit)
-                )
+                if tag in explicit_axes:
+                    # Caller-owned polarity: no area-weighted sign vote.
+                    safe_mags = np.where(mags > 1e-15, mags, 1.0)
+                    values = (raw / safe_mags[:, None]) @ explicit_axes[tag]
+                else:
+                    values = _tag_axial_projection(raw, mags, axis_unit)
                 scale[idx] = values
                 continue
 

@@ -607,14 +607,16 @@ class TestAxialFaceScale:
         tags = np.array([2, 2], dtype=np.int32)
         assert _build_axial_face_scale(grid, tags, [99], self.AXIS) is None
 
-    def test_degenerate_axis_returns_none(self):
-        """A zero-length axis -> None (fall back to uniform normal) rather than
-        dividing by zero."""
+    def test_degenerate_axis_raises(self):
+        """A zero-length axis raises rather than silently running uniform
+        normal; a tag with no faces keeps returning None."""
         from hornlab_metal_bem.bie import _build_axial_face_scale
 
         grid = _two_face_cap_grid(np.deg2rad(20.0))
         tags = np.array([2, 2], dtype=np.int32)
-        assert _build_axial_face_scale(grid, tags, [2], np.zeros(3)) is None
+        with pytest.raises(ValueError, match="axis"):
+            _build_axial_face_scale(grid, tags, [2], np.zeros(3))
+        assert _build_axial_face_scale(grid, tags, [99], np.zeros(3)) is None
 
     def test_two_sided_tag_is_axial_dipole_path(self):
         """Dipole path: one source tag covering both diaphragm sides under
@@ -701,7 +703,7 @@ class TestSourceFaceScaleProfiles:
         general = _build_source_face_scale(grid, tags, config, self.AXIS, self.CENTER)
         assert np.array_equal(general, legacy)
 
-    def test_degenerate_axis_axial_matches_legacy_none(self):
+    def test_degenerate_axis_axial_raises(self):
         from hornlab_metal_bem.bie import _build_source_face_scale
 
         grid = _two_face_cap_grid(np.deg2rad(20.0))
@@ -710,10 +712,8 @@ class TestSourceFaceScaleProfiles:
             velocity_sources={2: 1.0}, source_motion=SourceMotion.AXIAL
         )
 
-        assert (
+        with pytest.raises(ValueError, match="axis"):
             _build_source_face_scale(grid, tags, config, np.zeros(3), self.CENTER)
-            is None
-        )
 
     def test_raised_cosine_taper_decreases_with_normalized_radius(self):
         from hornlab_metal_bem.bie import _build_source_face_scale

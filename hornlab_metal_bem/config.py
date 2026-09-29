@@ -345,6 +345,13 @@ class SolveConfig:
     # overrides source_motion for that tag; tags with no profile fall back to
     # source_motion. None leaves historical normal/axial behavior unchanged.
     source_velocity_profiles: dict[int, SourceProfile] | None = None
+    # Optional explicit per-source piston axis, {tag: (x, y, z)} in mesh
+    # coordinates (normalized on use). None keeps the legacy behaviour: the
+    # observation frame axis with one area-weighted sign vote per tag. When
+    # given, every axial tag moves along its own axis: per-face scale is
+    # n_hat . axis with no sign vote, no symmetry projection and no dependence
+    # on the observation frame. See _normalized_source_axes.
+    source_axes: dict[int, tuple[float, float, float]] | None = None
     velocity_sources: dict[int, float] = field(
         default_factory=lambda: {2: 1.0}
     )
@@ -584,6 +591,7 @@ class SolveConfig:
             for tag, profile in self.source_velocity_profiles.items():
                 _validate_boundary_tag(tag, "source_velocity_profiles")
                 _validate_source_profile(profile)
+        _normalized_source_axes(self)
         _validated_impedance_sources(self.impedance_sources)
         if (
             self.impedance_source_callback is not None
@@ -696,6 +704,91 @@ class SolveConfig:
                 if not _is_integral_value(value) or value <= 0:
                     raise ValueError(f"{name} must be a positive integer")
                 setattr(self, name, int(value))
+
+
+_SYMMETRY_PLANE_NORMAL_AXES = {
+    "yz": (0,),
+    "xz": (1,),
+    "xy": (2,),
+    "yz+xz": (0, 1),
+}
+
+
+def _effective_axial_tags(config: SolveConfig) -> set[int]:
+    """Tags whose effective source profile is axial (profile or source_motion)."""
+    profile_map = {
+        int(tag): profile
+        for tag, profile in (config.source_velocity_profiles or {}).items()
+    }
+    tags = {int(tag) for tag in config.velocity_sources} | set(profile_map)
+    fallback_axial = config.source_motion == SourceMotion.AXIAL
+    axial: set[int] = set()
+    for tag in tags:
+        profile = profile_map.get(tag)
+        if profile is None:
+            if fallback_axial:
+                axial.add(tag)
+        elif isinstance(profile, AxialProfile):
+            axial.add(tag)
+    return axial
+
+
+def _normalized_source_axes(config: SolveConfig) -> dict[int, "np.ndarray"] | None:
+    """Validate ``config.source_axes`` and return unit axes per tag (or None)."""
+    import numpy as np
+
+    if config.source_axes is None:
+        return None
+    if not isinstance(config.source_axes, dict):
+        raise ValueError("source_axes must be a dict or None")
+    axial_tags = _effective_axial_tags(config)
+    if not axial_tags:
+        raise ValueError(
+            "source_axes needs axial motion: set source_motion='axial' or an "
+            "AxialProfile for the tag"
+        )
+    axes: dict[int, np.ndarray] = {}
+    for key, value in config.source_axes.items():
+        tag = _validate_boundary_tag(key, "source_axes")
+        if tag not in axial_tags:
+            raise ValueError(
+                f"source_axes tag {tag} is not an axial velocity-source tag"
+            )
+        try:
+            vec = np.asarray(value, dtype=np.float64).reshape(-1)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"source_axes axis of tag {tag} must be 3 finite numbers"
+            ) from exc
+        if vec.shape != (3,) or not np.all(np.isfinite(vec)):
+            raise ValueError(
+                f"source_axes axis of tag {tag} must be 3 finite numbers"
+            )
+        norm = float(np.linalg.norm(vec))
+        if not norm > 1e-12:
+            raise ValueError(
+                f"source_axes axis of tag {tag} must have non-zero length"
+            )
+        unit = vec / norm
+        plane = config.native_symmetry_plane
+        if plane is not None:
+            for component in _SYMMETRY_PLANE_NORMAL_AXES.get(
+                str(plane).strip().lower(), ()
+            ):
+                if abs(unit[component]) > 1e-9:
+                    raise ValueError(
+                        f"axis of source tag {tag} is not in the symmetry "
+                        "subspace; solve the full model"
+                    )
+        axes[tag] = unit
+    missing = sorted(axial_tags - set(axes))
+    if missing:
+        raise ValueError(
+            f"source_axes has no axis for axial source tag(s) {missing}; "
+            "give every axial source an axis (legacy and explicit axes are "
+            "not mixed within one solve)"
+        )
+    return axes
 
 
 def _validate_source_profile(profile: SourceProfile) -> None:

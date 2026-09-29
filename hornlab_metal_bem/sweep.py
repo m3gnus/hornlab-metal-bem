@@ -25,11 +25,13 @@ from .bie import (
     normal_velocity_from_driver_neumann,
 )
 from .config import (
+    AxialProfile,
     BIEFormulation,
     GROUND_PLANE_NORMAL_AXIS,
     NATIVE_GROUND_PLANES,
     NATIVE_SYMMETRY_PLANES,
     SolveConfig,
+    _effective_axial_tags,
     _impedance_source_tag,
     _validated_impedance_sources,
     _validated_velocity_sources,
@@ -1417,6 +1419,42 @@ def _extra_source_system_view(system, extra) -> SimpleNamespace:
     )
 
 
+def _source_axes_for_tags(config: SolveConfig, tags) -> dict | None:
+    """``config.source_axes`` restricted to ``tags`` (multi-source solves).
+
+    ``config.velocity_sources`` is ignored by the multi-source path, so each
+    per-source config sees only its own tags. A source that drives an axial tag
+    with no axis raises instead of silently running the legacy axis.
+    """
+    if config.source_axes is None:
+        return None
+    wanted = {int(tag) for tag in tags}
+    # A per-source config still carries every tag's source_velocity_profiles, so
+    # the other sources' axial-profile tags stay "axial" there and need their
+    # axes to pass validation.
+    keep = wanted | {
+        int(tag)
+        for tag, profile in (config.source_velocity_profiles or {}).items()
+        if isinstance(profile, AxialProfile)
+    }
+    subset = {
+        int(tag): axis
+        for tag, axis in config.source_axes.items()
+        if int(tag) in keep
+    }
+    if subset:
+        return subset
+    probe = replace(
+        config, source_axes=None, velocity_sources={t: 1.0 for t in wanted}
+    )
+    if _effective_axial_tags(probe) & wanted:
+        raise ValueError(
+            "source_axes has no axis for axial source tag(s) "
+            f"{sorted(wanted)}; give every axial source an axis"
+        )
+    return None
+
+
 def run_sweep_native_metal_multi_source(
     mesh: LoadedMesh,
     frequencies: NDArray[np.float64],
@@ -1454,7 +1492,12 @@ def run_sweep_native_metal_multi_source(
             "multi-source solves do not support velocity_source_callback"
         )
     per_source_configs = [
-        replace(config, velocity_sources=dict(source)) for source in sources
+        replace(
+            config,
+            velocity_sources=dict(source),
+            source_axes=_source_axes_for_tags(config, source),
+        )
+        for source in sources
     ]
     if len(sources) == 1:
         return [
@@ -1507,6 +1550,7 @@ def run_sweep_native_metal_multi_source(
     scale_config = replace(
         config,
         velocity_sources={tag: 1.0 for tag in source_tags},
+        source_axes=_source_axes_for_tags(config, source_tags),
     )
     source_face_scale = _build_source_face_scale(
         mesh.grid,

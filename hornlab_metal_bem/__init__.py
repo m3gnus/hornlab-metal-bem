@@ -284,7 +284,11 @@ def solve_multi_source(
 
     loaded = _resolve_mesh(mesh, config)
     config = _config_for_loaded_mesh(loaded, config)
-    frame_config = _replace(config, velocity_sources=dict(sources[0]))
+    # Frame inference ignores the drive, so the explicit axes are dropped here
+    # rather than validated against the narrowed first-source tag set.
+    frame_config = _replace(
+        config, velocity_sources=dict(sources[0]), source_axes=None
+    )
     frame = _resolve_frame(loaded, frame_config)
     freqs = (
         _build_frequency_grid(config)
