@@ -30,6 +30,7 @@ from test_native_coupled_ib_validation import (
     TAG_APERTURE,
     TAG_THROAT,
     TAG_WALL,
+    _straight_channel_mesh,
     _triangulated_disc,
     _z_axis_frame,
 )
@@ -168,5 +169,39 @@ def test_coupled_ib_large_aperture_concurrent_solve_matches_serial(monkeypatch):
     for result in (serial, concurrent):
         assert np.all(np.isfinite(result.pressure_complex))
         assert np.all(np.isfinite(result.impedance))
-    np.testing.assert_array_equal(concurrent.pressure_complex, serial.pressure_complex)
-    np.testing.assert_array_equal(concurrent.impedance, serial.impedance)
+    # Bitwise equality is expected on this machine, but Accelerate's results may
+    # depend on the thread count on small CI runners: allow float32 rounding.
+    np.testing.assert_allclose(
+        concurrent.pressure_complex, serial.pressure_complex, rtol=1e-6, atol=0.0
+    )
+    np.testing.assert_allclose(concurrent.impedance, serial.impedance, rtol=1e-6, atol=0.0)
+
+
+@pytest.mark.parametrize("quantity", ["surface", "field"])
+def test_non_finite_result_fails_with_case_and_frequency(monkeypatch, quantity):
+    """The helper names the case, frequency and quantity instead of aborting.
+
+    HORNLAB_METAL_BEM_NATIVE_TEST_INJECT_NAN (test-only, off by default) plants a NaN
+    in one case's surface pressure or field output before the finiteness scan.
+    """
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
+    require_fresh_native_helper()
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_TEST_INJECT_NAN", f"1:{quantity}")
+    depth = 0.003
+    config = SolveConfig(
+        velocity_sources={TAG_THROAT: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        aperture_tag=TAG_APERTURE,
+        observation=ObservationConfig(
+            distance_m=1.0, angle_min_deg=0.0, angle_max_deg=90.0,
+            angle_count=3, planes=["horizontal"], origin="mouth",
+        ),
+        frame_override=_z_axis_frame(depth),
+        metal_native_assembly_mode="corrected",
+    )
+    mesh = _straight_channel_mesh(0.04, depth, rings=3, sectors=16)
+    with pytest.raises(RuntimeError) as excinfo:
+        metal_bem.solve_frequencies(mesh, np.array([800.0, 1600.0, 2400.0]), config)
+    message = str(excinfo.value)
+    assert "non-finite" in message and quantity in message, message
+    assert "case 1" in message and "frequency_hz 1600.0" in message, message

@@ -127,6 +127,38 @@ func writeF32(_ path: String, _ values: [Float]) throws {
     try data.write(to: url)
 }
 
+/// Test-only fault injection, off unless HORNLAB_METAL_BEM_NATIVE_TEST_INJECT_NAN is
+/// set to "<case index>:<surface|field>". It plants a NaN in that case's
+/// quantity just before the finiteness scan, so tests can pin the error message.
+func testInjectNaN(_ values: inout [Float], quantity: String, caseIndex: Int) {
+    guard let spec = ProcessInfo.processInfo.environment["HORNLAB_METAL_BEM_NATIVE_TEST_INJECT_NAN"],
+          spec == "\(caseIndex):\(quantity)", !values.isEmpty else { return }
+    values[0] = Float.nan
+}
+
+/// "case 3 (case_id X), frequency_hz 6000.0" for error messages.
+func caseLabel(_ casePayload: [String: Any], caseIndex: Int) -> String {
+    var label = "case \(caseIndex)"
+    if let caseId = casePayload["case_id"] as? String { label += " (\(caseId))" }
+    if let frequency = (casePayload["frequency_hz"] as? NSNumber)?.doubleValue {
+        label += ", frequency_hz \(frequency)"
+    }
+    return label
+}
+
+/// Fail with a named error instead of writing NaN/Inf into a binary output.
+func requireFiniteF32(
+    _ values: [Float], quantity: String, casePayload: [String: Any], caseIndex: Int
+) throws {
+    var checked = values
+    testInjectNaN(&checked, quantity: quantity, caseIndex: caseIndex)
+    if let index = checked.firstIndex(where: { !$0.isFinite }) {
+        try fail(
+            "non-finite \(quantity) output: \(caseLabel(casePayload, caseIndex: caseIndex)), element \(index)"
+        )
+    }
+}
+
 func requireInt(_ object: [String: Any], _ key: String) throws -> Int {
     if let value = object[key] as? Int {
         return value
@@ -9292,7 +9324,7 @@ func assembleStandardNeumannBatch(
     caseResults.reserveCapacity(cases.count)
     var totalAssemblySeconds = 0.0
     var totalRegularSeconds = 0.0
-    for casePayload in cases {
+    for (caseIndex, casePayload) in cases.enumerated() {
         let k = Float(try requireDouble(casePayload, "k_real_f32"))
         let neumann = try readComplexVector(
             root: geom.root,
@@ -9386,7 +9418,7 @@ func assembleSolveStandardNeumannBatch(
     var totalRegularSeconds = 0.0
     var totalDenseSolveSeconds = 0.0
 
-    for casePayload in cases {
+    for (caseIndex, casePayload) in cases.enumerated() {
         let k = Float(try requireDouble(casePayload, "k_real_f32"))
         let neumann = try readComplexVector(
             root: geom.root,
@@ -9412,13 +9444,17 @@ func assembleSolveStandardNeumannBatch(
         if solve.lapackInfo != 0 {
             try fail("Accelerate dense solve failed with info=\(solve.lapackInfo)")
         }
+        let outRe = solve.pressure.map { $0.re }
+        let outIm = solve.pressure.map { $0.im }
+        try requireFiniteF32(outRe, quantity: "surface", casePayload: casePayload, caseIndex: caseIndex)
+        try requireFiniteF32(outIm, quantity: "surface", casePayload: casePayload, caseIndex: caseIndex)
         try writeF32(
             try descriptorPath(root: geom.root, descriptor: outReDesc),
-            solve.pressure.map { $0.re }
+            outRe
         )
         try writeF32(
             try descriptorPath(root: geom.root, descriptor: outImDesc),
-            solve.pressure.map { $0.im }
+            outIm
         )
 
         let correctionSeconds = assemblyCorrectionSeconds(run)
@@ -9949,7 +9985,13 @@ func assembleSolveEvaluateStandardNeumannBatch(
         )
         // A failed factorization (lapackInfo != 0) returns no pressures and is
         // reported by the caller; a "successful" solve must be finite.
-        for (source, pressure) in solved.pressures.enumerated() {
+        for (source, pressureValues) in solved.pressures.enumerated() {
+            var pressure = pressureValues
+            if source == 0 {
+                var re = pressure.map { $0.re }
+                testInjectNaN(&re, quantity: "surface", caseIndex: caseIndex)
+                if let first = re.first, first.isNaN, !pressure.isEmpty { pressure[0].re = first }
+            }
             if let dof = pressure.firstIndex(where: { !($0.re.isFinite && $0.im.isFinite) }) {
                 let frequency = (cases[caseIndex]["frequency_hz"] as? NSNumber)?.doubleValue
                 try fail(
@@ -10233,6 +10275,8 @@ func assembleSolveEvaluateStandardNeumannBatch(
         }
         let fieldReValues = field.values.map { $0.re }
         let fieldImValues = field.values.map { $0.im }
+        try requireFiniteF32(fieldReValues, quantity: "field", casePayload: casePayload, caseIndex: caseIndex)
+        try requireFiniteF32(fieldImValues, quantity: "field", casePayload: casePayload, caseIndex: caseIndex)
         if batchFieldReDesc != nil {
             batchFieldReValues.append(contentsOf: fieldReValues)
             batchFieldImValues.append(contentsOf: fieldImValues)
@@ -10343,6 +10387,8 @@ func assembleSolveEvaluateStandardNeumannBatch(
             }
             let extraFieldRe = extraField.values.map { $0.re }
             let extraFieldIm = extraField.values.map { $0.im }
+            try requireFiniteF32(extraFieldRe, quantity: "field", casePayload: casePayload, caseIndex: caseIndex)
+            try requireFiniteF32(extraFieldIm, quantity: "field", casePayload: casePayload, caseIndex: caseIndex)
             if batchFieldReDesc != nil {
                 batchFieldReValues.append(contentsOf: extraFieldRe)
                 batchFieldImValues.append(contentsOf: extraFieldIm)

@@ -30,7 +30,7 @@ hornlab_metal_bem = [
   "metal/HornlabMetalBemNative.swift",
   "metal/native_helper/.build/release/HornlabMetalBemNative",
   "metal/native_helper/Package.swift",
-    "metal/native_helper/Sources/HornlabMetalBemNative/main.swift",
+    "metal/native_helper/Sources/HornlabMetalBemNative/*.swift",
     "metal/native_helper/Sources/HornlabMetalBemNative/Resources/.gitkeep",
     "metal/native_helper/Sources/HornlabMetalBemNative/Resources/*.metallib",
 ]

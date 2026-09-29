@@ -16,7 +16,9 @@ Use the `hornlab_metal_bem` namespace for all new integrations.
 
 ## Status
 
-The native full-3D backend requires Apple Silicon and macOS.
+The native full-3D backend requires Apple Silicon and macOS. The native Metal
+helper needs macOS 13.3 or newer; building it from source needs Xcode 14.3 or
+newer (the macOS 13.3 SDK).
 
 The solver uses a NumPy-only mesh/grid/function-space loader and does not
 depend on `bempp-cl`. There is no OpenCL/Bempp fallback path in this package.

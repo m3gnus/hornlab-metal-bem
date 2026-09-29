@@ -1885,24 +1885,29 @@ def _find_helper_executable(
         native_package_dir / ".build" / "release" / config.native_binary_name,
         native_package_dir / ".build" / "debug" / config.native_binary_name,
     )
-    main_source = (
-        native_package_dir / "Sources" / config.native_binary_name / "main.swift"
-    )
+    sources_dir = native_package_dir / "Sources" / config.native_binary_name
+    swift_inputs = [
+        *sorted(sources_dir.glob("*.swift")),
+        native_package_dir / "Package.swift",
+    ]
     for candidate in candidates:
         if candidate.is_file():
-            if (
-                main_source.is_file()
-                # Wheel installers extract files sequentially, so a packaged
-                # helper can appear fractionally older than its source even
-                # though both came from the same build. Reserve the warning
-                # for a meaningful timestamp gap.
-                and candidate.stat().st_mtime + 2.0 < main_source.stat().st_mtime
-            ):
+            # Wheel installers extract files sequentially, so a packaged
+            # helper can appear fractionally older than its source even
+            # though both came from the same build. Reserve the warning
+            # for a meaningful timestamp gap.
+            newer = [
+                path
+                for path in swift_inputs
+                if path.is_file()
+                and candidate.stat().st_mtime + 2.0 < path.stat().st_mtime
+            ]
+            if newer:
                 logger.warning(
                     "Native helper binary %s is older than %s; numeric changes "
                     "in the source are not active until `swift build -c release`",
                     candidate,
-                    main_source,
+                    ", ".join(path.name for path in newer),
                 )
             return candidate, "swift-package"
 
