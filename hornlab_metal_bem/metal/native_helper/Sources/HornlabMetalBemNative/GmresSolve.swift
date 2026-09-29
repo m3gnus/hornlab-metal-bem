@@ -218,6 +218,8 @@ struct GmresRun {
     var xIm: [Float]
     var iterations: Int
     var relativeResidual: Double
+    /// Normwise backward error ||r|| / (||A|| ||x|| + ||b||), infinity norms.
+    var backwardError: Double
     var converged: Bool
 }
 
@@ -248,6 +250,32 @@ private func dotConj(_ aRe: [Float], _ aIm: [Float], _ bRe: [Float], _ bIm: [Flo
     return C2(re: re, im: im)
 }
 
+private func normInf(_ re: [Float], _ im: [Float]) -> Double {
+    var largest = 0.0
+    for i in 0..<re.count {
+        largest = max(largest, hypot(Double(re[i]), Double(im[i])))
+    }
+    return largest
+}
+
+/// Backward error a float32 solve of this size can be expected to reach.
+///
+/// The relative residual ||b - Ax|| / ||b|| cannot be driven below roughly
+/// eps * ||A|| ||x|| / ||b|| in float32, because computing Ax alone rounds by
+/// that much. Near an interior resonance ||A|| ||x|| / ||b|| is large, so an
+/// exact-LU-quality answer can sit above any fixed relative-residual floor --
+/// the closed 816-triangle channel at 1700 Hz, next to its first axial interior
+/// mode, measured 1.5e-5 after one iteration with the preconditioner equal to
+/// the full LU. The backward error divides that growth out: it asks whether x
+/// solves a nearby system, which is exactly the guarantee the float32 direct LU
+/// gives and the standard stopping test for Krylov solvers.
+///
+/// sqrt(n) * eps32 is the typical backward error of a float32 LU; the factor 8
+/// is headroom for the float32 matvec that measures it.
+func gmresBackwardErrorTolerance(n: Int) -> Double {
+    8.0 * Double(max(n, 1)).squareRoot() * Double(Float.ulpOfOne)
+}
+
 private func norm2(_ re: [Float], _ im: [Float]) -> Double {
     var sum = 0.0
     for i in 0..<re.count {
@@ -257,8 +285,14 @@ private func norm2(_ re: [Float], _ im: [Float]) -> Double {
 }
 
 /// Left-preconditioned restarted GMRES.
+///
+/// The iteration stops on the preconditioned residual, which is what GMRES
+/// minimises. Acceptance is decided afterwards on the true residual: either the
+/// relative residual meets the tolerance, or the normwise backward error meets
+/// what a float32 direct solve would (`gmresBackwardErrorTolerance`).
 func gmresSolve(
     operatorA: DenseComplexOperator,
+    operatorNormInf: Double,
     preconditioner: BlockJacobiPreconditioner,
     bRe: [Float],
     bIm: [Float],
@@ -274,7 +308,7 @@ func gmresSolve(
     let referenceNorm = norm2(preconditionedRhs.re, preconditionedRhs.im)
     if referenceNorm == 0 || !referenceNorm.isFinite {
         return GmresRun(xRe: xRe, xIm: xIm, iterations: 0,
-                        relativeResidual: 0, converged: true)
+                        relativeResidual: 0, backwardError: 0, converged: true)
     }
 
     var total = 0
@@ -422,9 +456,18 @@ func gmresSolve(
         resIm[i] = bIm[i] - ax.im[i]
     }
     let trueRelative = norm2(resRe, resIm) / max(norm2(bRe, bIm), Double.leastNormalMagnitude)
+    let backwardError = normInf(resRe, resIm) / max(
+        operatorNormInf * normInf(xRe, xIm) + normInf(bRe, bIm),
+        Double.leastNormalMagnitude
+    )
+    let converged = trueRelative.isFinite && backwardError.isFinite && (
+        trueRelative <= max(tolerance * 10.0, 1e-5)
+            || backwardError <= gmresBackwardErrorTolerance(n: n)
+    )
     return GmresRun(
         xRe: xRe, xIm: xIm, iterations: total,
         relativeResidual: trueRelative,
-        converged: trueRelative <= max(tolerance * 10.0, 1e-5)
+        backwardError: backwardError,
+        converged: converged
     )
 }

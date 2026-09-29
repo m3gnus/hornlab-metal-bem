@@ -812,3 +812,73 @@ def test_native_coupled_ib_radiates_outward_absolute_sign(velocity_mode: str):
             result.pressure_complex, frequencies_hz, radius, depth, distance, angles
         )
     )
+
+
+def _closed_channel_gmres_config(implementation: str) -> SolveConfig:
+    return SolveConfig(
+        velocity_sources={TAG_THROAT: 1.0},
+        velocity_mode=VelocityMode.VELOCITY,
+        observation=ObservationConfig(
+            distance_m=1.0,
+            angle_min_deg=0.0,
+            angle_max_deg=90.0,
+            angle_count=5,
+            planes=["horizontal"],
+            origin="mouth",
+        ),
+        frame_override=_z_axis_frame(_GATE_DEPTH_M),
+        metal_native_assembly_mode="corrected",
+        formulation="complex_k",
+        dense_solve_implementation=implementation,
+    )
+
+
+def test_gmres_accepts_a_float32_exact_answer_next_to_an_interior_mode():
+    """GMRES must not refuse an answer as good as the direct LU's.
+
+    The closed 816-triangle channel (no aperture, so no coupled-IB route) has
+    its first axial interior mode near c / (2 * depth) = 1715 Hz. At 1700 Hz
+    its 410 dofs fit one preconditioner block, so block-Jacobi is the full LU
+    and GMRES stops after one iteration -- yet the float32 true relative
+    residual came out at 1.5e-5, over the old fixed 1e-5 acceptance floor, and
+    the helper failed with info=-999. The residual is large only because
+    ||A|| ||x|| / ||b|| is large there; the backward error is what says whether
+    the answer is float32-exact, and acceptance now also admits that.
+    """
+    require_fresh_native_helper()
+    mesh = _straight_channel_mesh(_GATE_RADIUS_M, _GATE_DEPTH_M, **_MESH_A)
+    assert mesh.info.n_triangles == 816
+    frequencies = [1700.0]
+
+    direct = metal_bem.solve_frequencies(
+        mesh, frequencies, _closed_channel_gmres_config("cgesv")
+    )
+    iterative = metal_bem.solve_frequencies(
+        mesh, frequencies, _closed_channel_gmres_config("gmres")
+    )
+
+    assert iterative.native_diagnostics[0]["solve_implementation"] == (
+        "gmres_block_jacobi"
+    )
+    a = direct.pressure_complex
+    b = iterative.pressure_complex
+    # Measured 4e-5 to 7e-5: float32 assembly scatter between two runs.
+    assert np.abs(b - a).max() / np.abs(a).max() < 5e-4
+
+
+def test_gmres_still_refuses_a_genuinely_unconverged_solve(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The backward-error acceptance must not wave through a stopped-early run.
+
+    Two iterations with 8-dof blocks leave the residual orders of magnitude
+    above either acceptance test; the helper must refuse and say why.
+    """
+    require_fresh_native_helper()
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_GMRES_LEAF", "8")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_GMRES_MAX_ITERATIONS", "2")
+    mesh = _straight_channel_mesh(_GATE_RADIUS_M, _GATE_DEPTH_M, **_MESH_A)
+    with pytest.raises(RuntimeError, match="GMRES did not converge"):
+        metal_bem.solve_frequencies(
+            mesh, [900.0], _closed_channel_gmres_config("gmres")
+        )

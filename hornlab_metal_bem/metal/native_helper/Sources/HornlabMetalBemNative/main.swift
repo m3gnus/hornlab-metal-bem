@@ -8713,6 +8713,9 @@ func solveDenseGmresMulti(
         aReRowMajor: aReRowMajor, aImRowMajor: aImRowMajor, n: n, blocks: leaves
     )
     let op = DenseComplexOperator(aRe: aReRowMajor, aIm: aImRowMajor, n: n)
+    let operatorNormInf = Double(matrixInfNormRowMajor(
+        re: aReRowMajor, im: aImRowMajor, rows: n, cols: n
+    ))
     let restart = try requestedGmresRestart()
     let maxIterations = try requestedGmresMaxIterations()
     let tolerance = try requestedGmresTolerance()
@@ -8720,10 +8723,10 @@ func solveDenseGmresMulti(
     var pressures: [[Complex32]] = []
     var iterations: [Int] = []
     var residuals: [Double] = []
-    var anyDiverged = false
     for s in 0..<sourceCount {
         let run = gmresSolve(
-            operatorA: op, preconditioner: preconditioner,
+            operatorA: op, operatorNormInf: operatorNormInf,
+            preconditioner: preconditioner,
             bRe: rhsRe[s], bIm: rhsIm[s],
             restart: restart, maxIterations: maxIterations, tolerance: tolerance
         )
@@ -8732,16 +8735,22 @@ func solveDenseGmresMulti(
         pressures.append(out)
         iterations.append(run.iterations)
         residuals.append(run.relativeResidual)
-        if !run.converged { anyDiverged = true }
+        if !run.converged {
+            // A non-converged GMRES returns a plausible-looking wrong answer,
+            // so refuse it rather than let it reach the field evaluation.
+            try fail(
+                "GMRES did not converge (source \(s)): \(run.iterations) iterations, "
+                + "true relative residual \(run.relativeResidual), backward error "
+                + "\(run.backwardError) against \(gmresBackwardErrorTolerance(n: n)). "
+                + "Use dense_solve_implementation='cgesv' for this solve."
+            )
+        }
     }
-    // A non-converged GMRES returns a plausible-looking wrong answer, so surface
-    // it as a LAPACK-style failure rather than letting it reach the field
-    // evaluation silently.
     var run = MultiDenseSolveRun(
-        pressures: anyDiverged ? [] : pressures,
+        pressures: pressures,
         implementation: "gmres_block_jacobi",
         seconds: CFAbsoluteTimeGetCurrent() - start,
-        lapackInfo: anyDiverged ? Int32(-999) : 0,
+        lapackInfo: 0,
         rcond: nil
     )
     run.refineIterations = iterations

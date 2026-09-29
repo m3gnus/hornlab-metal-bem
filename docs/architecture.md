@@ -129,7 +129,11 @@ complement, and both keep the direct factorisation. Pair it with
 `formulation="complex_k"`: the undamped `standard` operator carries interior
 resonances that cost roughly 6x the iterations on a body enclosing a sizeable
 volume, and `sweep.py` warns about both the configuration and the measured
-iteration count.
+iteration count. A solve is accepted when its true relative residual meets
+the tolerance or its normwise backward error meets what a float32 direct LU
+reaches (`8 * sqrt(n) * eps32`); near an interior resonance even the LU's own
+relative residual exceeds any fixed floor. Anything else fails with the
+iteration count, residual and backward error.
 
 `SolveConfig(formulation="complex_k")` is experimental and opt-in. It follows
 the canonical bempp convention `k = k_real * (1 + i*complex_k_shift)` for
