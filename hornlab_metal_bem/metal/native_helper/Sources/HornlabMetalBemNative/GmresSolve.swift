@@ -76,8 +76,8 @@ func clusterLeaves(x: [Float], y: [Float], z: [Float], leafSize: Int) -> [[Int]]
 /// LU factors of the diagonal blocks, applied as an approximate inverse.
 struct BlockJacobiPreconditioner {
     var blocks: [[Int]]
-    var factors: [[__CLPK_complex]]
-    var pivots: [[__CLPK_integer]]
+    var factors: [[LapackComplex]]
+    var pivots: [[LapackInt]]
     /// Blocks LAPACK reported singular. Those act as identity rather than
     /// producing NaN, so a degenerate block degrades convergence instead of
     /// destroying the solve.
@@ -89,19 +89,19 @@ struct BlockJacobiPreconditioner {
         for (b, block) in blocks.enumerated() {
             let m = block.count
             if pivots[b].isEmpty { continue }
-            var rhs = [__CLPK_complex](repeating: __CLPK_complex(r: 0, i: 0), count: m)
+            var rhs = [LapackComplex](repeating: LapackComplex(r: 0, i: 0), count: m)
             for (local, global) in block.enumerated() {
-                rhs[local] = __CLPK_complex(r: re[global], i: im[global])
+                rhs[local] = LapackComplex(r: re[global], i: im[global])
             }
             var factored = factors[b]
             var piv = pivots[b]
             var trans = Int8(78)  // 'N'
-            var mm = __CLPK_integer(m)
-            var nrhs = __CLPK_integer(1)
-            var lda = __CLPK_integer(m)
-            var ldb = __CLPK_integer(m)
-            var info = __CLPK_integer(0)
-            cgetrs_(&trans, &mm, &nrhs, &factored, &lda, &piv, &rhs, &ldb, &info)
+            var mm = LapackInt(m)
+            var nrhs = LapackInt(1)
+            var lda = LapackInt(m)
+            var ldb = LapackInt(m)
+            var info = LapackInt(0)
+            lapack_cgetrs(&trans, &mm, &nrhs, &factored, &lda, &piv, &rhs, &ldb, &info)
             if info != 0 { continue }
             for (local, global) in block.enumerated() {
                 outRe[global] = rhs[local].r
@@ -118,29 +118,29 @@ func buildBlockJacobi(
     n: Int,
     blocks: [[Int]]
 ) -> BlockJacobiPreconditioner {
-    var factors: [[__CLPK_complex]] = []
-    var pivots: [[__CLPK_integer]] = []
+    var factors: [[LapackComplex]] = []
+    var pivots: [[LapackInt]] = []
     var singular = 0
     factors.reserveCapacity(blocks.count)
     pivots.reserveCapacity(blocks.count)
     for block in blocks {
         let m = block.count
-        var sub = [__CLPK_complex](repeating: __CLPK_complex(r: 0, i: 0), count: m * m)
+        var sub = [LapackComplex](repeating: LapackComplex(r: 0, i: 0), count: m * m)
         for (cj, j) in block.enumerated() {
             for (ci, i) in block.enumerated() {
                 let source = i * n + j          // row-major A[i][j]
-                sub[cj * m + ci] = __CLPK_complex(   // column-major for LAPACK
+                sub[cj * m + ci] = LapackComplex(   // column-major for LAPACK
                     r: aReRowMajor[source],
                     i: aImRowMajor[source]
                 )
             }
         }
-        var rows = __CLPK_integer(m)
-        var cols = __CLPK_integer(m)
-        var lda = __CLPK_integer(m)
-        var info = __CLPK_integer(0)
-        var piv = [__CLPK_integer](repeating: 0, count: m)
-        cgetrf_(&rows, &cols, &sub, &lda, &piv, &info)
+        var rows = LapackInt(m)
+        var cols = LapackInt(m)
+        var lda = LapackInt(m)
+        var info = LapackInt(0)
+        var piv = [LapackInt](repeating: 0, count: m)
+        lapack_cgetrf(&rows, &cols, &sub, &lda, &piv, &info)
         if info != 0 {
             singular += 1
             factors.append([])

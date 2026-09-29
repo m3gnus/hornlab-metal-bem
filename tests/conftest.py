@@ -1,8 +1,10 @@
 """Fail native-helper tests when the in-tree Swift helper is stale (see native_helper_guard).
 
 Every test module that runs the real helper (``discover_native_runtime(run_smoke_test=True)``
-or the guard) is covered, so a stale helper cannot silently validate the previous build. Modules
-that never run the helper (config, mesh, observation tests) are unaffected.
+or the guard) is covered, so a stale helper cannot silently validate the previous build. The check
+is per module, not per test: every test in such a module errors on a stale helper, including its
+pure-Python tests. Modules that never mention the helper (config, mesh, observation tests) are
+unaffected.
 """
 
 from __future__ import annotations

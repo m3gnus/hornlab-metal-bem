@@ -23,7 +23,59 @@ func loadJSON(_ path: String) throws -> [String: Any] {
     return object
 }
 
+/// Path of the first non-finite number inside a JSON-bound value, or nil.
+/// `JSONSerialization` raises an Objective-C exception on NaN/Inf, which Swift
+/// cannot catch: the helper would abort with no message. Names the location
+/// (and, for a per-case entry, its case_id / frequency_hz) instead.
+func firstNonFiniteJSONPath(_ value: Any, path: String) -> String? {
+    if let number = value as? Double {
+        return number.isFinite ? nil : path
+    }
+    if let number = value as? Float {
+        return number.isFinite ? nil : path
+    }
+    if let numbers = value as? [Double] {
+        return numbers.firstIndex { !$0.isFinite }.map { "\(path)[\($0)]" }
+    }
+    if let numbers = value as? [Float] {
+        return numbers.firstIndex { !$0.isFinite }.map { "\(path)[\($0)]" }
+    }
+    if let dict = value as? [String: Any] {
+        for key in dict.keys.sorted() {
+            if let found = firstNonFiniteJSONPath(dict[key]!, path: "\(path)/\(key)") {
+                return found
+            }
+        }
+        return nil
+    }
+    if let array = value as? [Any] {
+        for (index, element) in array.enumerated() {
+            var label = "\(path)[\(index)]"
+            if let entry = element as? [String: Any] {
+                var tags: [String] = []
+                if let caseId = entry["case_id"] as? String {
+                    tags.append("case_id \(caseId)")
+                }
+                if let frequency = (entry["frequency_hz"] as? NSNumber)?.doubleValue {
+                    tags.append("frequency_hz \(frequency)")
+                }
+                if !tags.isEmpty {
+                    label += " (\(tags.joined(separator: ", ")))"
+                }
+            }
+            if let found = firstNonFiniteJSONPath(element, path: label) {
+                return found
+            }
+        }
+        return nil
+    }
+    return nil
+}
+
 func writeJSON(_ path: String, _ object: [String: Any]) throws {
+    if let bad = firstNonFiniteJSONPath(object, path: "") {
+        try fail("non-finite value in native result at \(bad); refusing to write \(path)")
+    }
     let url = URL(fileURLWithPath: path)
     try FileManager.default.createDirectory(
         at: url.deletingLastPathComponent(),
@@ -471,32 +523,32 @@ struct MultiDenseSolveRun {
     }
 }
 
-func matrixOneNorm(_ matrix: inout [__CLPK_complex], n: Int) -> __CLPK_real {
+func matrixOneNorm(_ matrix: inout [LapackComplex], n: Int) -> Float {
     var normChar = Int8(49) // "1"
-    var mClpk = __CLPK_integer(n)
-    var nClpk = __CLPK_integer(n)
-    var lda = __CLPK_integer(n)
-    var work = [__CLPK_real(0)] // unused for the 1-norm
-    return __CLPK_real(clange_(&normChar, &mClpk, &nClpk, &matrix, &lda, &work))
+    var mClpk = LapackInt(n)
+    var nClpk = LapackInt(n)
+    var lda = LapackInt(n)
+    var work = [Float(0)] // unused for the 1-norm
+    return Float(lapack_clange(&normChar, &mClpk, &nClpk, &matrix, &lda, &work))
 }
 
 /// 1-norm condition estimate via cgecon on an LU-factorized matrix.
 /// `anorm` must be the 1-norm of the original matrix, computed before the
 /// factorization overwrote it.
 func estimateReciprocalCondition(
-    factored: inout [__CLPK_complex],
+    factored: inout [LapackComplex],
     n: Int,
-    anorm: __CLPK_real
+    anorm: Float
 ) -> Double? {
     var normChar = Int8(49) // "1"
-    var nClpk = __CLPK_integer(n)
-    var lda = __CLPK_integer(n)
+    var nClpk = LapackInt(n)
+    var lda = LapackInt(n)
     var anormValue = anorm
-    var rcond = __CLPK_real(0)
-    var info = __CLPK_integer(0)
-    var work = Array(repeating: __CLPK_complex(r: 0.0, i: 0.0), count: 2 * n)
-    var rwork = Array(repeating: __CLPK_real(0), count: 2 * n)
-    cgecon_(
+    var rcond = Float(0)
+    var info = LapackInt(0)
+    var work = Array(repeating: LapackComplex(r: 0.0, i: 0.0), count: 2 * n)
+    var rwork = Array(repeating: Float(0), count: 2 * n)
+    lapack_cgecon(
         &normChar,
         &nClpk,
         &factored,
@@ -514,34 +566,34 @@ func estimateReciprocalCondition(
 }
 
 /// complex128 twin of `matrixOneNorm` (zlange). The work array is
-/// `[__CLPK_doublereal]` (Double), not doublecomplex — zlange's `work` is real,
-/// matching the float32 path's `[__CLPK_real]` work.
-func matrixOneNormZ(_ matrix: inout [__CLPK_doublecomplex], n: Int) -> Double {
+/// `[Double]` (Double), not doublecomplex — zlange's `work` is real,
+/// matching the float32 path's `[Float]` work.
+func matrixOneNormZ(_ matrix: inout [LapackDoubleComplex], n: Int) -> Double {
     var normChar = Int8(49) // "1"
-    var mClpk = __CLPK_integer(n)
-    var nClpk = __CLPK_integer(n)
-    var lda = __CLPK_integer(n)
+    var mClpk = LapackInt(n)
+    var nClpk = LapackInt(n)
+    var lda = LapackInt(n)
     var work = [Double(0)] // unused for the 1-norm
-    return Double(zlange_(&normChar, &mClpk, &nClpk, &matrix, &lda, &work))
+    return Double(lapack_zlange(&normChar, &mClpk, &nClpk, &matrix, &lda, &work))
 }
 
 /// complex128 twin of `estimateReciprocalCondition` (zgecon on LU factors).
 /// `anorm` must be the 1-norm of the original matrix, computed before the
 /// factorization overwrote it.
 func estimateReciprocalConditionZ(
-    factored: inout [__CLPK_doublecomplex],
+    factored: inout [LapackDoubleComplex],
     n: Int,
     anorm: Double
 ) -> Double? {
     var normChar = Int8(49) // "1"
-    var nClpk = __CLPK_integer(n)
-    var lda = __CLPK_integer(n)
+    var nClpk = LapackInt(n)
+    var lda = LapackInt(n)
     var anormValue = anorm
     var rcond = Double(0)
-    var info = __CLPK_integer(0)
-    var work = Array(repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0), count: 2 * n)
+    var info = LapackInt(0)
+    var work = Array(repeating: LapackDoubleComplex(r: 0.0, i: 0.0), count: 2 * n)
     var rwork = Array(repeating: Double(0), count: 2 * n)
-    zgecon_(
+    lapack_zgecon(
         &normChar,
         &nClpk,
         &factored,
@@ -7450,9 +7502,9 @@ func refineDenseSolveSolution(
     aImRowMajor: [Float],
     rhsRe: [Float],
     rhsIm: [Float],
-    factored: inout [__CLPK_complex],
-    pivots: inout [__CLPK_integer],
-    solution: inout [__CLPK_complex],
+    factored: inout [LapackComplex],
+    pivots: inout [LapackInt],
+    solution: inout [LapackComplex],
     n: Int,
     maxIterations: Int
 ) -> (iterations: Int, residualRel: Double) {
@@ -7508,25 +7560,25 @@ func refineDenseSolveSolution(
 
     var bestRel = residualRelativeNorm()
     var iterationsApplied = 0
-    var nClpk = __CLPK_integer(n)
-    var nrhs = __CLPK_integer(1)
-    var lda = __CLPK_integer(n)
-    var ldb = __CLPK_integer(n)
+    var nClpk = LapackInt(n)
+    var nrhs = LapackInt(1)
+    var lda = LapackInt(n)
+    var ldb = LapackInt(n)
     var trans = Int8(78) // "N"
 
     for _ in 0..<maxIterations {
         if bestRel <= singlePrecisionFloor {
             break
         }
-        var correction = [__CLPK_complex](
-            repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        var correction = [LapackComplex](
+            repeating: LapackComplex(r: 0.0, i: 0.0),
             count: n
         )
         for i in 0..<n {
-            correction[i] = __CLPK_complex(r: Float(resRe[i]), i: Float(resIm[i]))
+            correction[i] = LapackComplex(r: Float(resRe[i]), i: Float(resIm[i]))
         }
-        var info = __CLPK_integer(0)
-        cgetrs_(&trans, &nClpk, &nrhs, &factored, &lda, &pivots, &correction, &ldb, &info)
+        var info = LapackInt(0)
+        lapack_cgetrs(&trans, &nClpk, &nrhs, &factored, &lda, &pivots, &correction, &ldb, &info)
         if info != 0 {
             break
         }
@@ -7548,7 +7600,7 @@ func refineDenseSolveSolution(
     }
 
     for i in 0..<n {
-        solution[i] = __CLPK_complex(r: Float(xRe[i]), i: Float(xIm[i]))
+        solution[i] = LapackComplex(r: Float(xRe[i]), i: Float(xIm[i]))
     }
     return (iterationsApplied, bestRel)
 }
@@ -7605,14 +7657,14 @@ func solveDenseAccelerateZgesvMulti(
 
     // Widen float32 row-major -> complex128 column-major (LAPACK layout).
     var matrix = Array(
-        repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
+        repeating: LapackDoubleComplex(r: 0.0, i: 0.0),
         count: n * n
     )
     for row in 0..<n {
         for col in 0..<n {
             let source = row * n + col
             let dest = col * n + row
-            matrix[dest] = __CLPK_doublecomplex(
+            matrix[dest] = LapackDoubleComplex(
                 r: Double(aReRowMajor[source]),
                 i: Double(aImRowMajor[source])
             )
@@ -7620,26 +7672,26 @@ func solveDenseAccelerateZgesvMulti(
     }
 
     var rhs = Array(
-        repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
+        repeating: LapackDoubleComplex(r: 0.0, i: 0.0),
         count: n * sourceCount
     )
     for s in 0..<sourceCount {
         for i in 0..<n {
-            rhs[s * n + i] = __CLPK_doublecomplex(
+            rhs[s * n + i] = LapackDoubleComplex(
                 r: Double(rhsRe[s][i]),
                 i: Double(rhsIm[s][i])
             )
         }
     }
 
-    var nClpk = __CLPK_integer(n)
-    var nrhs = __CLPK_integer(sourceCount)
-    var lda = __CLPK_integer(n)
-    var ldb = __CLPK_integer(n)
-    var info = __CLPK_integer(0)
-    var pivots = Array(repeating: __CLPK_integer(0), count: n)
+    var nClpk = LapackInt(n)
+    var nrhs = LapackInt(sourceCount)
+    var lda = LapackInt(n)
+    var ldb = LapackInt(n)
+    var info = LapackInt(0)
+    var pivots = Array(repeating: LapackInt(0), count: n)
     let anorm = matrixOneNormZ(&matrix, n: n)
-    zgesv_(&nClpk, &nrhs, &matrix, &lda, &pivots, &rhs, &ldb, &info)
+    lapack_zgesv(&nClpk, &nrhs, &matrix, &lda, &pivots, &rhs, &ldb, &info)
 
     if info != 0 {
         return MultiDenseSolveRun(
@@ -7746,13 +7798,13 @@ func solveDenseLeastSquaresZgels(
 
     // Column-major (rows x n) complex128: A on top, scale*C below.
     var matrix = Array(
-        repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
+        repeating: LapackDoubleComplex(r: 0.0, i: 0.0),
         count: rows * n
     )
     for row in 0..<n {
         for col in 0..<n {
             let source = row * n + col
-            matrix[col * rows + row] = __CLPK_doublecomplex(
+            matrix[col * rows + row] = LapackDoubleComplex(
                 r: Double(aReRowMajor[source]),
                 i: Double(aImRowMajor[source])
             )
@@ -7761,7 +7813,7 @@ func solveDenseLeastSquaresZgels(
     for r in 0..<m {
         for col in 0..<n {
             let source = r * n + col
-            matrix[col * rows + (n + r)] = __CLPK_doublecomplex(
+            matrix[col * rows + (n + r)] = LapackDoubleComplex(
                 r: Double(cReRowMajor[source]) * scale,
                 i: Double(cImRowMajor[source]) * scale
             )
@@ -7772,19 +7824,19 @@ func solveDenseLeastSquaresZgels(
     // m = scale*d_s. All columns share the single QR factorization inside
     // one zgels call (nrhs = B).
     var b = Array(
-        repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
+        repeating: LapackDoubleComplex(r: 0.0, i: 0.0),
         count: rows * sourceCount
     )
     for s in 0..<sourceCount {
         let base = s * rows
         for i in 0..<n {
-            b[base + i] = __CLPK_doublecomplex(
+            b[base + i] = LapackDoubleComplex(
                 r: Double(rhsRe[s][i]),
                 i: Double(rhsIm[s][i])
             )
         }
         for r in 0..<m {
-            b[base + n + r] = __CLPK_doublecomplex(
+            b[base + n + r] = LapackDoubleComplex(
                 r: Double(dRe[s][r]) * scale,
                 i: Double(dIm[s][r]) * scale
             )
@@ -7792,17 +7844,17 @@ func solveDenseLeastSquaresZgels(
     }
 
     var trans = Int8(78) // "N"
-    var mC = __CLPK_integer(rows)
-    var nC = __CLPK_integer(n)
-    var nrhs = __CLPK_integer(sourceCount)
-    var lda = __CLPK_integer(rows)
-    var ldb = __CLPK_integer(rows)
-    var info = __CLPK_integer(0)
+    var mC = LapackInt(rows)
+    var nC = LapackInt(n)
+    var nrhs = LapackInt(sourceCount)
+    var lda = LapackInt(rows)
+    var ldb = LapackInt(rows)
+    var info = LapackInt(0)
 
     // Workspace query (lwork = -1), then the real solve.
-    var lwork = __CLPK_integer(-1)
-    var workQuery = [__CLPK_doublecomplex(r: 0.0, i: 0.0)]
-    zgels_(&trans, &mC, &nC, &nrhs, &matrix, &lda, &b, &ldb, &workQuery, &lwork, &info)
+    var lwork = LapackInt(-1)
+    var workQuery = [LapackDoubleComplex(r: 0.0, i: 0.0)]
+    lapack_zgels(&trans, &mC, &nC, &nrhs, &matrix, &lda, &b, &ldb, &workQuery, &lwork, &info)
     if info != 0 {
         return MultiDenseSolveRun(
             pressures: [],
@@ -7815,12 +7867,12 @@ func solveDenseLeastSquaresZgels(
         )
     }
     let workSize = max(1, Int(workQuery[0].r))
-    lwork = __CLPK_integer(workSize)
+    lwork = LapackInt(workSize)
     var work = Array(
-        repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
+        repeating: LapackDoubleComplex(r: 0.0, i: 0.0),
         count: workSize
     )
-    zgels_(&trans, &mC, &nC, &nrhs, &matrix, &lda, &b, &ldb, &work, &lwork, &info)
+    lapack_zgels(&trans, &mC, &nC, &nrhs, &matrix, &lda, &b, &ldb, &work, &lwork, &info)
     if info != 0 {
         return MultiDenseSolveRun(
             pressures: [],
@@ -7844,7 +7896,7 @@ func solveDenseLeastSquaresZgels(
     for s in 0..<sourceCount {
         let base = s * rows
         var solution = Array(
-            repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
+            repeating: LapackDoubleComplex(r: 0.0, i: 0.0),
             count: n
         )
         for i in 0..<n {
@@ -8117,20 +8169,20 @@ func solveCoupledIBDenseMultiSchur(
     // storage for the much larger N x N Schur product while recovering the
     // accuracy lost when an ill-conditioned aperture block is factored in f32.
     var apertureMatrix = Array(
-        repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
+        repeating: LapackDoubleComplex(r: 0.0, i: 0.0),
         count: m * m
     )
     for row in 0..<m {
         for col in 0..<m {
             let value = coupling.rayleighSlp.value(row: row, col: col) * 2.0
-            apertureMatrix[col * m + row] = __CLPK_doublecomplex(
+            apertureMatrix[col * m + row] = LapackDoubleComplex(
                 r: Double(value.re),
                 i: Double(value.im)
             )
         }
     }
     var apertureRhs = Array(
-        repeating: __CLPK_doublecomplex(r: 0.0, i: 0.0),
+        repeating: LapackDoubleComplex(r: 0.0, i: 0.0),
         count: m * n
     )
     for (rowLocal, tri) in coupling.aperture.triangles.enumerated() {
@@ -8140,14 +8192,14 @@ func solveCoupledIBDenseMultiSchur(
             apertureRhs[idx].r += 1.0 / 3.0
         }
     }
-    var mClpk = __CLPK_integer(m)
-    var nrhs = __CLPK_integer(n)
-    var lda = __CLPK_integer(m)
-    var ldb = __CLPK_integer(m)
-    var info = __CLPK_integer(0)
-    var aperturePivots = Array(repeating: __CLPK_integer(0), count: m)
+    var mClpk = LapackInt(m)
+    var nrhs = LapackInt(n)
+    var lda = LapackInt(m)
+    var ldb = LapackInt(m)
+    var info = LapackInt(0)
+    var aperturePivots = Array(repeating: LapackInt(0), count: m)
     let apertureAnorm = matrixOneNormZ(&apertureMatrix, n: m)
-    zgesv_(
+    lapack_zgesv(
         &mClpk,
         &nrhs,
         &apertureMatrix,
@@ -8179,52 +8231,44 @@ func solveCoupledIBDenseMultiSchur(
     // Row-major T (M x N), Sia (N x M), and Schur matrix (N x N) for
     // cblas_cgemm: Schur = A - Sia*T.
     var tRowMajor = Array(
-        repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        repeating: LapackComplex(r: 0.0, i: 0.0),
         count: m * n
     )
     for row in 0..<m {
         for col in 0..<n {
             let value = apertureRhs[col * m + row]
-            tRowMajor[row * n + col] = __CLPK_complex(
+            tRowMajor[row * n + col] = LapackComplex(
                 r: Float(value.r),
                 i: Float(value.i)
             )
         }
     }
     var sia = Array(
-        repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        repeating: LapackComplex(r: 0.0, i: 0.0),
         count: n * m
     )
     for idx in 0..<(n * m) {
-        sia[idx] = __CLPK_complex(
+        sia[idx] = LapackComplex(
             r: coupling.interiorSlp.re[idx],
             i: coupling.interiorSlp.im[idx]
         )
     }
     var schur = Array(
-        repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        repeating: LapackComplex(r: 0.0, i: 0.0),
         count: n * n
     )
     for idx in 0..<(n * n) {
-        schur[idx] = __CLPK_complex(r: arrays.aRe[idx], i: arrays.aIm[idx])
+        schur[idx] = LapackComplex(r: arrays.aRe[idx], i: arrays.aIm[idx])
     }
-    var alpha = __CLPK_complex(r: -1.0, i: 0.0)
-    var beta = __CLPK_complex(r: 1.0, i: 0.0)
-    cblas_cgemm(
-        CblasRowMajor,
-        CblasNoTrans,
-        CblasNoTrans,
-        Int32(n),
-        Int32(n),
-        Int32(m),
-        &alpha,
-        &sia,
-        Int32(m),
-        &tRowMajor,
-        Int32(n),
-        &beta,
-        &schur,
-        Int32(n)
+    var alpha = LapackComplex(r: -1.0, i: 0.0)
+    var beta = LapackComplex(r: 1.0, i: 0.0)
+    lapack_cgemm(
+        m: n, n: n, k: m,
+        alpha: &alpha,
+        a: &sia, lda: m,
+        b: &tRowMajor, ldb: n,
+        beta: &beta,
+        c: &schur, ldc: n
     )
     var schurRe = Array(repeating: Float(0.0), count: n * n)
     var schurIm = Array(repeating: Float(0.0), count: n * n)
@@ -8256,36 +8300,28 @@ func solveCoupledIBDenseMultiSchur(
     }
 
     var pressureMatrix = Array(
-        repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        repeating: LapackComplex(r: 0.0, i: 0.0),
         count: n * sourceCount
     )
     for s in 0..<sourceCount {
         for row in 0..<n {
             let value = solved.pressures[s][row]
-            pressureMatrix[row * sourceCount + s] = __CLPK_complex(r: value.re, i: value.im)
+            pressureMatrix[row * sourceCount + s] = LapackComplex(r: value.re, i: value.im)
         }
     }
     var apertureMatrixOut = Array(
-        repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        repeating: LapackComplex(r: 0.0, i: 0.0),
         count: m * sourceCount
     )
-    var recoverAlpha = __CLPK_complex(r: 1.0, i: 0.0)
-    var recoverBeta = __CLPK_complex(r: 0.0, i: 0.0)
-    cblas_cgemm(
-        CblasRowMajor,
-        CblasNoTrans,
-        CblasNoTrans,
-        Int32(m),
-        Int32(sourceCount),
-        Int32(n),
-        &recoverAlpha,
-        &tRowMajor,
-        Int32(n),
-        &pressureMatrix,
-        Int32(sourceCount),
-        &recoverBeta,
-        &apertureMatrixOut,
-        Int32(sourceCount)
+    var recoverAlpha = LapackComplex(r: 1.0, i: 0.0)
+    var recoverBeta = LapackComplex(r: 0.0, i: 0.0)
+    lapack_cgemm(
+        m: m, n: sourceCount, k: n,
+        alpha: &recoverAlpha,
+        a: &tRowMajor, lda: n,
+        b: &pressureMatrix, ldb: sourceCount,
+        beta: &recoverBeta,
+        c: &apertureMatrixOut, ldc: sourceCount
     )
     let apertureNeumanns = (0..<sourceCount).map { s in
         (0..<m).map { row in
@@ -8373,14 +8409,14 @@ func solveDenseAccelerateCgesvMulti(
     let start = CFAbsoluteTimeGetCurrent()
 
     var matrix = Array(
-        repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        repeating: LapackComplex(r: 0.0, i: 0.0),
         count: n * n
     )
     for row in 0..<n {
         for col in 0..<n {
             let source = row * n + col
             let dest = col * n + row
-            matrix[dest] = __CLPK_complex(
+            matrix[dest] = LapackComplex(
                 r: aReRowMajor[source],
                 i: aImRowMajor[source]
             )
@@ -8388,23 +8424,23 @@ func solveDenseAccelerateCgesvMulti(
     }
 
     var rhs = Array(
-        repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        repeating: LapackComplex(r: 0.0, i: 0.0),
         count: n * sourceCount
     )
     for s in 0..<sourceCount {
         for i in 0..<n {
-            rhs[s * n + i] = __CLPK_complex(r: rhsRe[s][i], i: rhsIm[s][i])
+            rhs[s * n + i] = LapackComplex(r: rhsRe[s][i], i: rhsIm[s][i])
         }
     }
 
-    var nClpk = __CLPK_integer(n)
-    var nrhs = __CLPK_integer(sourceCount)
-    var lda = __CLPK_integer(n)
-    var ldb = __CLPK_integer(n)
-    var info = __CLPK_integer(0)
-    var pivots = Array(repeating: __CLPK_integer(0), count: n)
+    var nClpk = LapackInt(n)
+    var nrhs = LapackInt(sourceCount)
+    var lda = LapackInt(n)
+    var ldb = LapackInt(n)
+    var info = LapackInt(0)
+    var pivots = Array(repeating: LapackInt(0), count: n)
     let anorm = matrixOneNorm(&matrix, n: n)
-    cgesv_(&nClpk, &nrhs, &matrix, &lda, &pivots, &rhs, &ldb, &info)
+    lapack_cgesv(&nClpk, &nrhs, &matrix, &lda, &pivots, &rhs, &ldb, &info)
 
     if info != 0 {
         return MultiDenseSolveRun(
@@ -8500,14 +8536,14 @@ func solveDenseAccelerateCgetrfCgetrsMulti(
     let start = CFAbsoluteTimeGetCurrent()
 
     var matrix = Array(
-        repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        repeating: LapackComplex(r: 0.0, i: 0.0),
         count: n * n
     )
     for row in 0..<n {
         for col in 0..<n {
             let source = row * n + col
             let dest = col * n + row
-            matrix[dest] = __CLPK_complex(
+            matrix[dest] = LapackComplex(
                 r: aReRowMajor[source],
                 i: aImRowMajor[source]
             )
@@ -8515,29 +8551,29 @@ func solveDenseAccelerateCgetrfCgetrsMulti(
     }
 
     var rhs = Array(
-        repeating: __CLPK_complex(r: 0.0, i: 0.0),
+        repeating: LapackComplex(r: 0.0, i: 0.0),
         count: n * sourceCount
     )
     for s in 0..<sourceCount {
         for i in 0..<n {
-            rhs[s * n + i] = __CLPK_complex(r: rhsRe[s][i], i: rhsIm[s][i])
+            rhs[s * n + i] = LapackComplex(r: rhsRe[s][i], i: rhsIm[s][i])
         }
     }
 
-    var mClpk = __CLPK_integer(n)
-    var nClpk = __CLPK_integer(n)
-    var nrhs = __CLPK_integer(sourceCount)
-    var lda = __CLPK_integer(n)
-    var ldb = __CLPK_integer(n)
-    var info = __CLPK_integer(0)
-    var pivots = Array(repeating: __CLPK_integer(0), count: n)
+    var mClpk = LapackInt(n)
+    var nClpk = LapackInt(n)
+    var nrhs = LapackInt(sourceCount)
+    var lda = LapackInt(n)
+    var ldb = LapackInt(n)
+    var info = LapackInt(0)
+    var pivots = Array(repeating: LapackInt(0), count: n)
     let anorm = matrixOneNorm(&matrix, n: n)
-    cgetrf_(&mClpk, &nClpk, &matrix, &lda, &pivots, &info)
+    lapack_cgetrf(&mClpk, &nClpk, &matrix, &lda, &pivots, &info)
     var rcond: Double? = nil
     if info == 0 {
         rcond = estimateReciprocalCondition(factored: &matrix, n: n, anorm: anorm)
         var trans = Int8(78)
-        cgetrs_(&trans, &nClpk, &nrhs, &matrix, &lda, &pivots, &rhs, &ldb, &info)
+        lapack_cgetrs(&trans, &nClpk, &nrhs, &matrix, &lda, &pivots, &rhs, &ldb, &info)
     }
 
     if info != 0 {
@@ -9900,6 +9936,34 @@ func assembleSolveEvaluateStandardNeumannBatch(
     }
 
     func solveDenseForCase(
+        assembly: AssemblyRun,
+        extraRhs: [(re: [Float], im: [Float])],
+        apertureCoupling: ApertureCoupling?,
+        caseIndex: Int
+    ) throws -> MultiDenseSolveRun {
+        let solved = try solveDenseForCaseUnchecked(
+            assembly: assembly,
+            extraRhs: extraRhs,
+            apertureCoupling: apertureCoupling,
+            caseIndex: caseIndex
+        )
+        // A failed factorization (lapackInfo != 0) returns no pressures and is
+        // reported by the caller; a "successful" solve must be finite.
+        for (source, pressure) in solved.pressures.enumerated() {
+            if let dof = pressure.firstIndex(where: { !($0.re.isFinite && $0.im.isFinite) }) {
+                let frequency = (cases[caseIndex]["frequency_hz"] as? NSNumber)?.doubleValue
+                try fail(
+                    "non-finite dense solution (\(solved.implementation)): case \(caseIndex)"
+                        + ((cases[caseIndex]["case_id"] as? String).map { " (\($0))" } ?? "")
+                        + (frequency.map { ", frequency_hz \($0)" } ?? "")
+                        + ", surface pressure, source \(source), unknown \(dof)"
+                )
+            }
+        }
+        return solved
+    }
+
+    func solveDenseForCaseUnchecked(
         assembly: AssemblyRun,
         extraRhs: [(re: [Float], im: [Float])],
         apertureCoupling: ApertureCoupling?,
