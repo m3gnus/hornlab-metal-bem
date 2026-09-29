@@ -3,6 +3,11 @@
 This module is the analytic side of the resonant coupled-IB validation gate in
 ``test_native_coupled_ib_validation.py``. It uses no BEM code.
 
+Counterpart: hornlab-bempp-bem carries a copy of this file at
+``tests/ib_pipe_reference.py`` for its BEMPP-only resonant gate. THIS copy is the
+source of truth. Change both together; apart from the provenance note at the top of
+the copy, they must stay identical.
+
 Model
 -----
 A rigid-walled circular pipe of radius ``a`` and length ``L`` is closed at the
@@ -30,8 +35,9 @@ and opens at z = 0 into a rigid infinite baffle (half space z > 0).
 Geometry used by the gate: a = 40 mm, L = 100 mm. Observation: on axis (0 deg),
 D = 1.5 m from the mouth plane (``ObservationConfig.origin = "mouth"``). The
 first quarter-wave resonance of the closed-open pipe with end correction sits near
-650 Hz, so the gate frequency band brackets a resonance at its low-frequency
-end and rises across the pipe's first half-wave region.
+650 Hz, so the gate frequency band (300 Hz - 2.2 kHz) brackets that resonance at
+its low-frequency end and then crosses the half-wave antiresonance (near 1.2 kHz)
+and the three-quarter-wave resonance (near 2.1 kHz).
 
 Valid range
 -----------

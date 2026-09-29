@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Refuse `aperture_tag` (coupled infinite baffle) with `metal_native_assembly_mode="optimized"`: that mode omits the singular aperture integrals and is wrong at resonance (about 0.9 dB and 17 degrees on a 100 mm channel). `SolveConfig` raises `ValueError`; the native helper fails with a clear message. Use `"corrected"` (the default).
+- Refuse `aperture_tag` (coupled infinite baffle) with any `metal_native_assembly_mode` other than `"corrected"` (`"optimized"`, `"parity"`, `"reference"`): those modes omit the singular aperture integrals at real k and are wrong at resonance (`"optimized"`: about 0.9 dB and 17 degrees on a 100 mm channel). `SolveConfig` raises `ValueError`; the native helper fails with a clear message. Use `"corrected"` (the default).
 - Correct a native-helper comment that called `complex_k` the default coupled-IB formulation; the default is `standard`.
 
 ## 0.2.0 — 2026-09-28

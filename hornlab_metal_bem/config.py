@@ -658,12 +658,12 @@ class SolveConfig:
                 "metal_native_assembly_mode must be 'corrected', 'optimized', "
                 "'reference', or 'parity'"
             )
-        if self.aperture_tag is not None and self.metal_native_assembly_mode == "optimized":
+        if self.aperture_tag is not None and self.metal_native_assembly_mode != "corrected":
             raise ValueError(
                 "aperture_tag (coupled infinite baffle) requires "
-                "metal_native_assembly_mode='corrected': 'optimized' assembly "
-                "omits the singular aperture integrals and gives wrong "
-                "resonant pressure and phase"
+                "metal_native_assembly_mode='corrected': 'optimized', 'parity' and "
+                "'reference' assembly omit the singular aperture integrals and "
+                "give wrong resonant pressure and phase"
             )
         if self.dense_solve_dtype not in {"float32", "float64"}:
             raise ValueError("dense_solve_dtype must be 'float32' or 'float64'")

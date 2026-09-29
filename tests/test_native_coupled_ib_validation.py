@@ -259,6 +259,30 @@ def test_ib_reference_model_self_consistency():
         ) == pytest.approx(1.0, abs=1.0e-4)
 
 
+def test_ib_reference_quadrature_matches_airy_off_axis():
+    """Engine-free self-check of the off-axis Rayleigh quadrature against Airy.
+
+    The absolute-sign gate leans on _rayleigh_pressure_uniform_disc off axis,
+    so its shape is pinned here against the closed-form baffled-piston
+    directivity 2 J1(x)/x (ka = 3, far field). Measured 0.01 dB; limit 0.03 dB.
+    """
+    radius, ka, distance = 0.05, 3.0, 5.0
+    k = ka / radius
+    angles_deg = np.linspace(0.0, 70.0, 29)
+    vertices, triangles = _triangulated_disc(radius, rings=20, sectors=128)
+    points = np.column_stack(
+        [
+            distance * np.sin(np.deg2rad(angles_deg)),
+            np.zeros_like(angles_deg),
+            distance * np.cos(np.deg2rad(angles_deg)),
+        ]
+    )
+    pressure = _rayleigh_pressure_uniform_disc(vertices, triangles, points, k)
+    directivity_db = 20.0 * np.log10(np.abs(pressure / pressure[0]))
+    airy_db = 20.0 * np.log10(np.maximum(_airy_directivity(ka, angles_deg), 1.0e-12))
+    assert np.max(np.abs(directivity_db - airy_db)) < 0.03
+
+
 def test_native_coupled_ib_straight_channel_matches_analytic_piston(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -373,9 +397,9 @@ def test_native_coupled_channel_surface_and_hemisphere_power_agree():
 # on the gate grid against the reference:
 #
 #   mesh   max |dB|  max |phase|: off / in 600-700 Hz   resonance offset   peak level
-#   A  10   0.67      4.3 deg / 8.0 deg                  +6.6 Hz            -0.07 dB
-#   B  15   0.62      4.4 deg / 7.7 deg                  +6.3 Hz            -0.06 dB
-#   C  22   0.59      4.4 deg / 7.5 deg                  +6.2 Hz            -0.05 dB
+#   A  10   0.67      4.3 deg / 8.0 deg                  +6.0 Hz            -0.07 dB
+#   B  15   0.62      4.4 deg / 7.7 deg                  +5.7 Hz            -0.06 dB
+#   C  22   0.59      4.4 deg / 7.5 deg                  +5.6 Hz            -0.05 dB
 #
 # Mesh-to-mesh differences are small (A-B 0.07 dB / 0.4 deg, B-C 0.03 dB /
 # 0.14 deg, A-C 0.10 dB / 0.5 deg), so the residual against the reference is not
@@ -383,7 +407,20 @@ def test_native_coupled_channel_surface_and_hemisphere_power_agree():
 # reference (uniform mouth velocity, plane-wave-only pipe): about +6 Hz (1 %) in
 # resonance frequency and 0.6 dB / 4.4 deg elsewhere; the larger in-band phase
 # sits at the resonance, where 6 Hz of shift is several degrees of phase. Each
-# limit below is that converged gap times 1.5-2 (coarsest mesh included).
+# level and phase limit below is that converged gap times 1.5-2 (coarsest mesh
+# included).
+#
+# The resonance limit is a WINDOW centred on the known gap, not a symmetric
+# tolerance around the reference: a symmetric +/-12 Hz let a solver whose
+# resonance sat 1.5-2 % (10-11 Hz) too low pass. The window (3, 9) Hz is the
+# measured 5.6-6.0 Hz offset +/-3 Hz (0.5 % of the resonance, 5x the mesh-to-mesh
+# spread of 0.35 Hz), so a resonance shift of about 0.5 % in either direction
+# fails. The alternative, adopting the exact flanged-pipe end correction (Norris
+# and Sheng, about 0.82 a against King's 0.85 a) in the reference, was not taken:
+# it would close only the end-correction part of the gap, leave the uniform
+# mouth-velocity part, and move the reference off the published King form. The
+# offset is measured with a three-point parabola on the actual (non-uniform)
+# scan spacing.
 #
 # A single wall element (the historical fixture, 5 rings x 32 sectors x 1 layer)
 # is off by 24 dB and 115 deg and shows no resonance peak, so it fails every
@@ -402,7 +439,7 @@ _GATE_BAND_HZ = np.arange(300.0, 2200.1, 50.0)
 _GATE_RESONANCE_SCAN_HZ = np.arange(620.0, 700.1, 4.0)
 _GATE_RESONANCE_BAND_HZ = (600.0, 700.0)
 
-_GATE_RESONANCE_TOL_HZ = 12.0   # converged gap 6.2-6.6 Hz
+_GATE_RESONANCE_OFFSET_HZ = (3.0, 9.0)  # engine minus reference; converged gap 5.6-6.0 Hz
 _GATE_PEAK_LEVEL_TOL_DB = 0.25  # converged gap 0.05-0.07 dB
 _GATE_LEVEL_TOL_DB = 1.0        # converged gap 0.59-0.67 dB
 _GATE_PHASE_TOL_DEG = 8.0       # away from the resonance: converged gap 4.4 deg
@@ -470,10 +507,13 @@ def _resonance_peak(
     if not 0 < i < f.size - 1:
         # No interior peak in the scan: report NaN so every comparison fails.
         return float("nan"), float("nan")
-    step = f[i + 1] - f[i]
-    offset = 0.5 * (y[i - 1] - y[i + 1]) / (y[i - 1] - 2.0 * y[i] + y[i + 1])
-    peak_level = y[i] - 0.25 * (y[i - 1] - y[i + 1]) * offset
-    return float(f[i] + offset * step), float(20.0 * np.log10(np.e) * peak_level)
+    # Parabola through the three samples at their actual frequencies: the scan
+    # grid is not uniform (the 50 Hz band contributes 600 and 650 Hz between the
+    # 4 Hz samples), so a uniform-step vertex formula would bias the peak.
+    a, b, c = np.polyfit(f[i - 1 : i + 2] - f[i], y[i - 1 : i + 2], 2)
+    offset = -b / (2.0 * a)
+    peak_level = c - b * b / (4.0 * a)
+    return float(f[i] + offset), float(20.0 * np.log10(np.e) * peak_level)
 
 
 def _pipe_gap(frequencies_hz: np.ndarray, pressure: np.ndarray) -> dict[str, float]:
@@ -499,7 +539,8 @@ def _assert_within_pipe_reference(
     frequencies_hz: np.ndarray, pressure: np.ndarray
 ) -> None:
     gap = _pipe_gap(frequencies_hz, pressure)
-    assert abs(gap["resonance_hz"]) < _GATE_RESONANCE_TOL_HZ, gap
+    low, high = _GATE_RESONANCE_OFFSET_HZ
+    assert low < gap["resonance_hz"] < high, gap
     assert abs(gap["peak_level_db"]) < _GATE_PEAK_LEVEL_TOL_DB, gap
     assert gap["level_db"] < _GATE_LEVEL_TOL_DB, gap
     assert gap["phase_off_resonance_deg"] < _GATE_PHASE_TOL_DEG, gap
@@ -573,16 +614,17 @@ def test_native_coupled_ib_deep_channel_wall_refinement_converges():
     assert np.max(np.abs(np.degrees(np.angle(ratio)))) < _GATE_PHASE_TOL_RESONANCE_DEG
 
 
-def test_coupled_ib_config_refuses_optimized_assembly():
-    """'optimized' assembly zeroes the singular aperture integrals: refuse it up front."""
+@pytest.mark.parametrize("mode", ["optimized", "parity", "reference"])
+def test_coupled_ib_config_refuses_non_corrected_assembly(mode):
+    """Every mode but 'corrected' omits the singular aperture integrals: refuse up front."""
     with pytest.raises(ValueError, match="requires metal_native_assembly_mode='corrected'"):
         SolveConfig(
             velocity_sources={TAG_THROAT: 1.0},
             aperture_tag=TAG_APERTURE,
-            metal_native_assembly_mode="optimized",
+            metal_native_assembly_mode=mode,
         )
-    # Not coupled IB: 'optimized' stays available.
-    SolveConfig(velocity_sources={TAG_THROAT: 1.0}, metal_native_assembly_mode="optimized")
+    # Not coupled IB: the mode stays available.
+    SolveConfig(velocity_sources={TAG_THROAT: 1.0}, metal_native_assembly_mode=mode)
 
 
 def _cut_channel_mesh(mesh: LoadedMesh, *, quarter: bool) -> LoadedMesh:
@@ -622,7 +664,9 @@ def test_native_coupled_ib_half_and_quarter_match_full_at_resonance(plane, quart
     yz+xz quarter meshes must give the same pressure field and source impedance as
     the full mesh, including at the 650 Hz resonance where the solve is sensitive.
     Measured differences (float32 field path): <= 4.4e-4 relative pressure,
-    <= 0.003 dB, <= 0.02 deg; impedance <= 1e-3 relative.
+    <= 0.003 dB, <= 0.02 deg; impedance <= 1e-3 relative. The asserted limits
+    (2e-3 pressure, 5e-3 impedance) are deliberate margins of 4.5x and 5x over
+    those measurements, for float32 and platform variation.
     """
     require_fresh_native_helper()
     frequencies = np.array([300.0, 650.0, 659.0, 1000.0, 2000.0])

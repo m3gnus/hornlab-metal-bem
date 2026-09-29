@@ -4285,10 +4285,13 @@ def test_native_executable_coupled_ib_yz_xz_quadrant_matches_full(
     assert relative_error < 5.0e-4
 
 
-def test_native_executable_coupled_ib_refuses_optimized_assembly(monkeypatch, tmp_path):
-    """'optimized' assembly drops the singular aperture integrals; refuse it."""
+@pytest.mark.parametrize("mode", ["optimized", "parity", "reference"])
+def test_native_executable_coupled_ib_refuses_non_corrected_assembly(
+    monkeypatch, tmp_path, mode
+):
+    """Every assembly mode but 'corrected' drops the singular aperture integrals."""
     require_fresh_native_helper()
-    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "optimized")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", mode)
     monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE", "float64")
 
     buffers = _ib_quarter_box_mirrored_full_geometry_buffers()
@@ -4296,8 +4299,8 @@ def test_native_executable_coupled_ib_refuses_optimized_assembly(monkeypatch, tm
     neumann[0, buffers.physical_tags_i32 == 1] = 1.0 + 0.0j
     with MetalNativeStandardSession.create_session(
         geometry_buffers=buffers,
-        work_dir=tmp_path / "native-coupled-ib-optimized-session",
-        session_id="native-coupled-ib-optimized-test",
+        work_dir=tmp_path / f"native-coupled-ib-{mode}-session",
+        session_id=f"native-coupled-ib-{mode}-test",
         aperture_tag=7,
         velocity_source_tags=[1],
     ) as session:
@@ -4307,7 +4310,7 @@ def test_native_executable_coupled_ib_refuses_optimized_assembly(monkeypatch, tm
                 np.array([np.float32(2.0 * np.pi * 100.0 / 343.0)], dtype=np.float32),
                 neumann,
                 np.array([[0.0, 0.0, 0.12]], dtype=np.float32),
-                operation_id="resident-coupled-ib-optimized",
+                operation_id=f"resident-coupled-ib-{mode}",
                 source_tags=[1],
                 dense_solve_dtype="float64",
             )

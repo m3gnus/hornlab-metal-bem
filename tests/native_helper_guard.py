@@ -28,6 +28,32 @@ from hornlab_metal_bem.metal import discover_native_runtime
 _MTIME_SLACK_S = 2.0
 
 
+def stale_helper_message(status) -> str | None:
+    """Return the failure text when the in-tree helper is older than its sources."""
+    if not status.available or status.helper_source != "swift-package":
+        return None
+    helper = status.helper_executable_path
+    package_dir = status.native_package_dir
+    inputs = [
+        *sorted((package_dir / "Sources").rglob("*.swift")),
+        package_dir / "Package.swift",
+    ]
+    newer = [
+        path.name
+        for path in inputs
+        if path.is_file()
+        and path.stat().st_mtime > helper.stat().st_mtime + _MTIME_SLACK_S
+    ]
+    if not newer:
+        return None
+    return (
+        f"native helper {helper} is older than {', '.join(newer)}; "
+        f"run `swift build -c release` in {package_dir} so the tests exercise "
+        "the current source (if that reports nothing to relink, as after a "
+        "comment-only edit, `touch` the helper afterwards: setup.py does the same)"
+    )
+
+
 def require_fresh_native_helper():
     """Skip when the helper cannot run; fail when it is older than its sources."""
     status = discover_native_runtime(run_smoke_test=True)
@@ -36,26 +62,7 @@ def require_fresh_native_helper():
             "Swift/Metal native helper unavailable: "
             + "; ".join(status.unavailable_reasons)
         )
-    if status.helper_source == "swift-package":
-        helper = status.helper_executable_path
-        package_dir = status.native_package_dir
-        inputs = [
-            *sorted((package_dir / "Sources").rglob("*.swift")),
-            package_dir / "Package.swift",
-        ]
-        newer = [
-            path.name
-            for path in inputs
-            if path.is_file()
-            and path.stat().st_mtime > helper.stat().st_mtime + _MTIME_SLACK_S
-        ]
-        if newer:
-            pytest.fail(
-                f"native helper {helper} is older than {', '.join(newer)}; "
-                "run `swift build -c release` in "
-                f"{package_dir} so the tests exercise the current source "
-                "(if that reports nothing to relink, as after a comment-only "
-                "edit, `touch` the helper afterwards: setup.py does the same)",
-                pytrace=False,
-            )
+    message = stale_helper_message(status)
+    if message is not None:
+        pytest.fail(message, pytrace=False)
     return status

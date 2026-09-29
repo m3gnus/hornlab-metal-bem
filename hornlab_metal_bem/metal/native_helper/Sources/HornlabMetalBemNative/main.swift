@@ -9676,16 +9676,19 @@ func assembleSolveEvaluateStandardNeumannBatch(
     let assemblyMode = ProcessInfo.processInfo.environment[
         "HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE"
     ] ?? "optimized"
-    if hasCoupledIB && assemblyMode == "optimized" {
+    if hasCoupledIB && assemblyMode != "corrected" {
         // regularPairBlocks zeroes the r = 0 (self and coincident) terms when
         // includeDuffy is false, which is what "optimized" does. The aperture
         // radiation block is the Rayleigh single layer over exactly those
         // pairs, so without the Duffy correction its singular integrals are
         // missing: on a 100 mm deep circular channel 'optimized' is off from
         // 'corrected' by about 0.9 dB and 17 degrees at the first resonance.
+        // 'parity' returns the optimized arrays, and 'reference' applies the
+        // Duffy correction only for complex k or Robin betas, so at real k both
+        // omit the same integrals.
         try fail(
             "coupled IB aperture_tag requires assembly mode 'corrected'; "
-                + "'optimized' assembly omits the singular aperture integrals"
+                + "'\(assemblyMode)' assembly omits the singular aperture integrals"
         )
     }
     let duffyMode = ProcessInfo.processInfo.environment[
