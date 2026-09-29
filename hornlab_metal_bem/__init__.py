@@ -5,6 +5,7 @@ from dataclasses import replace as _replace
 
 import numpy as np
 
+from .capabilities import CAPABILITY_SCHEMA_VERSION, REQUEST_SCHEMA_VERSION, capabilities
 from .config import (
     AnnularProfile,
     AxialProfile,
@@ -30,6 +31,9 @@ from .observation import ObservationFrame, infer_frame
 from .result import MeshInfo, SolveResult
 
 __all__ = [
+    "capabilities",
+    "CAPABILITY_SCHEMA_VERSION",
+    "REQUEST_SCHEMA_VERSION",
     "native_config",
     "solve",
     "solve_frequencies",

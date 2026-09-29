@@ -249,9 +249,11 @@ Common fields:
 
 The native Metal package supports standard Neumann solves by default. It also
 exposes experimental opt-in `formulation="complex_k"` and
-`impedance_sources={tag: beta}` Robin admittance support. It does not expose
-legacy OpenCL/Bempp fallback configuration or Burton-Miller as user-facing
-features.
+`impedance_sources={tag: beta}` Robin admittance support, plus
+`formulation="burton_miller"` for prescribed-Neumann exterior solves.
+Burton-Miller refuses Robin boundaries, CHIEF points, ground planes and
+coupled infinite baffle. Legacy OpenCL/Bempp fallback configuration is not
+exposed.
 
 Use `solve_frequencies(mesh, frequencies_hz, config=None)` when frequency order
 comes from the caller instead of a generated sweep.
@@ -269,6 +271,44 @@ the default pipelined corrected/optimized assembly path; when
 `on_frequency_result` is set, each callback entry includes a `source_results`
 list with one per-source log entry. The reference/parity debug modes stay
 single-source.
+
+### Capability handshake
+
+Integrations can inspect the package contract before constructing a request:
+
+```python
+from hornlab_metal_bem import (
+    CAPABILITY_SCHEMA_VERSION, REQUEST_SCHEMA_VERSION, capabilities,
+)
+
+report = capabilities()
+assert report["schema_version"] == CAPABILITY_SCHEMA_VERSION == 1
+assert report["request_schema_version"] == REQUEST_SCHEMA_VERSION == 1
+assert "frame_override" in report["request_fields"]
+assert "axial" in report["features"]["source_motion"]
+```
+
+The result is a fresh JSON-serialisable dictionary. `schema_version` versions
+the report's structure; `request_schema_version` versions the public
+`SolveConfig` contract (not the native helper IPC). Consumers should check
+both versions against the versions they understand before interpreting keys.
+A feature becoming supported does not itself change the report schema.
+Incompatible request names, values or semantics change the request version.
+
+`package_version` comes from installed distribution metadata and is `"unknown"`
+in an uninstalled source checkout. `request_fields` lists every constructor
+field directly from `SolveConfig`. `features` describes source motion and
+axes, aperture-coupled infinite baffle, formulations, complex-k shift, explicit
+frames, ground planes, symmetry, streaming and retained traces. It also
+declares the optional `require_closed_mesh` and `workers` request keywords
+unsupported. Ground planes support `xy`, `yz`, `xz`, and cannot compose with
+symmetry or infinite baffle. The per-feature formulation lists record that
+ground planes and infinite baffle refuse Burton-Miller. `conventions` states
+the time factor, outgoing wave and Neumann coefficient together.
+
+This describes the package API without probing hardware, building a helper or
+running a solve. Host readiness remains a separate call to
+`hornlab_metal_bem.metal.discover_native_runtime()`.
 
 ## Observation Points
 
