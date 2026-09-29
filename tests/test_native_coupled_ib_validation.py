@@ -7,9 +7,9 @@ from scipy.special import j1, struve
 import hornlab_metal_bem as metal_bem
 from hornlab_metal_bem.config import ObservationConfig, SolveConfig, VelocityMode
 from hornlab_metal_bem.mesh import LoadedMesh, make_pure_grid
-from hornlab_metal_bem.metal import discover_native_runtime
 from hornlab_metal_bem.observation import ObservationFrame
 from hornlab_metal_bem.result import MeshInfo
+from native_helper_guard import require_fresh_native_helper
 from ib_pipe_reference import (
     baffled_piston_on_axis,
     pipe_mouth_velocity,
@@ -264,12 +264,7 @@ def test_native_coupled_ib_straight_channel_matches_analytic_piston(
 ):
     monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
     monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
-    status = discover_native_runtime(run_smoke_test=True)
-    if not status.available:
-        pytest.skip(
-            "Swift/Metal native helper unavailable: "
-            + "; ".join(status.unavailable_reasons)
-        )
+    require_fresh_native_helper()
 
     radius = 0.04
     depth = 0.003
@@ -319,12 +314,7 @@ def test_native_coupled_ib_straight_channel_matches_analytic_piston(
 
 @pytest.mark.slow
 def test_native_coupled_channel_surface_and_hemisphere_power_agree():
-    status = discover_native_runtime(run_smoke_test=True)
-    if not status.available:
-        pytest.skip(
-            "Swift/Metal native helper unavailable: "
-            + "; ".join(status.unavailable_reasons)
-        )
+    require_fresh_native_helper()
 
     radius = 0.04
     depth = 0.003
@@ -444,15 +434,6 @@ def _channel_config(
     )
 
 
-def _require_native_helper() -> None:
-    status = discover_native_runtime(run_smoke_test=True)
-    if not status.available:
-        pytest.skip(
-            "Swift/Metal native helper unavailable: "
-            + "; ".join(status.unavailable_reasons)
-        )
-
-
 def _gate_frequencies() -> np.ndarray:
     return np.unique(np.concatenate([_GATE_BAND_HZ, _GATE_RESONANCE_SCAN_HZ]))
 
@@ -528,7 +509,7 @@ def _assert_within_pipe_reference(
 @pytest.mark.parametrize("mesh_spec", [_MESH_A, _MESH_B], ids=["10-layers", "15-layers"])
 def test_native_coupled_ib_resonant_channel_matches_pipe_reference(mesh_spec):
     """Deep channel: resonance frequency, absolute on-axis level and phase vs the 1-D pipe."""
-    _require_native_helper()
+    require_fresh_native_helper()
     frequencies = _gate_frequencies()
     pressure = _channel_on_axis(
         _straight_channel_mesh(_GATE_RADIUS_M, _GATE_DEPTH_M, **mesh_spec), frequencies
@@ -538,7 +519,7 @@ def test_native_coupled_ib_resonant_channel_matches_pipe_reference(mesh_spec):
 
 def test_native_coupled_ib_pipe_gate_rejects_single_layer_wall():
     """The historical one-band wall fixture cannot pass the resonant gate."""
-    _require_native_helper()
+    require_fresh_native_helper()
     frequencies = _gate_frequencies()
     pressure = _channel_on_axis(
         _straight_channel_mesh(
@@ -557,7 +538,7 @@ def test_native_coupled_ib_deep_channel_wall_refinement_converges():
     twenty-one frequencies including the resonance, and checks that every mesh is
     within the pipe-reference gate, so the gate limits are not fitted to one mesh.
     """
-    _require_native_helper()
+    require_fresh_native_helper()
     frequencies = np.unique(
         np.concatenate([np.arange(300.0, 2201.0, 100.0), _GATE_RESONANCE_SCAN_HZ[::4]])
     )
@@ -590,6 +571,18 @@ def test_native_coupled_ib_deep_channel_wall_refinement_converges():
     ratio = fields["C"][:, 0] / reference
     assert np.max(np.abs(20.0 * np.log10(np.abs(ratio)))) < _GATE_LEVEL_TOL_DB
     assert np.max(np.abs(np.degrees(np.angle(ratio)))) < _GATE_PHASE_TOL_RESONANCE_DEG
+
+
+def test_coupled_ib_config_refuses_optimized_assembly():
+    """'optimized' assembly zeroes the singular aperture integrals: refuse it up front."""
+    with pytest.raises(ValueError, match="requires metal_native_assembly_mode='corrected'"):
+        SolveConfig(
+            velocity_sources={TAG_THROAT: 1.0},
+            aperture_tag=TAG_APERTURE,
+            metal_native_assembly_mode="optimized",
+        )
+    # Not coupled IB: 'optimized' stays available.
+    SolveConfig(velocity_sources={TAG_THROAT: 1.0}, metal_native_assembly_mode="optimized")
 
 
 def _cut_channel_mesh(mesh: LoadedMesh, *, quarter: bool) -> LoadedMesh:
@@ -631,7 +624,7 @@ def test_native_coupled_ib_half_and_quarter_match_full_at_resonance(plane, quart
     Measured differences (float32 field path): <= 4.4e-4 relative pressure,
     <= 0.003 dB, <= 0.02 deg; impedance <= 1e-3 relative.
     """
-    _require_native_helper()
+    require_fresh_native_helper()
     frequencies = np.array([300.0, 650.0, 659.0, 1000.0, 2000.0])
     full_mesh = _straight_channel_mesh(_GATE_RADIUS_M, _GATE_DEPTH_M, **_MESH_B)
     full = metal_bem.solve_frequencies(full_mesh, frequencies, _channel_config())
@@ -743,12 +736,7 @@ def _assert_outward_baffled_piston(scales: list[tuple[complex, float]]) -> None:
 
 @pytest.mark.parametrize("velocity_mode", [VelocityMode.VELOCITY, VelocityMode.ACCELERATION])
 def test_native_coupled_ib_radiates_outward_absolute_sign(velocity_mode: str):
-    status = discover_native_runtime(run_smoke_test=True)
-    if not status.available:
-        pytest.skip(
-            "Swift/Metal native helper unavailable: "
-            + "; ".join(status.unavailable_reasons)
-        )
+    require_fresh_native_helper()
     radius, depth, distance = 0.04, 0.003, 1.5
     frequencies_hz = np.array([800.0, 2000.0], dtype=np.float64)
     angles = np.linspace(0.0, 90.0, 10)

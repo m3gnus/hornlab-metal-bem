@@ -23,6 +23,7 @@ from hornlab_metal_bem.metal import native
 from hornlab_metal_bem.metal.geometry import build_metal_geometry_buffers
 from hornlab_metal_bem.metal.geometry import MetalGeometryError
 from hornlab_metal_bem.metal.geometry import validate_native_symmetry_plane
+from native_helper_guard import require_fresh_native_helper
 from hornlab_metal_bem.validation.native_symmetry import orbit_reduce_matrix_rhs
 
 
@@ -4202,12 +4203,7 @@ def test_native_executable_coupled_ib_yz_xz_quadrant_matches_full(
     monkeypatch,
     tmp_path,
 ):
-    status = discover_native_runtime(run_smoke_test=True)
-    if not status.available:
-        pytest.skip(
-            "Swift/Metal native helper unavailable: "
-            + "; ".join(status.unavailable_reasons)
-        )
+    require_fresh_native_helper()
 
     monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "corrected")
     monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_FIELD_MODE", "optimized")
@@ -4287,6 +4283,34 @@ def test_native_executable_coupled_ib_yz_xz_quadrant_matches_full(
     assert quarter_solved.diagnostics["symmetry_plane"] == "yz+xz"
     assert quarter_solved.diagnostics["coupled_ib"] is True
     assert relative_error < 5.0e-4
+
+
+def test_native_executable_coupled_ib_refuses_optimized_assembly(monkeypatch, tmp_path):
+    """'optimized' assembly drops the singular aperture integrals; refuse it."""
+    require_fresh_native_helper()
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE", "optimized")
+    monkeypatch.setenv("HORNLAB_METAL_BEM_NATIVE_DENSE_SOLVE_DTYPE", "float64")
+
+    buffers = _ib_quarter_box_mirrored_full_geometry_buffers()
+    neumann = np.zeros((1, buffers.n_triangles), dtype=np.complex64)
+    neumann[0, buffers.physical_tags_i32 == 1] = 1.0 + 0.0j
+    with MetalNativeStandardSession.create_session(
+        geometry_buffers=buffers,
+        work_dir=tmp_path / "native-coupled-ib-optimized-session",
+        session_id="native-coupled-ib-optimized-test",
+        aperture_tag=7,
+        velocity_source_tags=[1],
+    ) as session:
+        with pytest.raises(Exception, match="requires assembly mode 'corrected'"):
+            session.assemble_solve_evaluate_standard_neumann_batch(
+                np.array([100.0]),
+                np.array([np.float32(2.0 * np.pi * 100.0 / 343.0)], dtype=np.float32),
+                neumann,
+                np.array([[0.0, 0.0, 0.12]], dtype=np.float32),
+                operation_id="resident-coupled-ib-optimized",
+                source_tags=[1],
+                dense_solve_dtype="float64",
+            )
 
 
 def test_native_executable_field_evaluation_on_tiny_mesh(tmp_path):

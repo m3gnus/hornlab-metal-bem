@@ -9676,6 +9676,18 @@ func assembleSolveEvaluateStandardNeumannBatch(
     let assemblyMode = ProcessInfo.processInfo.environment[
         "HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE"
     ] ?? "optimized"
+    if hasCoupledIB && assemblyMode == "optimized" {
+        // regularPairBlocks zeroes the r = 0 (self and coincident) terms when
+        // includeDuffy is false, which is what "optimized" does. The aperture
+        // radiation block is the Rayleigh single layer over exactly those
+        // pairs, so without the Duffy correction its singular integrals are
+        // missing: on a 100 mm deep circular channel 'optimized' is off from
+        // 'corrected' by about 0.9 dB and 17 degrees at the first resonance.
+        try fail(
+            "coupled IB aperture_tag requires assembly mode 'corrected'; "
+                + "'optimized' assembly omits the singular aperture integrals"
+        )
+    }
     let duffyMode = ProcessInfo.processInfo.environment[
         "HORNLAB_METAL_BEM_NATIVE_DUFFY_MODE"
     ] ?? "gpu_blocks"
@@ -9892,9 +9904,11 @@ func assembleSolveEvaluateStandardNeumannBatch(
     ) throws -> MultiDenseSolveRun {
         if let apertureCoupling {
             // Coupled infinite-baffle solves intentionally skip CHIEF rows. The
-            // Rayleigh aperture block adds exterior radiation damping, and the
-            // default complex_k formulation moves resonant wavenumbers off the
-            // real axis; server coupled-IB parity tests exercise this contract.
+            // Rayleigh aperture block already adds the exterior radiation
+            // load, so there is no exterior spurious-frequency problem for
+            // CHIEF to fix. The formulation is the caller's choice: the
+            // library default is "standard" (real k); complex_k, when
+            // requested, additionally damps the real cavity resonances.
             return try solveCoupledIBDenseMulti(
                 arrays: assembly.arrays,
                 extraRhs: extraRhs,

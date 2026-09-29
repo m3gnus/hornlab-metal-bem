@@ -529,6 +529,15 @@ def main(argv: list[str] | None = None) -> int:
         {},
     )
     aperture_tag = getattr(mesh, "coupled_ib_aperture_tag", None)
+    assembly_mode_env = "HORNLAB_METAL_BEM_NATIVE_ASSEMBLY_MODE"
+    session_env = dict(_native_field_env_overrides())
+    if aperture_tag is not None and os.environ.get(assembly_mode_env) is None:
+        # The helper's unset default ("optimized") drops the singular aperture
+        # integrals and now refuses coupled IB. Pin the mode the coupled path
+        # requires, and record it, rather than benchmarking a refusal. An
+        # explicit "optimized" in the caller's environment still fails loudly.
+        session_env[assembly_mode_env] = "corrected"
+        environment[assembly_mode_env] = "corrected"
     fixture_name = str(args.mesh) if args.mesh is not None else "built-in-coupled-box"
     helper_path = runtime.helper_executable_path
 
@@ -545,7 +554,7 @@ def main(argv: list[str] | None = None) -> int:
         # helper fall back to the serial CPU reference evaluator, which once
         # reported a 4 s balloon that the Metal kernel evaluates in 13 ms. Every
         # other A/B knob is still inherited from os.environ verbatim.
-        extra_env=_native_field_env_overrides(),
+        extra_env=session_env,
     ) as session:
         points, sphere_total, sphere_evaluated = _observation_points(
             mesh,

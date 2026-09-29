@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Refuse `aperture_tag` (coupled infinite baffle) with `metal_native_assembly_mode="optimized"`: that mode omits the singular aperture integrals and is wrong at resonance (about 0.9 dB and 17 degrees on a 100 mm channel). `SolveConfig` raises `ValueError`; the native helper fails with a clear message. Use `"corrected"` (the default).
+- Correct a native-helper comment that called `complex_k` the default coupled-IB formulation; the default is `standard`.
+
 ## 0.2.0 — 2026-09-28
 
 - Report `impedance` as the pressure average on the lowest source tag with a nonzero weight (previously the lowest listed tag, even at zero weight); all-zero weights keep the lowest tag. The observation frame still uses the lowest listed tag.
