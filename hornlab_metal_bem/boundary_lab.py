@@ -242,10 +242,7 @@ class BoundaryLabSession:
             return not should_stop()
 
         overrides = {**self.default_overrides, "on_frequency_result": on_frequency_result}
-        overrides.update(
-            velocity_sources=dict(channel_sources[0]),
-            velocity_source_callback=None,
-        )
+        overrides.update(_multi_source_overrides(overrides, channel_sources))
         solve_config, translated_frequencies = solve_config_from_boundary_lab(cfg, **overrides)
         frequencies = frequencies_hz if frequencies_hz is not None else translated_frequencies
         if frequencies is None:
@@ -287,6 +284,24 @@ class BoundaryLabSession:
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         self.close()
+
+
+def _multi_source_overrides(
+    overrides: dict[str, Any], channel_sources: list[dict[int, complex]]
+) -> dict[str, Any]:
+    """Drive overrides for the multi-source channel-basis solve.
+
+    ``velocity_sources`` is ignored by the multi-source path, but the config
+    validates ``source_axes`` against it. Caller-supplied ``source_axes`` cover
+    every channel's tags, so the config must list the union of all channels'
+    tags or construction rejects the axes of the later channels.
+    """
+    velocity_sources = dict(channel_sources[0])
+    if overrides.get("source_axes") is not None:
+        for source in channel_sources[1:]:
+            for tag in source:
+                velocity_sources.setdefault(tag, 1.0)
+    return {"velocity_sources": velocity_sources, "velocity_source_callback": None}
 
 
 def create_backend(**default_overrides: Any) -> BoundaryLabBackend:

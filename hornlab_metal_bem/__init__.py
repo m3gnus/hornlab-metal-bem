@@ -245,6 +245,11 @@ def solve_frequencies(
     return run_sweep_native_metal(loaded, freqs, frame, config)
 
 
+def _multi_source_frame_config(config, first_source):
+    """Config used only to infer the shared observation frame (pure)."""
+    return _replace(config, velocity_sources=dict(first_source), source_axes=None)
+
+
 def solve_multi_source(
     mesh,
     sources: list[dict[int, complex]],
@@ -286,10 +291,7 @@ def solve_multi_source(
     config = _config_for_loaded_mesh(loaded, config)
     # Frame inference ignores the drive, so the explicit axes are dropped here
     # rather than validated against the narrowed first-source tag set.
-    frame_config = _replace(
-        config, velocity_sources=dict(sources[0]), source_axes=None
-    )
-    frame = _resolve_frame(loaded, frame_config)
+    frame = _resolve_frame(loaded, _multi_source_frame_config(config, sources[0]))
     freqs = (
         _build_frequency_grid(config)
         if frequencies_hz is None

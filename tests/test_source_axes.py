@@ -397,3 +397,56 @@ def test_multi_source_two_axial_sources_without_profiles_or_frame_override():
     np.testing.assert_allclose(
         sum(m.pressure_complex for m in multi), joint.pressure_complex, **_TOL
     )
+
+
+# Follow-ups: pure-Python coverage of the multi-source config narrowing ---
+def test_per_source_axes_keep_other_axial_profile_tags():
+    from hornlab_metal_bem.sweep import _source_axes_for_tags
+
+    axial = AxialProfile()
+    cfg = SolveConfig(
+        velocity_sources={2: 1.0, 3: 1.0, 4: 1.0},
+        source_velocity_profiles={2: axial, 3: axial},
+        source_axes={2: (0, 0, 1), 3: (0, 0, -1)},
+    )
+    subset = _source_axes_for_tags(cfg, [2])
+    # Tag 3 stays axial in tag 2's per-source config, so its axis must remain.
+    assert subset == {2: (0, 0, 1), 3: (0, 0, -1)}
+    # The per-source config built by the multi-source path must be accepted.
+    replace(cfg, velocity_sources={2: 1.0}, source_axes=subset)
+    # A normal-only source keeps just the axial-profile axes.
+    assert set(_source_axes_for_tags(cfg, [4])) == {2, 3}
+
+
+def test_frame_config_drops_axes_and_is_accepted():
+    from hornlab_metal_bem import _multi_source_frame_config
+
+    cfg = _cfg({2: 1.0, 3: 1.0}, {2: (0, 0, 1), 3: (0, 0, 1)})
+    frame_cfg = _multi_source_frame_config(cfg, {2: 1.0})
+    assert frame_cfg.source_axes is None
+    assert frame_cfg.velocity_sources == {2: 1.0}
+    # Without dropping the axes, narrowing to the first source is rejected.
+    with pytest.raises(ValueError, match="source_axes"):
+        replace(cfg, velocity_sources={2: 1.0})
+
+
+def test_boundary_lab_channel_axes_cover_every_channel():
+    from hornlab_metal_bem.boundary_lab import (
+        _multi_source_overrides,
+        solve_config_from_boundary_lab,
+    )
+
+    channels = [{2: 1.0 + 0j}, {3: 1.0 + 0j}]
+    axes = {2: (0, 0, 1), 3: (0, 0, -1)}
+    overrides = {"source_motion": SourceMotion.AXIAL, "source_axes": axes}
+    overrides.update(_multi_source_overrides(overrides, channels))
+    config, _ = solve_config_from_boundary_lab({}, **overrides)
+    assert config.source_axes == axes
+    # velocity_sources is ignored downstream; the second channel's tag is only
+    # listed so its axis validates.
+    assert set(config.velocity_sources) == {2, 3}
+    # Legacy path (no axes): first channel only, unchanged.
+    assert _multi_source_overrides({}, channels) == {
+        "velocity_sources": {2: 1.0 + 0j},
+        "velocity_source_callback": None,
+    }
