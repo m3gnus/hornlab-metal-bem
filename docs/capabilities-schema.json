@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "This copy must match docs/capabilities-schema.json in both hornlab-metal-bem and hornlab-bempp-bem; update and test both together.",
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "hornlab-bem-capabilities"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "request_schema_version": {
+      "const": 1
+    },
+    "package": {
+      "enum": [
+        "hornlab-metal-bem",
+        "hornlab-bempp-bem"
+      ]
+    },
+    "package_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "request_fields": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "conventions": {
+      "type": "object",
+      "properties": {
+        "time_convention": {
+          "const": "exp(-i*omega*t)"
+        },
+        "outgoing_wave": {
+          "const": "exp(+i*k*r)"
+        }
+      },
+      "required": [
+        "time_convention",
+        "outgoing_wave"
+      ],
+      "additionalProperties": false
+    },
+    "features": {
+      "type": "object",
+      "properties": {
+        "source_motion": {
+          "$ref": "#/$defs/feature"
+        },
+        "source_axes": {
+          "$ref": "#/$defs/feature"
+        },
+        "formulation": {
+          "$ref": "#/$defs/feature"
+        },
+        "complex_k_shift": {
+          "$ref": "#/$defs/feature"
+        },
+        "frame_override": {
+          "$ref": "#/$defs/feature"
+        },
+        "infinite_baffle": {
+          "$ref": "#/$defs/feature"
+        },
+        "native_symmetry": {
+          "$ref": "#/$defs/feature"
+        },
+        "ground_plane": {
+          "$ref": "#/$defs/feature"
+        },
+        "explicit_frequencies": {
+          "$ref": "#/$defs/feature"
+        },
+        "on_frequency_result": {
+          "$ref": "#/$defs/feature"
+        },
+        "return_surface_traces": {
+          "$ref": "#/$defs/feature"
+        },
+        "require_closed_mesh": {
+          "$ref": "#/$defs/feature"
+        },
+        "workers": {
+          "$ref": "#/$defs/feature"
+        },
+        "assembly_backend": {
+          "$ref": "#/$defs/feature"
+        }
+      },
+      "required": [
+        "source_motion",
+        "source_axes",
+        "formulation",
+        "complex_k_shift",
+        "frame_override",
+        "infinite_baffle",
+        "native_symmetry",
+        "ground_plane",
+        "explicit_frequencies",
+        "on_frequency_result",
+        "return_surface_traces",
+        "require_closed_mesh",
+        "workers",
+        "assembly_backend"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "schema",
+    "schema_version",
+    "request_schema_version",
+    "package",
+    "package_version",
+    "request_fields",
+    "conventions",
+    "features"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "feature": {
+      "type": "object",
+      "properties": {
+        "supported": {
+          "type": "boolean"
+        },
+        "request_fields": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "values": {
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "requires": {
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "array",
+              "string"
+            ]
+          }
+        },
+        "refuses": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "request_fields": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "uniqueItems": true
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "request_fields",
+              "reason"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "composes_with": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "feature": {
+                "enum": [
+                  "source_motion",
+                  "source_axes",
+                  "formulation",
+                  "complex_k_shift",
+                  "frame_override",
+                  "infinite_baffle",
+                  "native_symmetry",
+                  "ground_plane",
+                  "explicit_frequencies",
+                  "on_frequency_result",
+                  "return_surface_traces",
+                  "require_closed_mesh",
+                  "workers",
+                  "assembly_backend"
+                ]
+              },
+              "values": {
+                "type": "array"
+              }
+            },
+            "required": [
+              "feature",
+              "values"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "supported",
+        "request_fields",
+        "values",
+        "requires",
+        "refuses",
+        "composes_with"
+      ],
+      "additionalProperties": false
+    }
+  }
+}
