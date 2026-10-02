@@ -764,12 +764,15 @@ def _normalized_source_axes(config: SolveConfig) -> dict[int, "np.ndarray"] | No
             raise ValueError(
                 f"source_axes axis of tag {tag} must be 3 finite numbers"
             )
-        norm = float(np.linalg.norm(vec))
-        if not norm > 1e-12:
+        scale = float(np.max(np.abs(vec)))
+        if scale == 0.0:
             raise ValueError(
                 f"source_axes axis of tag {tag} must have non-zero length"
             )
-        unit = vec / norm
+        # Bound the norm's inputs so finite directions cannot overflow or
+        # underflow solely because the caller scaled a non-zero axis.
+        scaled = vec / scale
+        unit = scaled / float(np.linalg.norm(scaled))
         plane = config.native_symmetry_plane
         if plane is not None:
             for component in _SYMMETRY_PLANE_NORMAL_AXES.get(

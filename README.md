@@ -214,7 +214,9 @@ Common fields:
   both front/back faces of a thin diaphragm gives the dipole path because axial
   preserves the opposite per-face signs)
 - `source_axes`, optional `{tag: (x, y, z)}` giving each axial source its own
-  piston axis in mesh coordinates (normalized on use). Default `None` keeps the
+  piston axis in mesh coordinates (normalized on use). Any finite, non-zero
+  direction is accepted regardless of magnitude; exact zero and non-finite
+  coordinates raise `ValueError`. Default `None` keeps the
   legacy behaviour: the observation-frame axis with one area-weighted sign vote
   per tag, which makes the drive depend on tag grouping and on the plotting
   frame. With `source_axes` every axial tag needs an entry (`ValueError`

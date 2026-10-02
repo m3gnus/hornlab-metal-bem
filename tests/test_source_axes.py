@@ -14,7 +14,12 @@ import pytest
 
 import hornlab_metal_bem as metal_bem
 from hornlab_metal_bem.bie import _build_source_face_scale
-from hornlab_metal_bem.config import AxialProfile, SolveConfig, SourceMotion
+from hornlab_metal_bem.config import (
+    AxialProfile,
+    SolveConfig,
+    SourceMotion,
+    _normalized_source_axes,
+)
 from hornlab_metal_bem.observation import ObservationFrame
 
 Z = np.array([0.0, 0.0, 1.0])
@@ -94,8 +99,43 @@ def test_axis_is_normalized():
     np.testing.assert_array_equal(a, b)
 
 
+@pytest.mark.parametrize("magnitude", [1e200, 1e-13, 1e-200, 1e307])
+@pytest.mark.parametrize("polarity", [1, -1])
+def test_axis_direction_is_independent_of_extreme_scale(magnitude, polarity):
+    direction = np.array([1.0, -2.0, 2.0]) * polarity
+    expected = direction / 3.0
+    with np.errstate(over="raise", invalid="raise", divide="raise"):
+        config = _cfg({2: 1.0}, {2: direction * magnitude})
+        actual = _normalized_source_axes(config)[2]
+        scales = _scale([Z, -Z, [1, 0, 0]], [2, 2, 2], config)
+    np.testing.assert_allclose(actual, expected, rtol=1e-15, atol=0)
+    np.testing.assert_allclose(
+        scales, [expected[2], -expected[2], expected[0]], rtol=1e-15, atol=0
+    )
+    assert np.isfinite(actual).all()
+    assert np.linalg.norm(actual) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("magnitude", [np.finfo(float).max, np.nextafter(0.0, 1.0)])
+def test_axis_at_finite_float_limits_is_normalized(magnitude):
+    direction = np.array([1.0, -1.0, 1.0])
+    with np.errstate(over="raise", invalid="raise", divide="raise"):
+        actual = _normalized_source_axes(_cfg({2: 1.0}, {2: direction * magnitude}))[2]
+    np.testing.assert_array_equal(actual, direction / np.sqrt(3.0))
+
+
+@pytest.mark.parametrize("axis", [(1, 0, 0), (0, -1, 0), (0, 0, 1)])
+def test_unit_axes_are_unchanged(axis):
+    np.testing.assert_array_equal(
+        _normalized_source_axes(_cfg({2: 1.0}, {2: axis}))[2], axis
+    )
+
+
 # 5 -----------------------------------------------------------------------
-@pytest.mark.parametrize("bad", [(0, 0, 0), (0, 0, float("nan"))])
+@pytest.mark.parametrize("bad", [
+    (0, 0, 0), (-0.0, 0, -0.0), (0, 0, float("nan")),
+    (0, 0, float("inf")), (0, 0, -float("inf")),
+])
 def test_degenerate_axis_raises_explicit(bad):
     with pytest.raises(ValueError, match="tag 2"):
         _cfg({2: 1.0}, {2: bad})
@@ -130,8 +170,6 @@ def test_config_validation():
         _cfg({2: 1.0}, {2: (0, 1)})
     with pytest.raises(ValueError, match="tag 2"):
         _cfg({2: 1.0}, {2: (0, 0, float("inf"))})
-    with pytest.raises(ValueError, match="tag 2"):
-        _cfg({2: 1.0}, {2: (0, 0, 1e-13)})
     # AxialProfile on one tag makes source_axes legal without source_motion.
     cfg = SolveConfig(
         velocity_sources={2: 1.0},
@@ -162,6 +200,16 @@ def test_symmetry_subspace(plane, bad, good):
     with pytest.raises(ValueError, match="symmetry subspace"):
         _cfg({2: 1.0}, {2: bad}, native_symmetry_plane=plane)
     _cfg({2: 1.0}, {2: good}, native_symmetry_plane=plane)
+
+
+@pytest.mark.parametrize("magnitude", [1e200, 1e-200])
+def test_extreme_axis_scale_does_not_bypass_symmetry(magnitude):
+    with pytest.raises(ValueError, match="symmetry subspace"):
+        _cfg({2: 1.0}, {2: (magnitude, 0, magnitude)}, native_symmetry_plane="yz")
+    actual = _normalized_source_axes(
+        _cfg({2: 1.0}, {2: (0, 0, magnitude)}, native_symmetry_plane="yz")
+    )[2]
+    np.testing.assert_array_equal(actual, Z)
 
 
 def test_symmetry_check_also_in_builder():
@@ -237,6 +285,23 @@ def test_polarity_flip_negates_the_field():
         down.surface_pressure_complex, -up.surface_pressure_complex, **_TOL
     )
     assert np.max(np.abs(up.pressure_complex)) > 0
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("magnitude", [1e200, np.nextafter(0.0, 1.0)])
+def test_extreme_axis_scale_matches_unit_axis_field(magnitude):
+    _require_native()
+    from test_multi_source_parity import _two_cap_sphere_mesh
+
+    mesh = _two_cap_sphere_mesh()
+    kw = {"velocity_sources": {2: 1.0}, "source_motion": "axial"}
+    unit = _solve(mesh, source_axes={2: (0, 0, 1)}, **kw)
+    scaled = _solve(mesh, source_axes={2: (0, 0, magnitude)}, **kw)
+    np.testing.assert_allclose(scaled.pressure_complex, unit.pressure_complex, **_TOL)
+    np.testing.assert_allclose(
+        scaled.surface_pressure_complex, unit.surface_pressure_complex, **_TOL
+    )
+    assert np.max(np.abs(scaled.pressure_complex)) > 0
 
 
 @pytest.mark.slow
