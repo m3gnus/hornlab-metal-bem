@@ -415,3 +415,8 @@ session = backend.create_session(solve_request)
 for result in session.solve_stream():
     ...
 ```
+
+## BEAT compiled inputs (opt-in)
+
+The additive `solve_compiled` API accepts a guarded exterior subset of the official
+BEAT input contract. Legacy APIs remain unchanged. See [input compatibility](docs/BEAT-INPUT-COMPATIBILITY.md) for supported physics, installation and result axes.

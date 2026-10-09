@@ -304,3 +304,9 @@ def solve_multi_source(
 
     should_route_native_metal(config)
     return run_sweep_native_metal_multi_source(loaded, freqs, frame, config, sources)
+
+
+# Opt-in BEAT compatibility; does not import beat_engine until invoked.
+from .compiled import CompiledResult, compiled_capabilities, solve_compiled
+
+__all__ += ["CompiledResult", "compiled_capabilities", "solve_compiled"]

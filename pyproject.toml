@@ -18,7 +18,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+# Optional BEAT syntax validator; legacy installs/API never require Julia or BEAT.
+beat-contract = ["beat-engine @ git+https://github.com/m3gnus/BEAT_Engine.git@d7ed50d3da87277bef44419ec9e7401e7d6b1288"]
+dev = ["pytest", "hornlab-metal-bem[beat-contract]"]
 
 [tool.pytest.ini_options]
 markers = [
