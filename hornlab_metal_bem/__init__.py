@@ -307,6 +307,26 @@ def solve_multi_source(
 
 
 # Opt-in BEAT compatibility; does not import beat_engine until invoked.
-from .compiled import CompiledResult, compiled_capabilities, solve_compiled
+from .compiled import (
+    CompiledQuantity,
+    CompiledResult,
+    compiled_capabilities,
+    solve_compiled,
+)
+from .beat_worker import (
+    MetalEngineWorker,
+    result_records,
+    solve_events,
+    worker_announcement,
+)
 
-__all__ += ["CompiledResult", "compiled_capabilities", "solve_compiled"]
+__all__ += [
+    "CompiledQuantity",
+    "CompiledResult",
+    "compiled_capabilities",
+    "solve_compiled",
+    "MetalEngineWorker",
+    "result_records",
+    "solve_events",
+    "worker_announcement",
+]

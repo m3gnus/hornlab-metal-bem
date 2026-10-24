@@ -69,7 +69,9 @@ def test_compiled_matches_direct_legacy_call(tmp_path, motion):
             metal_native_assembly_mode="corrected",
             mesh_merge_tol=0.0,
         )
-        budget = 1e-6
+        # Several ports share one factorization (solve_multi_source), which
+        # matches separate solves to the multi-source parity budget.
+        budget = 2e-4
     else:
         common.update(
             precision="double",

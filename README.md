@@ -418,5 +418,11 @@ for result in session.solve_stream():
 
 ## BEAT compiled inputs (opt-in)
 
-The additive `solve_compiled` API accepts a guarded exterior subset of the official
-BEAT input contract. Legacy APIs remain unchanged. See [input compatibility](docs/BEAT-INPUT-COMPATIBILITY.md) for supported physics, installation and result axes.
+The additive `solve_compiled` API accepts BEAT's exterior request contract
+(compiled-system v1-v3): ideal velocity sources, exterior electrodynamic
+transducers, off/x/xy/ground images and BEAT's exterior output quantities.
+`MetalEngineWorker` speaks BEAT worker protocol v1 and returns BEAT
+`system_result` v2 records, so a client of BEAT's `EngineWorker` can swap in
+this solver for exterior jobs. Legacy APIs remain unchanged. See
+[input compatibility](docs/BEAT-INPUT-COMPATIBILITY.md) for supported physics,
+installation and result format.

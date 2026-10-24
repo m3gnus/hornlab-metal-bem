@@ -2,6 +2,7 @@
 
 import base64
 import copy
+import dataclasses
 import importlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +28,18 @@ def native_mesh_loading_is_not_needed_for_translation_tests(monkeypatch):
         "load_mesh",
         lambda path, **kwargs: SimpleNamespace(staged_path=path, mesh_kwargs=kwargs),
     )
+
+    def multi_source(loaded, sources, config, freqs):
+        # The shared-factorization path returns what separate solves would;
+        # replay each drive through the (mocked) single-source API.
+        return [
+            api.solve_frequencies(
+                loaded, freqs, dataclasses.replace(config, velocity_sources=source)
+            )
+            for source in sources
+        ]
+
+    monkeypatch.setattr(api, "solve_multi_source", multi_source)
 
 
 def packed(a, dtype):
@@ -224,8 +237,8 @@ def test_axes_and_velocity_basis_do_not_depend_on_observation_frame(monkeypatch)
     [
         lambda w: w.update(schema_version=True),
         lambda w: w["compiled_system"].update(contract_version=99),
-        lambda w: w["solver_options"].update(symmetry="ground"),
-        lambda w: w["solver_options"].update(phasor_convention="exp(+i omega t)"),
+        lambda w: w["solver_options"].update(symmetry="y"),
+        lambda w: w["solver_options"].update(ground_plane_min_clearance_m=0.1),
         lambda w: w["solver_options"].update(unknown_physics=True),
         lambda w: w["solver_options"].update(regular_quadrature_mode="wavelength"),
         lambda w: w["compiled_system"]["components"][0].update(
@@ -239,11 +252,23 @@ def test_axes_and_velocity_basis_do_not_depend_on_observation_frame(monkeypatch)
             kind="viscous"
         ),
         lambda w: w["compiled_system"]["boundaries"][0].update(kind="impedance"),
-        lambda w: w["outputs"][0].update(quantity="radiation_impedance"),
+        lambda w: w["outputs"][0].update(quantity="fem_nodal_pressure"),
         lambda w: w["outputs"][0]["options"].update(domain="interior"),
         lambda w: w["outputs"][0]["options"].update(extra=True),
         lambda w: w["outputs"][0]["options"].update(points_m=[[0, float("nan"), 1]]),
-        lambda w: w.update(frequencies_hz=[80, 80]),
+        lambda w: w.update(excitation_port_ids=["pb"])
+        or w["outputs"].append(
+            {"id": "z", "quantity": "radiation_impedance", "target_ids": [], "options": {}}
+        ),
+        lambda w: w["outputs"].append(
+            {"id": "v", "quantity": "diaphragm_velocity", "target_ids": [], "options": {}}
+        ),
+        lambda w: w["compiled_system"]["components"][0]["parameters"].update(
+            boundary_motion_weights={"b13": 2.0}
+        ),
+        lambda w: w["compiled_system"]["components"][0]["parameters"].update(
+            boundary_motion_weights={"b11": 0.0}
+        ),
         lambda w: w["solver_options"].update(quadrature_order=True),
         lambda w: w["compiled_system"]["boundaries"][1]["group"].update(tag=11),
         lambda w: w["compiled_system"]["components"][1].update(boundary_ids=["b11"]),
@@ -257,7 +282,7 @@ def test_unsupported_or_malformed_physics_refused_before_mesh_io(monkeypatch, ch
     def no_read(*args):
         pytest.fail("unsupported request reached mesh I/O")
 
-    monkeypatch.setattr(adapter, "_mesh_file", no_read)
+    monkeypatch.setattr(adapter, "_surface", no_read)
     with pytest.raises((ValueError, KeyError)):
         api.solve_compiled(w)
 
@@ -379,8 +404,9 @@ def test_invalid_native_result_rejected(monkeypatch, defect):
 
 def test_capabilities_and_backend_precision_guards():
     c = api.compiled_capabilities()
-    assert c["components"] == ["ideal_velocity_source"]
-    assert c["outputs"] == ["exterior_pressure"]
+    assert c["components"] == ["ideal_velocity_source", "electrodynamic_transducer"]
+    assert c["outputs"][0] == "exterior_pressure"
+    assert c["symmetry"] == ["off", "x", "xy", "ground"]
     w = request()
     w["solver_options"]["bem_backend"] = "cpu" if adapter._IS_METAL else "metal"
     with pytest.raises(ValueError, match="bem_backend"):
@@ -440,13 +466,13 @@ def test_explicit_uniform_normal_v2_and_extreme_axis():
     w["compiled_system"]["contract_version"] = 2
     for c in w["compiled_system"]["components"]:
         c["parameters"] = {"motion_profile": "uniform_normal"}
-    assert adapter._plan(w)["kwargs"]["source_motion"] == "normal"
+    assert adapter._plan(w)["column_kwargs"][0]["source_motion"] == "normal"
     for c in w["compiled_system"]["components"]:
         c["parameters"] = {
             "motion_profile": "rigid_translation",
             "motion_axis": [1e300, 0, 0],
         }
-    assert adapter._plan(w)["kwargs"]["source_axes"][11] == (1.0, 0.0, 0.0)
+    assert adapter._plan(w)["column_kwargs"][0]["source_axes"][11] == (1.0, 0.0, 0.0)
 
 
 @pytest.mark.parametrize(
