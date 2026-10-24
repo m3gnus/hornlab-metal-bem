@@ -8,12 +8,14 @@ from test_compiled import api, request
 
 @pytest.mark.slow
 @pytest.mark.parametrize("motion", ["normal", "rigid_translation"])
-def test_compiled_matches_direct_legacy_call(tmp_path, motion):
+@pytest.mark.parametrize("port_count", [1, 2])
+def test_compiled_matches_direct_legacy_call(tmp_path, motion, port_count):
     if api.__name__ == "hornlab_metal_bem":
         from native_helper_guard import require_fresh_native_helper
 
         require_fresh_native_helper()
     w = request()
+    w["excitation_port_ids"] = w["excitation_port_ids"][:port_count]
     w["compiled_system"]["contract_version"] = 2 if motion == "rigid_translation" else 1
     for c in w["compiled_system"]["components"]:
         c["parameters"] = (
@@ -82,9 +84,8 @@ def test_compiled_matches_direct_legacy_call(tmp_path, motion):
             hyp_adlp_quadrature=4,
         )
         budget = 1e-12
-    for i, drive in enumerate(
-        [{11: 0.0, 12: 0.0, 13: 1.0}, {11: 1.0, 12: 1.0, 13: 0.0}]
-    ):
+    drives = [{11: 0.0, 12: 0.0, 13: 1.0}, {11: 1.0, 12: 1.0, 13: 0.0}]
+    for i, drive in enumerate(drives[:port_count]):
         direct = api.solve_frequencies(
             file,
             [200.0, 80.0, 120.0],
@@ -100,6 +101,10 @@ def test_compiled_matches_direct_legacy_call(tmp_path, motion):
         )
         np.testing.assert_array_equal(compiled.frequencies_hz, direct.frequencies_hz)
         assert compiled.native_results[i].solver_log
+        if api.__name__ == "hornlab_metal_bem":
+            runtime = compiled.native_results[i].native_runtime
+            assert runtime["helper"]["sha256"]
+            assert compiled.diagnostics["engine_provenance"]["runtime"]["helper"] == runtime["helper"]
 
 
 @pytest.mark.slow

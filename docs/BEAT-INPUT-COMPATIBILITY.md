@@ -113,7 +113,9 @@ the adapter sets `native_symmetry_complete_images` so the native validator
 accepts both. Vertices within `max(1e-9, 1e-6 * model size)` of an image plane
 are snapped onto it and the mesh must lie in the positive fundamental domain.
 An open edge is accepted only when both ends lie on an active image plane, and
-no face may lie on one. Motion axes must lie in every active symmetry plane.
+no face may lie on one. Motion axes must lie in every active symmetry plane,
+using BEAT's `1e-8` tolerance on normalized components. The native config owns
+this validation; native callers keep the default `1e-9` tolerance.
 `ground` requires the whole radiator at Y >= 0, refuses faces flat on Y=0 and
 honours `ground_plane_min_clearance_m`. Images other than these are refused.
 
@@ -156,6 +158,22 @@ point); `quantities` holds every output as a `CompiledQuantity` (`id`,
 `native_results` holds one native `SolveResult` per motion-basis column
 (`motion_basis_component_ids`), always in exp(-i omega t).
 
+Both direct results and worker records preserve
+`diagnostics.engine_provenance` with `schema_version: 1`, following the
+[BEAT Run Provenance contract](https://github.com/JWSound/BEAT_Engine/blob/main/docs/BEAT%20Run%20Provenance.md).
+This subset records the implementation and package version, Python/NumPy and
+machine/kernel identity, the executed native helper's content hash (or Swift
+script and interpreter hashes), submitted solver options, effective native
+numerical settings, and input mesh hashes sampled at solve entry. Packed
+meshes hash their received JSON payload; file meshes hash the original file
+bytes. Mesh transforms are retained alongside these hashes. Each frequency
+record receives an independent copy.
+
+Package version supplies release identity; Git revision/dirty status and the
+helper's device identity remain null. Source-tree fingerprints, dependency
+environment/library hashes and thread counts are not collected in this
+subset. Local paths are omitted. Inputs must remain unchanged during a solve.
+
 ### Worker events
 
 `MetalEngineWorker.worker_info` is a BEAT `ready` announcement that passes
@@ -183,8 +201,10 @@ blocked reading; it cancels the job and returns only after the job has
 stopped, after which the submission publishes nothing. The native helper
 notices cancellation at its next frequency checkpoint and is then killed, so
 `close()` can wait up to one frequency's solve. `terminate()` closes the
-active submission. One job runs at a time; `submit` waits for the previous one
-to finish or be closed. Drain or close every submission.
+active submission. Concurrent closers all wait for shutdown. One job runs at a
+time; `submit` waits for the previous one to finish or be closed, and startup
+waits until termination has finished clearing the announcement. Drain or close
+every submission.
 
 Differences from BEAT's worker: the job runs in-process; all results are
 emitted after the whole sweep (a cancelled job reports `solved_count: 0`); the

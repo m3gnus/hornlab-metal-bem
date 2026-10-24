@@ -30,6 +30,7 @@ from .compiled import (
     NEGATIVE_TIME,
     POSITIVE_TIME,
     CompiledResult,
+    _package_version,
     solve_compiled,
 )
 
@@ -43,15 +44,6 @@ _FLOAT64_QUANTITIES = {
     "diaphragm_velocity",
     "voice_coil_current",
 }
-
-
-def _package_version() -> str:
-    try:
-        from importlib.metadata import version
-
-        return version("hornlab-metal-bem")
-    except Exception:  # noqa: BLE001  # pragma: no cover - checkout without metadata
-        return "0+unknown"
 
 
 def _metal_availability() -> dict[str, Any]:
@@ -268,11 +260,12 @@ class MetalSubmission(Iterator[dict[str, Any]]):
 
     def close(self) -> None:
         with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-        self._cancel.set()
-        self._events.put(_DONE)
+            if not self._closed:
+                self._closed = True  # cancellation requested, not shutdown finished
+                self._cancel.set()
+                self._events.put(_DONE)
+        # Every external closer must wait, including a concurrent/repeated
+        # close while another caller is already joining this thread.
         if self._thread.ident is not None and threading.current_thread() is not self._thread:
             self._thread.join()
 
@@ -300,19 +293,25 @@ class MetalEngineWorker:
         self._info: dict[str, Any] | None = None
         self._available = threading.Condition()
         self._active: MetalSubmission | None = None
+        self._terminating = False
 
     @property
     def worker_info(self) -> dict[str, Any] | None:
         """A copy of the ready announcement, if started."""
-        return copy.deepcopy(self._info)
+        with self._available:
+            return copy.deepcopy(self._info)
 
     def ensure_started(
         self, *, status_callback: Callable[[str], None] | None = None
     ) -> None:
-        if self._info is None:
-            self._info = worker_announcement(self._availability)
-            if status_callback is not None:
-                status_callback("hornlab-metal-bem worker ready")
+        with self._available:
+            while self._terminating:
+                self._available.wait()
+            started = self._info is None
+            if started:
+                self._info = worker_announcement(self._availability)
+        if started and status_callback is not None:
+            status_callback("hornlab-metal-bem worker ready")
 
     def submit(
         self,
@@ -321,7 +320,6 @@ class MetalEngineWorker:
         status_callback: Callable[[str], None] | None = None,
         operation: str = "solve",
     ) -> MetalSubmission:
-        self.ensure_started()
         base = self.base_dir if self.base_dir is not None else Path.cwd()
 
         def run(cancel_cb):
@@ -348,10 +346,12 @@ class MetalEngineWorker:
 
         submission = MetalSubmission(self, run, status_callback)
         with self._available:
-            while self._active is not None:
+            while self._active is not None or self._terminating:
                 self._available.wait()
+            self.ensure_started()
             self._active = submission
-        submission._start()
+            # Publish and start atomically with respect to terminate().
+            submission._start()
         return submission
 
     def _release(self, submission: MetalSubmission) -> None:
@@ -362,7 +362,15 @@ class MetalEngineWorker:
 
     def terminate(self) -> None:
         with self._available:
+            while self._terminating:
+                self._available.wait()
+            self._terminating = True
             active = self._active
-        if active is not None:
-            active.close()
-        self._info = None
+        try:
+            if active is not None:
+                active.close()
+        finally:
+            with self._available:
+                self._info = None
+                self._terminating = False
+                self._available.notify_all()

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import logging
 import os
@@ -91,6 +92,36 @@ class MetalNativeSessionInfo:
     manifest_path: Path
     geometry_dir: Path
     runtime_status: MetalNativeRuntimeStatus
+
+
+def _file_sha256(path: str | Path | None) -> str | None:
+    """Content identity, or null when a runtime artifact is unavailable."""
+    if path is None:
+        return None
+    try:
+        with Path(path).open("rb") as source:
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _native_runtime_identity(status: MetalNativeRuntimeStatus) -> dict[str, Any]:
+    """Identify the selected helper at solve entry without archiving local paths."""
+    helper = status.helper_executable_path
+    return {
+        "helper": {
+            "name": Path(helper).name if helper is not None else status.native_entrypoint.name,
+            "source": status.helper_source if helper is not None else "swift-script",
+            "sha256": _file_sha256(helper if helper is not None else status.native_entrypoint),
+        },
+        "swift": None if helper is not None else {
+            "name": Path(status.swift_path).name if status.swift_path else None,
+            "sha256": _file_sha256(status.swift_path),
+        },
+    }
 
 
 def discover_native_runtime(

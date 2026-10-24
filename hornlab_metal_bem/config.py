@@ -352,6 +352,9 @@ class SolveConfig:
     # n_hat . axis with no sign vote, no symmetry projection and no dependence
     # on the observation frame. See _normalized_source_axes.
     source_axes: dict[int, tuple[float, float, float]] | None = None
+    # Tolerance on normalized symmetry-normal axis components. Native callers
+    # keep 1e-9; contract adapters may explicitly select their contract's limit.
+    source_axis_symmetry_tolerance: float = field(default=1e-9, kw_only=True)
     velocity_sources: dict[int, float] = field(
         default_factory=lambda: {2: 1.0}
     )
@@ -600,6 +603,11 @@ class SolveConfig:
             for tag, profile in self.source_velocity_profiles.items():
                 _validate_boundary_tag(tag, "source_velocity_profiles")
                 _validate_source_profile(profile)
+        if not (
+            math.isfinite(self.source_axis_symmetry_tolerance)
+            and self.source_axis_symmetry_tolerance >= 0
+        ):
+            raise ValueError("source_axis_symmetry_tolerance must be finite and non-negative")
         _normalized_source_axes(self)
         _validated_impedance_sources(self.impedance_sources)
         if (
@@ -725,6 +733,17 @@ _SYMMETRY_PLANE_NORMAL_AXES = {
 }
 
 
+def _validate_source_axis_symmetry(
+    unit, plane, *, tolerance: float = 1e-9, label: str = "source axis"
+) -> None:
+    """Validate a unit motion axis against the active native image planes."""
+    for component in _SYMMETRY_PLANE_NORMAL_AXES.get(str(plane).strip().lower(), ()):
+        if abs(unit[component]) > tolerance:
+            raise ValueError(
+                f"{label} is not in the symmetry subspace; solve the full model"
+            )
+
+
 def _effective_axial_tags(config: SolveConfig) -> set[int]:
     """Tags whose effective source profile is axial (profile or source_motion)."""
     profile_map = {
@@ -784,16 +803,11 @@ def _normalized_source_axes(config: SolveConfig) -> dict[int, "np.ndarray"] | No
         # underflow solely because the caller scaled a non-zero axis.
         scaled = vec / scale
         unit = scaled / float(np.linalg.norm(scaled))
-        plane = config.native_symmetry_plane
-        if plane is not None:
-            for component in _SYMMETRY_PLANE_NORMAL_AXES.get(
-                str(plane).strip().lower(), ()
-            ):
-                if abs(unit[component]) > 1e-9:
-                    raise ValueError(
-                        f"axis of source tag {tag} is not in the symmetry "
-                        "subspace; solve the full model"
-                    )
+        _validate_source_axis_symmetry(
+            unit, config.native_symmetry_plane,
+            tolerance=config.source_axis_symmetry_tolerance,
+            label=f"axis of source tag {tag}",
+        )
         axes[tag] = unit
     missing = sorted(axial_tags - set(axes))
     if missing:

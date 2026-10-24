@@ -17,7 +17,11 @@ and currents are reduced from those columns on the host in float64.
 from __future__ import annotations
 
 import base64
+import copy
+import hashlib
+import json
 import math
+import platform
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -27,7 +31,10 @@ from typing import Any
 
 import numpy as np
 
-from .config import AxialProfile, ObservationConfig, SolveConfig, VelocityMode
+from .config import (
+    AxialProfile, ObservationConfig, SolveConfig, VelocityMode,
+    _validate_source_axis_symmetry,
+)
 from .observation import ObservationFrame
 
 _IS_METAL = __package__ == "hornlab_metal_bem"
@@ -35,6 +42,7 @@ _IS_METAL = __package__ == "hornlab_metal_bem"
 NEGATIVE_TIME = "exp(-i omega t)"
 POSITIVE_TIME = "exp(+i omega t)"
 DEFAULT_REFERENCE_VOLTAGE_V = 2.83
+_BEAT_AXIS_SYMMETRY_TOLERANCE = 1e-8
 
 # BEAT image modes -> native keyword, image-plane coordinate axes, and the
 # number of physical radiator copies (ground images are not real radiators).
@@ -152,6 +160,80 @@ def compiled_capabilities() -> dict[str, Any]:
     }
 
 
+def _package_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("hornlab-metal-bem")
+    except Exception:  # noqa: BLE001 - source tree without distribution metadata
+        return "0+unknown"
+
+
+def _mesh_provenance(spec: dict, base_dir: Path) -> dict:
+    from .metal.native import _file_sha256
+
+    if "mesh_data" in spec:
+        # Hash the received payload, before scaling/translation/tag remapping.
+        payload = json.dumps(spec["mesh_data"], separators=(",", ":"), ensure_ascii=False)
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        source = "memory"
+    else:
+        path = (base_dir / spec["file"]).resolve()
+        if not path.is_relative_to(base_dir):
+            _refuse("mesh file must remain inside base_dir")
+        digest = _file_sha256(path)
+        source = "file"
+    return {
+        "id": spec["id"], "source": source, "sha256": digest,
+        # Local filenames are deliberately omitted from archived identity.
+        "file": None,
+        "scale_to_m": spec["scale_to_m"],
+        "translation_m": copy.deepcopy(spec["translation_m"]),
+    }
+
+
+def _run_provenance(request, meshes, results, config) -> dict:
+    """BEAT Run Provenance v1, with Python/native-helper runtime identity.
+
+    Package version supplies release identity; uncollected Git/device metadata
+    stays null. Runtime identity comes from the executed sweep, never a fresh
+    discovery that could identify a different helper after the solve.
+    """
+    runtime = {
+        "python_version": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+        "numpy_version": np.__version__,
+        "machine": platform.machine(), "kernel": platform.system(),
+        "helper": None,
+        **copy.deepcopy(getattr(results[0], "native_runtime", {})),
+    }
+    effective = {
+        key: getattr(config, key)
+        for key in (
+            "formulation", "velocity_mode", "air_density", "speed_of_sound",
+            "native_symmetry_plane", "ground_plane", "ground_plane_min_clearance_m",
+            "source_axis_symmetry_tolerance", "metal_native_assembly_mode",
+            "dense_solve_dtype", "dense_solve_implementation",
+        )
+    }
+    return {
+        "schema_version": 1,
+        "engine": {
+            "name": "hornlab-metal-bem", "version": _package_version(),
+            "repository_revision": None, "repository_dirty": None,
+        },
+        "runtime": runtime,
+        "execution": {
+            "backend": "metal", "precision": config.dense_solve_dtype,
+            "device": None,
+            "device_query_error": "Native helper does not report device identity",
+            "solver_options": copy.deepcopy(request["solver_options"]),
+            "native_options": effective,
+        },
+        "meshes": meshes,
+    }
+
+
 def _refuse(message: str) -> None:
     raise ValueError(f"Legacy compiled BEAT adapter: {message}")
 
@@ -211,10 +293,10 @@ def _axis(value: Any) -> tuple[float, float, float]:
 
 
 def _require_in_planes(axis, symmetry: str, label: str) -> None:
-    if symmetry in ("x", "xy") and any(
-        abs(axis[i]) > 1e-8 for i in _IMAGE_AXES[symmetry]
-    ):
-        _refuse(f"{label} motion_axis must lie in every active symmetry plane")
+    _validate_source_axis_symmetry(
+        axis, _SYMMETRY_KWARGS[symmetry].get("native_symmetry_plane"),
+        tolerance=_BEAT_AXIS_SYMMETRY_TOLERANCE, label=f"{label} motion_axis",
+    )
 
 
 def _boundary_map(raw: Any, boundary_ids: list[str], label: str) -> dict:
@@ -626,6 +708,7 @@ def _plan(request: dict) -> dict:
     if _IS_METAL:
         kwargs.update(
             speed_of_sound=region["sound_speed_m_per_s"],
+            source_axis_symmetry_tolerance=_BEAT_AXIS_SYMMETRY_TOLERANCE,
             dense_solve_dtype="float32",
             metal_native_assembly_mode="corrected",
             mesh_merge_tol=0.0,
@@ -970,7 +1053,7 @@ def solve_compiled(
     before submission and after each native frequency; no partial basis is
     returned on cancellation. Unsupported physics fails before mesh I/O.
     """
-    from . import load_mesh, solve_frequencies, solve_multi_source
+    from . import load_mesh, solve_multi_source
 
     plan = _plan(request)
     base = Path(base_dir).resolve()
@@ -988,6 +1071,7 @@ def solve_compiled(
 
     check_cancel()
     started = time.perf_counter()
+    meshes = [_mesh_provenance(spec, base) for spec in plan["meshes"]]
     ids = tuple(plan["port_ids"])
     basis = plan["basis"]
     freqs = plan["unique_frequencies"]
@@ -1022,17 +1106,14 @@ def solve_compiled(
             )
             for column_kwargs in plan["column_kwargs"]
         ]
-        if len(configs) == 1:
-            results = [solve_frequencies(loaded, freqs.copy(), configs[0])]
-        else:
-            # One assembly and factorization per frequency serves every
-            # motion-basis column; the configs differ only in their drive.
-            results = solve_multi_source(
-                loaded,
-                [c.velocity_sources for c in configs],
-                configs[0],
-                freqs.copy(),
-            )
+        # One assembly and factorization per frequency serves every basis
+        # column. The native multi-source API preserves its one-source path.
+        results = solve_multi_source(
+            loaded,
+            [c.velocity_sources for c in configs],
+            configs[0],
+            freqs.copy(),
+        )
         check_cancel()
         if len(results) != len(configs):
             raise RuntimeError("Legacy solver returned the wrong number of source results")
@@ -1138,6 +1219,7 @@ def solve_compiled(
         "motion_basis_component_ids": [col["component_id"] for col in basis],
         "factorization_count": 1,
         "wall_time_s": time.perf_counter() - started,
+        "engine_provenance": _run_provenance(request, meshes, results, configs[0]),
     }
     if plan["transducer_count"]:
         diagnostics["transducer_reference_voltage_v"] = plan["voltage"]

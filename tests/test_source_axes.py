@@ -60,6 +60,27 @@ def _cfg(sources, axes=None, **kw):
     )
 
 
+@pytest.mark.parametrize("plane,axis", [
+    ("yz", (5e-9, 0, 1)), ("yz+xz", (0, 5e-9, 1)),
+])
+def test_symmetry_axis_contract_tolerance_preserves_native_default(plane, axis):
+    with pytest.raises(ValueError, match="symmetry subspace"):
+        _cfg({2: 1.0}, {2: axis}, native_symmetry_plane=plane)
+    config = _cfg(
+        {2: 1.0}, {2: axis}, native_symmetry_plane=plane,
+        source_axis_symmetry_tolerance=1e-8,
+    )
+    np.testing.assert_allclose(_normalized_source_axes(config)[2], axis)
+    with pytest.raises(ValueError, match="symmetry subspace"):
+        replace(config, source_axes={2: (2e-8, 0, 1)})
+
+
+@pytest.mark.parametrize("tolerance", [-1, float("nan"), float("inf")])
+def test_invalid_symmetry_axis_tolerance(tolerance):
+    with pytest.raises(ValueError, match="source_axis_symmetry_tolerance"):
+        SolveConfig(source_axis_symmetry_tolerance=tolerance)
+
+
 # 1 -----------------------------------------------------------------------
 def test_flat_disc_sign_follows_axis_and_legacy_votes():
     normals = [Z, Z]

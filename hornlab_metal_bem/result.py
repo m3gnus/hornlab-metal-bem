@@ -107,6 +107,9 @@ class SolveResult:
     radiated_power_sphere_w: NDArray[np.float64] | None = None
     radiated_power_sphere_coverage_sr: float | None = None
 
+    # Identity sampled from the runtime actually selected by the native sweep.
+    native_runtime: dict[str, Any] = field(default_factory=dict)
+
     @property
     def spl_norm_db(self) -> NDArray[np.float64]:
         """Alias for normalized directivity in dB."""

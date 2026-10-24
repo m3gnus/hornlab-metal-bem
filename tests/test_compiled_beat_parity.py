@@ -9,6 +9,8 @@ and wire encoding are then checked against closed forms.
 
 import base64
 import copy
+import hashlib
+import json
 
 import numpy as np
 import pytest
@@ -352,6 +354,112 @@ def test_transducer_only_radiation_impedance_has_an_empty_radiator_axis(calls):
 def test_pressure_only_requests_skip_surface_traces(calls):
     api.solve_compiled(request())
     assert all(not c.return_surface_pressure for c in calls)
+
+
+@pytest.mark.parametrize("kind", ["ideal", "transducer"])
+@pytest.mark.parametrize("symmetry,axis,orbit", [
+    ("x", [5e-9, 0, 1], 2), ("xy", [0, 5e-9, 1], 4),
+])
+def test_beat_axis_tolerance_survives_native_config(calls, kind, symmetry, axis, orbit):
+    w = transducer_request() if kind == "transducer" else request()
+    w["compiled_system"]["contract_version"] = 3
+    parameters = w["compiled_system"]["components"][0]["parameters"]
+    parameters.update(motion_profile="rigid_translation", motion_axis=axis)
+    if kind == "transducer":
+        parameters["physical_driver_orbit_count"] = orbit
+    w["solver_options"]["symmetry"] = symmetry
+    result = api.solve_compiled(w)
+    assert result.native_results
+    assert all(c.source_axis_symmetry_tolerance == 1e-8 for c in calls)
+    # Both planning and subsequent profile evaluation use config.py's owner.
+    from hornlab_metal_bem.config import _normalized_source_axes
+
+    assert all(_normalized_source_axes(c) for c in calls)
+    parameters["motion_axis"] = [2e-8, 0, 1]
+    with pytest.raises(ValueError, match="symmetry subspace"):
+        adapter._plan(w)
+
+
+def test_single_column_uses_multi_source_without_changing_response(calls, monkeypatch):
+    w = request()
+    w["excitation_port_ids"] = ["pa"]
+    multi_source = api.solve_multi_source
+    sources_seen = []
+
+    def solve(loaded, sources, config, freqs):
+        sources_seen.append(sources)
+        return multi_source(loaded, sources, config, freqs)
+
+    monkeypatch.setattr(api, "solve_multi_source", solve)
+    result = api.solve_compiled(w)
+    assert len(sources_seen) == 1 and len(sources_seen[0]) == 1
+    assert result.motion_basis_component_ids == ("a",)
+    np.testing.assert_allclose(result.pressure["far"], BETA * 2)
+
+
+@pytest.mark.parametrize("file_backed", [False, True])
+def test_provenance_archives_identity_options_and_mesh(calls, monkeypatch, tmp_path, file_backed):
+    w = request()
+    spec = w["compiled_system"]["meshes"][0]
+    if file_backed:
+        import meshio
+
+        payload = spec.pop("mesh_data")
+        meshio.write(
+            tmp_path / "input.msh",
+            meshio.Mesh(
+                adapter._packed_array(payload["points"]),
+                [("triangle", adapter._packed_array(payload["cells"][0]["connectivity"]))],
+                cell_data={
+                    name: [adapter._packed_array(payload["cells"][0]["physical_tags"])]
+                    for name in ("gmsh:physical", "gmsh:geometrical")
+                },
+            ), file_format="gmsh22", binary=False,
+        )
+        spec["file"] = "input.msh"
+        expected_hash = hashlib.sha256((tmp_path / "input.msh").read_bytes()).hexdigest()
+    else:
+        expected_hash = hashlib.sha256(json.dumps(
+            spec["mesh_data"], separators=(",", ":"), ensure_ascii=False,
+        ).encode()).hexdigest()
+
+    runtime = {"helper": {"name": "solver", "sha256": "a" * 64, "source": "test"}}
+    solve = api.solve_frequencies
+
+    def solve_with_runtime(*args):
+        result = solve(*args)
+        result.native_runtime = runtime
+        return result
+
+    monkeypatch.setattr(api, "solve_frequencies", solve_with_runtime)
+    result = api.solve_compiled(w, base_dir=tmp_path)
+    records = beat_worker.result_records(result)
+    provenance = result.diagnostics["engine_provenance"]
+    assert provenance["schema_version"] == 1
+    assert provenance["engine"]["name"] == "hornlab-metal-bem"
+    assert provenance["engine"]["version"] == beat_worker.worker_announcement({})["implementation"]["version"]
+    assert provenance["runtime"]["helper"] == runtime["helper"]
+    assert provenance["runtime"]["python_version"]
+    execution = provenance["execution"]
+    assert execution["solver_options"] == w["solver_options"]
+    assert execution["native_options"]["metal_native_assembly_mode"] == "corrected"
+    assert execution["native_options"]["source_axis_symmetry_tolerance"] == 1e-8
+    assert execution["device"] is None and execution["device_query_error"]
+    assert provenance["meshes"] == [{
+        "id": "mesh", "source": "file" if file_backed else "memory",
+        "file": None, "sha256": expected_hash, "scale_to_m": 0.001,
+        "translation_m": [0.2, 0.3, 0.4],
+    }]
+    for record in records:
+        contract_worker.validate_worker_event({"type": "result", "result": record})
+        assert record["diagnostics"]["engine_provenance"] == provenance
+        json.dumps(record)  # archived records must remain JSON serializable
+    w["solver_options"]["precision"] = "changed"
+    runtime["helper"]["name"] = "changed"
+    assert execution["solver_options"]["precision"] == "float32"
+    assert provenance["runtime"]["helper"]["name"] == "solver"
+    records[0]["diagnostics"]["engine_provenance"]["engine"]["version"] = "changed"
+    assert records[1]["diagnostics"]["engine_provenance"] == provenance
 
 
 def test_semi_inductance_and_sealed_chamber_follow_beat_formulas():

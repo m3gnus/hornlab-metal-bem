@@ -1027,7 +1027,7 @@ def run_sweep_native_metal(
 
     try:
         from .metal.geometry import _build_metal_geometry_buffers_with_max_edge
-        from .metal.native import MetalNativeStandardSession
+        from .metal.native import MetalNativeStandardSession, _native_runtime_identity
     except Exception as exc:  # pragma: no cover - import/runtime specific.
         raise AssemblyBackendUnavailable(
             f"Native Metal helper could not be imported: {exc}"
@@ -1038,6 +1038,7 @@ def run_sweep_native_metal(
         reason = "; ".join(runtime.unavailable_reasons)
         raise AssemblyBackendUnavailable(reason)
 
+    runtime_identity = _native_runtime_identity(runtime)
     t_total = time.time()
     obs_points, angles_deg = build_observation_points(frame, config.observation)
     p1_space, dp0_space = make_pure_function_spaces(mesh.grid)
@@ -1382,6 +1383,7 @@ def run_sweep_native_metal(
         surface_pressure_complex=surface_pressure_complex,
         surface_neumann_complex=surface_neumann_complex,
         native_diagnostics=native_diagnostics_rows,
+        native_runtime=runtime_identity,
         sphere_pressure_complex=sphere_pressure_complex,
         sphere_points=sphere_points_arr,
         sphere_theta_deg=sphere_theta_deg,
@@ -1520,7 +1522,7 @@ def run_sweep_native_metal_multi_source(
 
     try:
         from .metal.geometry import _build_metal_geometry_buffers_with_max_edge
-        from .metal.native import MetalNativeStandardSession
+        from .metal.native import MetalNativeStandardSession, _native_runtime_identity
     except Exception as exc:  # pragma: no cover - import/runtime specific.
         raise AssemblyBackendUnavailable(
             f"Native Metal helper could not be imported: {exc}"
@@ -1531,6 +1533,7 @@ def run_sweep_native_metal_multi_source(
         reason = "; ".join(runtime.unavailable_reasons)
         raise AssemblyBackendUnavailable(reason)
 
+    runtime_identity = _native_runtime_identity(runtime)
     t_total = time.time()
     obs_points, angles_deg = build_observation_points(frame, config.observation)
     p1_space, dp0_space = make_pure_function_spaces(mesh.grid)
@@ -1879,6 +1882,7 @@ def run_sweep_native_metal_multi_source(
                 surface_pressure_complex=surface_pressure_complex,
                 surface_neumann_complex=surface_neumann_complex,
                 native_diagnostics=native_diagnostics_rows[source_index],
+                native_runtime=dict(runtime_identity),
                 sphere_pressure_complex=sphere_pressure_complex,
                 sphere_points=sphere_points_arr,
                 sphere_theta_deg=sphere_theta_deg,

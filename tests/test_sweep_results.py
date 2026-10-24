@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -8,6 +10,45 @@ import numpy as np
 from hornlab_metal_bem import sweep
 from hornlab_metal_bem.metal import native
 from hornlab_metal_bem.metal.native import MetalNativeRuntimeStatus
+
+
+def test_native_runtime_identity_hashes_selected_helper_without_local_paths(tmp_path):
+    helper = tmp_path / "custom-helper"
+    helper.write_bytes(b"selected helper")
+    status = replace(
+        native.discover_native_runtime(run_smoke_test=False),
+        helper_executable_path=helper, helper_source="configured",
+    )
+    identity = native._native_runtime_identity(status)
+    assert identity == {
+        "helper": {
+            "name": "custom-helper", "source": "configured",
+            "sha256": hashlib.sha256(b"selected helper").hexdigest(),
+        },
+        "swift": None,
+    }
+    helper.write_bytes(b"replacement helper")
+    assert native._native_runtime_identity(status) != identity
+    helper.unlink()
+    assert native._native_runtime_identity(status)["helper"]["sha256"] is None
+
+
+def test_native_runtime_identity_covers_swift_script_fallback(tmp_path):
+    script = tmp_path / "entry.swift"
+    swift = tmp_path / "swift"
+    script.write_bytes(b"source")
+    swift.write_bytes(b"interpreter")
+    status = replace(
+        native.discover_native_runtime(run_smoke_test=False),
+        helper_executable_path=None, swift_path=str(swift), native_entrypoint=script,
+    )
+    assert native._native_runtime_identity(status) == {
+        "helper": {
+            "name": "entry.swift", "source": "swift-script",
+            "sha256": hashlib.sha256(b"source").hexdigest(),
+        },
+        "swift": {"name": "swift", "sha256": hashlib.sha256(b"interpreter").hexdigest()},
+    }
 
 
 def test_append_sphere_field_points_concatenates_and_counts():
