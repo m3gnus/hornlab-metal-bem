@@ -272,6 +272,7 @@ class MetalNativeStandardSession:
         aperture_tag: int | None = None,
         velocity_source_tags: Any | None = None,
         check_open_edges: bool = True,
+        require_plane_contact: bool = True,
         runtime_status: MetalNativeRuntimeStatus | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> "MetalNativeStandardSession":
@@ -284,7 +285,9 @@ class MetalNativeStandardSession:
         boundary edge of a symmetry-reduced mesh lies on a requested symmetry
         plane. Pass ``False`` for open shells whose rim is a real free edge of
         the full (reduced + mirrored) geometry; see
-        :func:`validate_native_symmetry_plane`.
+        :func:`validate_native_symmetry_plane`. ``require_plane_contact=False``
+        accepts a complete body whose mirror images are further physical
+        copies, so it need not reach the plane.
 
         ``ground_plane`` names a rigid half-space boundary instead. It uses the
         SAME image kernel as ``symmetry_plane`` -- the helper is told about one
@@ -344,6 +347,7 @@ class MetalNativeStandardSession:
             geometry_buffers,
             symmetry_plane,
             check_open_edges=check_open_edges,
+            require_plane_contact=require_plane_contact,
         )
         ground_plane = validate_native_ground_plane(
             geometry_buffers,

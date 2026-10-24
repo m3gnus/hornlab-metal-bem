@@ -213,6 +213,7 @@ def validate_native_symmetry_plane(
     *,
     tolerance: float = 1.0e-7,
     check_open_edges: bool = True,
+    require_plane_contact: bool = True,
 ) -> str | None:
     """Validate the narrow native reduced-domain symmetry contract.
 
@@ -225,7 +226,9 @@ def validate_native_symmetry_plane(
     on a requested symmetry plane: a closed surface reduced by mirror cuts has
     its entire rim on the cut planes, so an off-plane open edge means the mesh
     was cut along an unrequested plane and the mirrored solve would be wrong.
-    Pass ``check_open_edges=False`` only for open shells whose rim is a real
+    ``require_plane_contact=False`` drops only the requirement that the mesh
+    reach each plane, for complete bodies whose images are further physical
+    copies. Pass ``check_open_edges=False`` only for open shells whose rim is a real
     free edge of the full (reduced + mirrored) geometry.
     """
     if symmetry_plane is None:
@@ -254,7 +257,7 @@ def validate_native_symmetry_plane(
                 f"reduced-domain mesh; minimum {name.upper()} is {min_value:.6g}"
             )
         used_values = values[used_vertices]
-        if not np.any(np.abs(used_values) <= tolerance):
+        if require_plane_contact and not np.any(np.abs(used_values) <= tolerance):
             raise MetalGeometryError(
                 f"native_symmetry_plane={plane!r} requires boundary vertices "
                 f"on {name.upper()}=0"

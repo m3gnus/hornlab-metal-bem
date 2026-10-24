@@ -465,6 +465,15 @@ class SolveConfig:
     # mesh topology owns this choice; geometry alone cannot distinguish a
     # legitimate mouth rim from a bad cut.
     native_check_open_edges: bool = True
+    # When False (default), a symmetry-reduced mesh must reach every requested
+    # plane: it is a cut representative whose mirror completes one body. Set
+    # True when the mesh may instead be a complete body (or bodies) whose
+    # mirror images are additional physical copies -- a driver wholly at X>0
+    # whose reflection is a second driver -- so it need not touch the plane.
+    # The positive-domain, cut-face and open-edge checks still apply. Radiated
+    # surface power keeps multiplying by the copy count, which is right for
+    # both readings because every image is a real radiator.
+    native_symmetry_complete_images: bool = False
     metal_native_assembly_mode: MetalNativeAssemblyMode = "corrected"
     # Dense LU precision. "float32" (default) matches the historical Complex32
     # LU. "float64" factors/solves the float32-assembled system in complex128
@@ -624,6 +633,8 @@ class SolveConfig:
             raise ValueError(
                 "native_symmetry_plane must be None, 'yz', 'xz', 'xy', or 'yz+xz'"
             )
+        if not isinstance(self.native_symmetry_complete_images, bool):
+            raise ValueError("native_symmetry_complete_images must be a bool")
         if self.ground_plane is not None:
             if self.ground_plane not in NATIVE_GROUND_PLANES:
                 raise ValueError(

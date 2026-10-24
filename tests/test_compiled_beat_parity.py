@@ -330,3 +330,50 @@ def test_worker_reports_failures_and_cancellation(calls, tmp_path):
     path.write_text(json.dumps(request()))
     assert list(worker.submit(path))[-1]["type"] == "completed"
     assert list(worker.submit(request(), operation="bem_field"))[-1]["type"] == "failed"
+
+
+def test_transducer_only_radiation_impedance_has_an_empty_radiator_axis(calls):
+    w = transducer_request(ports=("pv",))
+    s = w["compiled_system"]
+    s["components"] = s["components"][:1]
+    s["components"][0]["boundary_ids"] = ["b11", "b12", "b13"]
+    s["excitation_ports"] = s["excitation_ports"][:1]
+    w["outputs"].append(
+        {"id": "zself", "quantity": "radiation_impedance", "target_ids": [], "options": {}}
+    )
+    result = api.solve_compiled(w)
+    assert result.quantities["zself"].values.shape == (3, 0)
+    record = beat_worker.result_records(result)[0]
+    item = next(q for q in record["quantities"] if q["id"] == "zself")
+    assert item["values"]["shape"] == [0]
+    assert item["axes"] == ["radiator"]
+
+
+def test_pressure_only_requests_skip_surface_traces(calls):
+    api.solve_compiled(request())
+    assert all(not c.return_surface_pressure for c in calls)
+
+
+def test_semi_inductance_and_sealed_chamber_follow_beat_formulas():
+    w, rho, c = 2 * np.pi * 250.0, 1.21, 343.0
+    semi = {"re_prime_ohm": 5.5, "leb_h": 1e-4, "le_h": 3e-4, "ke_semi_h": 0.02, "rss_ohm": 12.0}
+    lem = {**LEM, "semi_inductance": semi, "sealed_chamber": {"volume_m3": 2e-3, "projected_area_m2": 5e-3}}
+    s = -1j * w  # exp(-i omega t) time derivative
+    expected_ze = semi["re_prime_ohm"] + s * semi["leb_h"] + 1 / (
+        1 / semi["rss_ohm"] + 1 / (s * semi["le_h"]) + 1 / (np.sqrt(s) * semi["ke_semi_h"])
+    )
+    assert adapter._electrical_impedance(lem, s) == pytest.approx(expected_ze, rel=1e-14)
+    stiffness = rho * c**2 * 5e-3**2 / 2e-3
+    expected_zm = LEM["rms_n_s_per_m"] + 1j * (
+        -w * LEM["mmd_kg"] + 1 / (w * LEM["cms_m_per_n"]) + stiffness / w
+    )
+    assert adapter._mechanical_impedance(lem, w, rho, c) == pytest.approx(expected_zm, rel=1e-14)
+    # Disabled sub-models are ignored, as in BEAT.
+    p = transducer_request()["compiled_system"]["components"][0]["parameters"]
+    p["semi_inductance"] = {**semi, "enabled": False}
+    p["lumped_sealed_rear_chamber"] = {"volume_m3": 1e-3, "enabled": True, "projected_area_m2": 1e-3}
+    w2 = transducer_request()
+    w2["compiled_system"]["components"][0]["parameters"] = p
+    lem2 = adapter._plan(w2)["basis"][0]["lem"]
+    assert lem2["semi_inductance"] is None
+    assert lem2["sealed_chamber"] == {"volume_m3": 1e-3, "projected_area_m2": 1e-3}

@@ -482,3 +482,33 @@ def test_validate_native_infinite_baffle_aperture_rejects_geometry_in_front_of_b
 
     with pytest.raises(MetalGeometryError, match="at or behind Z=0"):
         validate_native_infinite_baffle_aperture(moved, 7)
+
+
+def test_symmetry_plane_contact_is_optional_for_complete_images():
+    # A closed tetrahedron wholly at X>0: a complete body whose mirror is a
+    # second physical body, not a cut representative.
+    from hornlab_metal_bem.metal.geometry import validate_native_symmetry_plane
+
+    vertices = np.array(
+        [[0.2, 1.2, 0.2, 0.2], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+    )
+    triangles = np.array([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]]).T
+    buffers = build_metal_geometry_buffers(
+        _mock_grid(vertices, triangles),
+        np.array([2, 2, 2, 2]),
+        SimpleNamespace(local2global=triangles.T, global_dof_count=4),
+        _mock_dp0(4),
+    )
+    with pytest.raises(MetalGeometryError, match="boundary vertices on X=0"):
+        validate_native_symmetry_plane(buffers, "yz")
+    assert validate_native_symmetry_plane(buffers, "yz", require_plane_contact=False) == "yz"
+    shifted = vertices.copy()
+    shifted[0] -= 0.5  # crossing into X<0 is still refused
+    buffers = build_metal_geometry_buffers(
+        _mock_grid(shifted, triangles),
+        np.array([2, 2, 2, 2]),
+        SimpleNamespace(local2global=triangles.T, global_dof_count=4),
+        _mock_dp0(4),
+    )
+    with pytest.raises(MetalGeometryError, match="positive-x"):
+        validate_native_symmetry_plane(buffers, "yz", require_plane_contact=False)

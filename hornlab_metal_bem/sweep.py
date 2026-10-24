@@ -1122,6 +1122,7 @@ def run_sweep_native_metal(
         aperture_tag=config.aperture_tag,
         velocity_source_tags=source_tags,
         check_open_edges=config.native_check_open_edges,
+        require_plane_contact=not config.native_symmetry_complete_images,
         runtime_status=runtime,
         extra_env=_native_env_overrides(config),
     ) as session:
@@ -1718,6 +1719,7 @@ def run_sweep_native_metal_multi_source(
         aperture_tag=config.aperture_tag,
         velocity_source_tags=source_tags,
         check_open_edges=config.native_check_open_edges,
+        require_plane_contact=not config.native_symmetry_complete_images,
         runtime_status=runtime,
         extra_env=_native_env_overrides(config),
     ) as session:

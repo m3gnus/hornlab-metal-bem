@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import queue
 import threading
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
@@ -202,13 +203,90 @@ def solve_events(
     yield {"type": "completed", "solved_count": len(records)}
 
 
+_DONE = object()
+
+
+class MetalSubmission(Iterator[dict[str, Any]]):
+    """One job's event stream, with its own cancellation state.
+
+    The solve runs on a thread owned by the submission, so ``close()`` may be
+    called from any thread, including while another thread is blocked in
+    ``next()``. ``close()`` requests cancellation, which stops the native
+    helper at its next frequency checkpoint, and returns only after the job
+    has stopped: nothing the submission owns is still running, and no further
+    event is published. Repeated and late ``close()`` calls are no-ops and
+    never touch another submission.
+    """
+
+    def __init__(self, worker: MetalEngineWorker, run, status_callback) -> None:
+        self._worker = worker
+        self._run = run
+        self._status_callback = status_callback
+        self._events: queue.Queue = queue.Queue()
+        self._cancel = threading.Event()
+        self._closed = False
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._produce, name="hornlab-metal-bem-solve", daemon=True
+        )
+
+    def _start(self) -> None:
+        self._thread.start()
+
+    def _check_cancel(self) -> None:
+        if self._cancel.is_set():
+            raise InterruptedError("Compiled BEAT submission closed")
+
+    def _produce(self) -> None:
+        try:
+            for event in self._run(self._check_cancel):
+                if self._cancel.is_set():
+                    break
+                self._events.put(event)
+        finally:
+            self._events.put(_DONE)
+            self._worker._release(self)
+
+    @property
+    def running(self) -> bool:
+        """Whether this submission's solve thread is still alive."""
+        return self._thread.is_alive()
+
+    def __iter__(self) -> MetalSubmission:
+        return self
+
+    def __next__(self) -> dict[str, Any]:
+        if self._closed:
+            raise StopIteration
+        event = self._events.get()
+        if event is _DONE or self._closed:
+            self._events.put(_DONE)  # wake any other blocked reader
+            raise StopIteration
+        if event["type"] == "status" and self._status_callback is not None:
+            self._status_callback(event["message"])
+        return event
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._cancel.set()
+        self._events.put(_DONE)
+        if self._thread.ident is not None and threading.current_thread() is not self._thread:
+            self._thread.join()
+
+
 class MetalEngineWorker:
     """In-process stand-in for ``beat_engine.EngineWorker``.
 
     ``submit`` takes a request path (relative mesh files resolve against
     ``base_dir``, the working directory by default, as in BEAT) or an inline
-    request mapping, and returns an iterator of worker events. One submission
-    runs at a time. ``bem_field`` is not offered.
+    request mapping, and returns a :class:`MetalSubmission`. One submission
+    runs at a time: a new ``submit`` waits until the previous job has finished
+    or been closed. Drain or close every submission. ``terminate()`` closes
+    the active submission (waiting for it to stop) and forgets the
+    announcement. ``bem_field`` is not offered.
     """
 
     def __init__(
@@ -220,7 +298,8 @@ class MetalEngineWorker:
         self.base_dir = Path(base_dir) if base_dir is not None else None
         self._availability = availability
         self._info: dict[str, Any] | None = None
-        self._lock = threading.Lock()
+        self._available = threading.Condition()
+        self._active: MetalSubmission | None = None
 
     @property
     def worker_info(self) -> dict[str, Any] | None:
@@ -241,12 +320,11 @@ class MetalEngineWorker:
         *,
         status_callback: Callable[[str], None] | None = None,
         operation: str = "solve",
-    ) -> Iterator[dict[str, Any]]:
+    ) -> MetalSubmission:
         self.ensure_started()
-        return self._events(request_path, status_callback, operation)
+        base = self.base_dir if self.base_dir is not None else Path.cwd()
 
-    def _events(self, request_path, status_callback, operation):
-        with self._lock:
+        def run(cancel_cb):
             if operation != "solve":
                 yield {
                     "type": "failed",
@@ -266,11 +344,25 @@ class MetalEngineWorker:
                         "error": f"cannot read request: {exc}",
                     }
                     return
-            base = self.base_dir if self.base_dir is not None else Path.cwd()
-            for event in solve_events(request, base_dir=base):
-                if event["type"] == "status" and status_callback is not None:
-                    status_callback(event["message"])
-                yield event
+            yield from solve_events(request, base_dir=base, cancel_cb=cancel_cb)
+
+        submission = MetalSubmission(self, run, status_callback)
+        with self._available:
+            while self._active is not None:
+                self._available.wait()
+            self._active = submission
+        submission._start()
+        return submission
+
+    def _release(self, submission: MetalSubmission) -> None:
+        with self._available:
+            if self._active is submission:
+                self._active = None
+                self._available.notify_all()
 
     def terminate(self) -> None:
+        with self._available:
+            active = self._active
+        if active is not None:
+            active.close()
         self._info = None

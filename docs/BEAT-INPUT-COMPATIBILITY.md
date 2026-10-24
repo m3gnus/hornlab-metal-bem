@@ -106,7 +106,11 @@ Neumann data are the basis columns combined with the solved amplitudes.
 | `xy` | `native_symmetry_plane="yz+xz"` (X=0 and Y=0) | 4 |
 | `ground` | `ground_plane="xz"` (rigid Y=0) | 1 (the image is not a radiator) |
 
-For `x`/`xy`, vertices within `max(1e-9, 1e-6 * model size)` of an image plane
+For `x`/`xy`, the representative may be cut by an image plane (a fractional
+driver, `surface_completion_factor > 1`) or be a complete body off the plane
+whose mirrors are further physical drivers (`physical_driver_orbit_count > 1`);
+the adapter sets `native_symmetry_complete_images` so the native validator
+accepts both. Vertices within `max(1e-9, 1e-6 * model size)` of an image plane
 are snapped onto it and the mesh must lie in the positive fundamental domain.
 An open edge is accepted only when both ends lie on an active image plane, and
 no face may lie on one. Motion axes must lie in every active symmetry plane.
@@ -173,6 +177,15 @@ for transducers, `transducer_reference_voltage_v` and the network residual.
 Pressure and boundary traces use `complex64`; the matrix, diaphragm velocity
 and coil current use `complex128`, as BEAT does.
 
+`submit` returns a `MetalSubmission` whose solve runs on its own thread.
+`close()` may be called from any thread, including while another thread is
+blocked reading; it cancels the job and returns only after the job has
+stopped, after which the submission publishes nothing. The native helper
+notices cancellation at its next frequency checkpoint and is then killed, so
+`close()` can wait up to one frequency's solve. `terminate()` closes the
+active submission. One job runs at a time; `submit` waits for the previous one
+to finish or be closed. Drain or close every submission.
+
 Differences from BEAT's worker: the job runs in-process; all results are
 emitted after the whole sweep (a cancelled job reports `solved_count: 0`); the
 `bem_field` operation is not offered; and request or solver errors become
@@ -194,7 +207,13 @@ this package's own kernels. It does not claim numerical equivalence with
 BEAT's Burton-Miller assembly: compare both engines on the qualification set
 before treating them as interchangeable for a design.
 
-Tests cover official-schema refusals, BEAT's negotiation and event validators,
-symmetry and ground accounting, and the driver network against closed-form
-single-driver solutions using a synthetic linear BEM response. The native
-comparison (`tests/test_compiled_native.py`) needs Apple Silicon.
+Portable tests cover official-schema refusals, BEAT's negotiation and event
+validators, submission lifecycle, symmetry and ground accounting, and the
+driver network against closed-form single-driver solutions using a synthetic
+linear BEM response. Native qualification
+(`tests/test_compiled_native_qualification.py`, Apple Silicon) compares an
+oscillating-sphere transducer with the analytic dipole load and field,
+symmetry representatives (cut, whole-driver copies, cut plus copy) with the
+explicitly mirrored full model, a coupled pair with a shorted undriven
+driver, both phasor conventions, and colliding tags across meshes with one
+merged mesh.

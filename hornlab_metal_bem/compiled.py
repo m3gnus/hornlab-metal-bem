@@ -40,8 +40,10 @@ DEFAULT_REFERENCE_VOLTAGE_V = 2.83
 # number of physical radiator copies (ground images are not real radiators).
 _SYMMETRY_KWARGS = {
     "off": {},
-    "x": {"native_symmetry_plane": "yz"},
-    "xy": {"native_symmetry_plane": "yz+xz"},
+    # The adapter runs BEAT's own domain/closure checks, so a representative
+    # may be a cut body or a whole driver whose mirrors are further drivers.
+    "x": {"native_symmetry_plane": "yz", "native_symmetry_complete_images": True},
+    "xy": {"native_symmetry_plane": "yz+xz", "native_symmetry_complete_images": True},
     "ground": {"ground_plane": "xz"},
 }
 _IMAGE_AXES = {"off": (), "x": (0,), "xy": (0, 1), "ground": (1,)}
@@ -876,7 +878,7 @@ def _mechanical_impedance(lem: dict, omega: float, density: float, c: float) -> 
     return z
 
 
-def _network(plan: dict, z: np.ndarray, omega: float) -> tuple[np.ndarray, np.ndarray, float]:
+def _network(plan: dict, z: np.ndarray | None, omega: float) -> tuple[np.ndarray, np.ndarray, float]:
     """Unit-motion amplitudes ``U`` (basis x port) and coil currents.
 
     Transducer rows balance mechanical, radiation and Lorentz forces; voltage
@@ -1060,19 +1062,23 @@ def solve_compiled(
 
     nf, nb, nv = len(freqs), len(basis), len(surface["points"])
     fields = np.stack([r.pressure_complex[:, 0, :] for r in results], axis=1)
-    surface_p = np.zeros((nf, nv, nb), dtype=np.complex128)
+    velocities = np.stack([_face_velocity(surface, col) for col in basis], axis=1)
+    surface_p = z = None
     if plan["kwargs"].get("return_surface_pressure"):
+        # Only loads, boundary pressure or a driver network need the traces.
+        surface_p = np.zeros((nf, nv, nb), dtype=np.complex128)
         for j, r in enumerate(results):
             surface_p[:, surface["used"], j] = r.surface_pressure_complex
-    velocities = np.stack([_face_velocity(surface, col) for col in basis], axis=1)
-    force = _force_matrix(surface, velocities, basis)
-    z = np.einsum("vi,fvj->fij", force, surface_p)
+        force = _force_matrix(surface, velocities, basis)
+        z = np.einsum("vi,fvj->fij", force, surface_p)
     omegas = 2 * np.pi * freqs
     u = np.zeros((nf, nb, len(ids)), dtype=np.complex128)
     current = np.zeros((nf, plan["transducer_count"], len(ids)), dtype=np.complex128)
     residuals = []
     for f, omega in enumerate(omegas):
-        u[f], current[f], residual = _network(plan, z[f], float(omega))
+        u[f], current[f], residual = _network(
+            plan, None if z is None else z[f], float(omega)
+        )
         residuals.append(residual)
 
     def response(basis_values):
@@ -1092,10 +1098,10 @@ def solve_compiled(
             q = 1j * plan["density"] * omegas[:, None, None] * velocities[None]
             values = response(q)
         elif quantity == "radiation_impedance":
-            values = np.stack(
-                [z[:, plan["column_of"][c], plan["column_of"][c]] for c in plan["ideal_components"]],
-                axis=1,
-            )
+            # Ideal self loads only; a transducer-only system has an empty
+            # radiator axis (its loads are in radiation_impedance_matrix).
+            cols = [plan["column_of"][c] for c in plan["ideal_components"]]
+            values = z[:, cols, cols].reshape(nf, len(cols))
         elif quantity == "radiation_impedance_matrix":
             values, metadata = _matrix_quantity(plan, output, z, velocities, surface)
         else:
