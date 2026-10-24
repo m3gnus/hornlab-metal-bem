@@ -1,6 +1,8 @@
 """Unit tests for hornlab_metal_bem.config — pure dataclass tests, no bempp needed."""
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from hornlab_metal_bem.backends import (
@@ -19,6 +21,74 @@ from hornlab_metal_bem.config import (
     TaperProfile,
 )
 from hornlab_metal_bem.sweep import should_route_native_metal
+
+
+def test_solve_config_preserves_main_positional_field_order():
+    # Positional constructor fields on main at 7c461f7.
+    main_fields = [
+        "freq_min_hz",
+        "freq_max_hz",
+        "freq_count",
+        "freq_spacing",
+        "formulation",
+        "complex_k_shift",
+        "velocity_mode",
+        "source_motion",
+        "source_velocity_profiles",
+        "source_axes",
+        "velocity_sources",
+        "velocity_source_callback",
+        "impedance_sources",
+        "impedance_source_callback",
+        "chief_points",
+        "chief_weight",
+        "observation",
+        "frame_override",
+        "aperture_tag",
+        "native_symmetry_plane",
+        "ground_plane",
+        "ground_plane_min_clearance_m",
+        "native_check_open_edges",
+        "metal_native_assembly_mode",
+        "dense_solve_dtype",
+        "dense_solve_implementation",
+        "return_surface_pressure",
+        "return_surface_traces",
+        "metal_native_threads_per_group",
+        "metal_native_matrix_threads_per_group",
+        "metal_native_rhs_threads_per_group",
+        "metal_native_duffy_threads_per_group",
+        "metal_native_field_threads_per_group",
+        "dense_solve_rcond_warning_threshold",
+        "mesh_elements_per_wavelength_min",
+        "mesh_scale",
+        "mesh_validate",
+        "mesh_merge_tol",
+        "mesh_repair_normals",
+        "air_density",
+        "speed_of_sound",
+        "progress_callback",
+        "on_frequency_result",
+    ]
+    parameters = inspect.signature(SolveConfig).parameters
+    assert [
+        name
+        for name, parameter in parameters.items()
+        if parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+    ] == main_fields
+    assert (
+        parameters["native_symmetry_complete_images"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
+
+    defaults = SolveConfig(metal_native_assembly_mode="reference")
+    cfg = SolveConfig(*(getattr(defaults, name) for name in main_fields))
+    assert cfg == defaults
+    assert cfg.native_symmetry_complete_images is False
+    assert (
+        SolveConfig(native_symmetry_complete_images=True).native_symmetry_complete_images
+        is True
+    )
 
 
 def test_observation_config_custom_points_defaults_none():

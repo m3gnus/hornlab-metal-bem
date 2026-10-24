@@ -476,7 +476,7 @@ class SolveConfig:
     # The positive-domain, cut-face and open-edge checks still apply. Radiated
     # surface power keeps multiplying by the copy count, which is right for
     # both readings because every image is a real radiator.
-    native_symmetry_complete_images: bool = False
+    native_symmetry_complete_images: bool = field(default=False, kw_only=True)
     metal_native_assembly_mode: MetalNativeAssemblyMode = "corrected"
     # Dense LU precision. "float32" (default) matches the historical Complex32
     # LU. "float64" factors/solves the float32-assembled system in complex128
