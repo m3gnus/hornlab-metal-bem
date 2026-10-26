@@ -1036,6 +1036,12 @@ def _matrix_quantity(plan, output, z, velocities, surface) -> tuple[np.ndarray, 
     return matrix, metadata
 
 
+def validate_compiled(request: dict, *, base_dir: str | Path = ".") -> None:
+    """Validate request and surface compatibility without starting a solve."""
+    plan = _plan(request)
+    _surface(plan, Path(base_dir).resolve())
+
+
 def solve_compiled(
     request: dict,
     *,

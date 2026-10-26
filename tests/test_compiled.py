@@ -158,6 +158,19 @@ def request():
     }
 
 
+def test_preflight_validates_surface_without_invoking_solver(monkeypatch):
+    if not adapter._IS_METAL:
+        pytest.skip("Metal worker preflight is a host extension")
+    monkeypatch.setattr(api, "solve_multi_source", lambda *args: pytest.fail("solve was called"))
+    api.validate_compiled(request())
+    bad = request()
+    cells = bad["compiled_system"]["meshes"][0]["mesh_data"]["cells"][0]
+    cells["connectivity"] = packed([[0, 2, 1], [0, 1, 3], [0, 3, 2]], "<i8")
+    cells["physical_tags"] = packed([11, 12, 13], "<i8")
+    with pytest.raises(ValueError):
+        api.validate_compiled(bad)
+
+
 def test_units_identity_order_and_separate_basis(monkeypatch):
     import meshio
 

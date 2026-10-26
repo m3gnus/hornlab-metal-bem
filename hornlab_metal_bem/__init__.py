@@ -314,6 +314,7 @@ from .compiled import (
     CompiledResult,
     compiled_capabilities,
     solve_compiled,
+    validate_compiled,
 )
 from .beat_worker import (
     MetalEngineWorker,
@@ -327,6 +328,7 @@ __all__ += [
     "CompiledResult",
     "compiled_capabilities",
     "solve_compiled",
+    "validate_compiled",
     "MetalEngineWorker",
     "result_records",
     "solve_events",

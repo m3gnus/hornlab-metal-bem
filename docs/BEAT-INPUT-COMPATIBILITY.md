@@ -12,6 +12,8 @@ Two entry points share one implementation:
 - `MetalEngineWorker` has the client surface of BEAT's `EngineWorker`
   (`worker_info`, `ensure_started`, `submit`, `terminate`) and yields BEAT
   worker protocol v1 events carrying `system_result` v2 records.
+- `validate_compiled(request, *, base_dir=".")` checks request and mesh
+  compatibility without starting a solver, for hosts retaining other paths.
 
 Neither is selected implicitly. Existing `solve`, `solve_frequencies`,
 `SolveConfig` and Boundary Lab paths are unchanged. Install the package with
