@@ -50,11 +50,19 @@ from .observation import (
     sphere_grid_solid_angle_weights,
 )
 from .result import SolveResult
+from .source_identity import solver_source_identity
 
 logger = logging.getLogger(__name__)
 
 _SMOKE_VALIDATED_HELPERS: dict[tuple[str, float], bool] = {}
 _SPHERE_SYMMETRY_DEDUPE_ENV = "HORNLAB_METAL_BEM_SPHERE_SYMMETRY_DEDUPE"
+
+
+def _runtime_identity(runtime):
+    """Record both the selected native helper and executing Python sources."""
+    from .metal.native import _native_runtime_identity
+
+    return {**_native_runtime_identity(runtime), "source": solver_source_identity()}
 
 
 def _discover_runtime_smoke_cached():
@@ -1027,7 +1035,7 @@ def run_sweep_native_metal(
 
     try:
         from .metal.geometry import _build_metal_geometry_buffers_with_max_edge
-        from .metal.native import MetalNativeStandardSession, _native_runtime_identity
+        from .metal.native import MetalNativeStandardSession
     except Exception as exc:  # pragma: no cover - import/runtime specific.
         raise AssemblyBackendUnavailable(
             f"Native Metal helper could not be imported: {exc}"
@@ -1038,7 +1046,7 @@ def run_sweep_native_metal(
         reason = "; ".join(runtime.unavailable_reasons)
         raise AssemblyBackendUnavailable(reason)
 
-    runtime_identity = _native_runtime_identity(runtime)
+    runtime_identity = _runtime_identity(runtime)
     t_total = time.time()
     obs_points, angles_deg = build_observation_points(frame, config.observation)
     p1_space, dp0_space = make_pure_function_spaces(mesh.grid)
@@ -1522,7 +1530,7 @@ def run_sweep_native_metal_multi_source(
 
     try:
         from .metal.geometry import _build_metal_geometry_buffers_with_max_edge
-        from .metal.native import MetalNativeStandardSession, _native_runtime_identity
+        from .metal.native import MetalNativeStandardSession
     except Exception as exc:  # pragma: no cover - import/runtime specific.
         raise AssemblyBackendUnavailable(
             f"Native Metal helper could not be imported: {exc}"
@@ -1533,7 +1541,7 @@ def run_sweep_native_metal_multi_source(
         reason = "; ".join(runtime.unavailable_reasons)
         raise AssemblyBackendUnavailable(reason)
 
-    runtime_identity = _native_runtime_identity(runtime)
+    runtime_identity = _runtime_identity(runtime)
     t_total = time.time()
     obs_points, angles_deg = build_observation_points(frame, config.observation)
     p1_space, dp0_space = make_pure_function_spaces(mesh.grid)

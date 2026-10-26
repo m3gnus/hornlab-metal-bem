@@ -122,6 +122,16 @@ honours `ground_plane_min_clearance_m`. Images other than these are refused.
 ### Solver options
 
 `bem_backend` must be `metal` and `precision` `float32` (both may be omitted).
+The default worker uses the standard real-wavenumber formulation. A host that
+needs the native complex-wavenumber formulation may explicitly construct
+`MetalEngineWorker(native_formulation="complex_k", complex_k_shift=0.005)`
+or pass those keyword arguments to `solve_compiled`. This is a host-side
+extension, not a BEAT request option; result diagnostics record the effective
+formulation and shift. Invalid formulations and shifts are refused.
+For hosts that already display native provisional results, an optional
+`native_progress_cb(index, frequency_hz, entry)` receives the native
+unit-velocity callback as frequencies complete. This callback is a host-side
+extension; it does not change the worker protocol's result-event ordering.
 `phasor_convention` may be `exp(-i omega t)` (default) or `exp(+i omega t)`;
 the native solve always runs in `exp(-i omega t)` and the outputs are
 conjugated for the positive convention, which is exact for real drives.
@@ -169,10 +179,15 @@ meshes hash their received JSON payload; file meshes hash the original file
 bytes. Mesh transforms are retained alongside these hashes. Each frequency
 record receives an independent copy.
 
-Package version supplies release identity; Git revision/dirty status and the
-helper's device identity remain null. Source-tree fingerprints, dependency
-environment/library hashes and thread counts are not collected in this
-subset. Local paths are omitted. Inputs must remain unchanged during a solve.
+At solve entry the engine record hashes all Python source files and records a
+Git commit only when the installed distribution owns the imported package and
+pip recorded a Git revision. A source checkout shadowing an installed wheel
+does not inherit that wheel's version or revision. The helper hash identifies
+the executable actually used; the Python source hash distinguishes installed
+edits from the recorded commit. Dirty status and the helper's device identity
+remain unknown. Dependency environment/library hashes and thread counts are
+not collected. Local paths are omitted. Inputs must remain unchanged during a
+solve.
 
 ### Worker events
 

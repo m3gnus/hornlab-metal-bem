@@ -36,6 +36,7 @@ from .config import (
     _validate_source_axis_symmetry,
 )
 from .observation import ObservationFrame
+from .source_identity import solver_source_identity
 
 _IS_METAL = __package__ == "hornlab_metal_bem"
 
@@ -161,12 +162,7 @@ def compiled_capabilities() -> dict[str, Any]:
 
 
 def _package_version() -> str:
-    try:
-        from importlib.metadata import version
-
-        return version("hornlab-metal-bem")
-    except Exception:  # noqa: BLE001 - source tree without distribution metadata
-        return "0+unknown"
+    return solver_source_identity()["version"]
 
 
 def _mesh_provenance(spec: dict, base_dir: Path) -> dict:
@@ -192,25 +188,27 @@ def _mesh_provenance(spec: dict, base_dir: Path) -> dict:
     }
 
 
-def _run_provenance(request, meshes, results, config) -> dict:
+def _run_provenance(request, meshes, results, config, source_identity) -> dict:
     """BEAT Run Provenance v1, with Python/native-helper runtime identity.
 
-    Package version supplies release identity; uncollected Git/device metadata
-    stays null. Runtime identity comes from the executed sweep, never a fresh
+    Source identity is captured at solve entry; unknown revision/device values
+    stay null. Runtime identity comes from the executed sweep, never a fresh
     discovery that could identify a different helper after the solve.
     """
+    selected_runtime = copy.deepcopy(getattr(results[0], "native_runtime", {}))
+    source_identity = selected_runtime.pop("source", source_identity)
     runtime = {
         "python_version": platform.python_version(),
         "python_implementation": platform.python_implementation(),
         "numpy_version": np.__version__,
         "machine": platform.machine(), "kernel": platform.system(),
         "helper": None,
-        **copy.deepcopy(getattr(results[0], "native_runtime", {})),
+        **selected_runtime,
     }
     effective = {
         key: getattr(config, key)
         for key in (
-            "formulation", "velocity_mode", "air_density", "speed_of_sound",
+            "formulation", "complex_k_shift", "velocity_mode", "air_density", "speed_of_sound",
             "native_symmetry_plane", "ground_plane", "ground_plane_min_clearance_m",
             "source_axis_symmetry_tolerance", "metal_native_assembly_mode",
             "dense_solve_dtype", "dense_solve_implementation",
@@ -218,10 +216,7 @@ def _run_provenance(request, meshes, results, config) -> dict:
     }
     return {
         "schema_version": 1,
-        "engine": {
-            "name": "hornlab-metal-bem", "version": _package_version(),
-            "repository_revision": None, "repository_dirty": None,
-        },
+        "engine": source_identity,
         "runtime": runtime,
         "execution": {
             "backend": "metal", "precision": config.dense_solve_dtype,
@@ -1046,16 +1041,28 @@ def solve_compiled(
     *,
     base_dir: str | Path = ".",
     cancel_cb: Callable[[], None] | None = None,
+    native_formulation: str = "standard",
+    complex_k_shift: float = 0.005,
+    native_progress_cb: Callable[[int, float, dict], None] | None = None,
 ) -> CompiledResult:
     """Translate the supported BEAT envelope into unchanged native solves.
 
     Optional cancel_cb raises to abandon the solve. cancel_path is checked
     before submission and after each native frequency; no partial basis is
     returned on cancellation. Unsupported physics fails before mesh I/O.
+    The optional native formulation is an explicit host-side extension, not
+    part of the BEAT wire request; its default preserves BEAT semantics.
     """
     from . import load_mesh, solve_multi_source
 
     plan = _plan(request)
+    if native_formulation not in {"standard", "complex_k"}:
+        raise ValueError("native_formulation must be 'standard' or 'complex_k'")
+    if (isinstance(complex_k_shift, bool) or not isinstance(complex_k_shift, (int, float))
+            or not math.isfinite(complex_k_shift) or complex_k_shift < 0):
+        raise ValueError("complex_k_shift must be finite and non-negative")
+    for column in plan["column_kwargs"]:
+        column.update(formulation=native_formulation, complex_k_shift=float(complex_k_shift))
     base = Path(base_dir).resolve()
     marker = request.get("cancel_path")
     cancel_path = (base / marker) if marker else None
@@ -1066,11 +1073,14 @@ def solve_compiled(
         if cancel_path is not None and cancel_path.exists():
             raise InterruptedError("Compiled BEAT solve cancelled")
 
-    def on_frequency(*args):
+    def on_frequency(index, frequency, entry):
         check_cancel()
+        if native_progress_cb is not None:
+            native_progress_cb(index, frequency, entry)
 
     check_cancel()
     started = time.perf_counter()
+    source_identity = solver_source_identity()
     meshes = [_mesh_provenance(spec, base) for spec in plan["meshes"]]
     ids = tuple(plan["port_ids"])
     basis = plan["basis"]
@@ -1215,11 +1225,12 @@ def solve_compiled(
         "bem_backend": "metal" if _IS_METAL else "cpu",
         "symmetry": plan["symmetry"],
         "phasor_convention": plan["phasor"],
-        "formulation": "native_corrected_standard" if _IS_METAL else "bempp_standard",
+        "formulation": (f"native_corrected_{native_formulation}" if _IS_METAL
+                        else f"bempp_{native_formulation}"),
         "motion_basis_component_ids": [col["component_id"] for col in basis],
         "factorization_count": 1,
         "wall_time_s": time.perf_counter() - started,
-        "engine_provenance": _run_provenance(request, meshes, results, configs[0]),
+        "engine_provenance": _run_provenance(request, meshes, results, configs[0], source_identity),
     }
     if plan["transducer_count"]:
         diagnostics["transducer_reference_voltage_v"] = plan["voltage"]

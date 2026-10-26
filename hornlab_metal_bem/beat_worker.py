@@ -170,6 +170,9 @@ def solve_events(
     *,
     base_dir: str | Path = ".",
     cancel_cb: Callable[[], None] | None = None,
+    native_formulation: str = "standard",
+    complex_k_shift: float = 0.005,
+    native_progress_cb: Callable[[int, float, dict], None] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Run one solve and yield BEAT worker events, ending in a terminal one.
 
@@ -178,7 +181,12 @@ def solve_events(
     """
     yield {"type": "status", "message": "Solving on hornlab-metal-bem native Metal"}
     try:
-        result = solve_compiled(dict(request), base_dir=base_dir, cancel_cb=cancel_cb)
+        native_options = {}
+        if native_formulation != "standard" or complex_k_shift != 0.005:
+            native_options = {"native_formulation": native_formulation, "complex_k_shift": complex_k_shift}
+        if native_progress_cb is not None:
+            native_options["native_progress_cb"] = native_progress_cb
+        result = solve_compiled(dict(request), base_dir=base_dir, cancel_cb=cancel_cb, **native_options)
         records = result_records(result)
     except InterruptedError:
         yield {"type": "cancelled", "solved_count": 0}
@@ -287,8 +295,14 @@ class MetalEngineWorker:
         *,
         base_dir: str | Path | None = None,
         availability: Mapping[str, Any] | None = None,
+        native_formulation: str = "standard",
+        complex_k_shift: float = 0.005,
+        native_progress_cb: Callable[[int, float, dict], None] | None = None,
     ) -> None:
         self.base_dir = Path(base_dir) if base_dir is not None else None
+        self.native_formulation = native_formulation
+        self.complex_k_shift = complex_k_shift
+        self.native_progress_cb = native_progress_cb
         self._availability = availability
         self._info: dict[str, Any] | None = None
         self._available = threading.Condition()
@@ -342,7 +356,10 @@ class MetalEngineWorker:
                         "error": f"cannot read request: {exc}",
                     }
                     return
-            yield from solve_events(request, base_dir=base, cancel_cb=cancel_cb)
+            yield from solve_events(request, base_dir=base, cancel_cb=cancel_cb,
+                                    native_formulation=self.native_formulation,
+                                    complex_k_shift=self.complex_k_shift,
+                                    native_progress_cb=self.native_progress_cb)
 
         submission = MetalSubmission(self, run, status_callback)
         with self._available:

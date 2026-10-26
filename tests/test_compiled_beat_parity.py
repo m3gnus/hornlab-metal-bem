@@ -356,6 +356,54 @@ def test_pressure_only_requests_skip_surface_traces(calls):
     assert all(not c.return_surface_pressure for c in calls)
 
 
+def test_worker_opt_in_complex_k_reaches_native_config_and_result_provenance(calls):
+    worker = beat_worker.MetalEngineWorker(
+        availability={"available": True}, native_formulation="complex_k", complex_k_shift=0.005,
+    )
+    events = list(worker.submit(request()))
+    assert events[-1]["type"] == "completed"
+    assert all(c.formulation == "complex_k" and c.complex_k_shift == 0.005 for c in calls)
+    for event in events:
+        if event["type"] == "result":
+            diagnostics = event["result"]["diagnostics"]
+            assert diagnostics["formulation"] == "native_corrected_complex_k"
+            options = diagnostics["engine_provenance"]["execution"]["native_options"]
+            assert options["formulation"] == "complex_k"
+            assert options["complex_k_shift"] == 0.005
+
+
+def test_worker_can_publish_native_progress_without_changing_protocol(calls, monkeypatch):
+    w = request()
+    w["excitation_port_ids"] = ["pa"]
+    solve = api.solve_frequencies
+    observed = []
+
+    def emit(loaded, frequencies, config):
+        result = solve(loaded, frequencies, config)
+        for i, frequency in enumerate(frequencies):
+            config.on_frequency_result(i, frequency, {"observation_pressure_complex": [i]})
+        return result
+
+    monkeypatch.setattr(api, "solve_frequencies", emit)
+    worker = beat_worker.MetalEngineWorker(
+        availability={"available": True}, native_progress_cb=lambda *args: observed.append(args),
+    )
+    events = list(worker.submit(w))
+    assert [event["type"] for event in events] == ["status", "result", "result", "result", "completed"]
+    assert [(i, f) for i, f, _ in observed] == list(enumerate([200.0, 80.0, 120.0]))
+    assert [entry["observation_pressure_complex"] for _, _, entry in observed] == [[0], [1], [2]]
+
+
+@pytest.mark.parametrize("formulation,shift", [("burton_miller", .005), ("complex_k", -1),
+                                               ("complex_k", float("nan")), ("complex_k", True)])
+def test_worker_refuses_invalid_native_formulation_before_mesh_io(calls, formulation, shift):
+    worker = beat_worker.MetalEngineWorker(
+        availability={"available": True}, native_formulation=formulation, complex_k_shift=shift,
+    )
+    assert list(worker.submit(request()))[-1]["type"] == "failed"
+    assert not calls
+
+
 @pytest.mark.parametrize("kind", ["ideal", "transducer"])
 @pytest.mark.parametrize("symmetry,axis,orbit", [
     ("x", [5e-9, 0, 1], 2), ("xy", [0, 5e-9, 1], 4),
@@ -438,6 +486,7 @@ def test_provenance_archives_identity_options_and_mesh(calls, monkeypatch, tmp_p
     assert provenance["schema_version"] == 1
     assert provenance["engine"]["name"] == "hornlab-metal-bem"
     assert provenance["engine"]["version"] == beat_worker.worker_announcement({})["implementation"]["version"]
+    assert len(provenance["engine"]["source_sha256"]) == 64
     assert provenance["runtime"]["helper"] == runtime["helper"]
     assert provenance["runtime"]["python_version"]
     execution = provenance["execution"]

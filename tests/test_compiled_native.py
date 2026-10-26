@@ -104,6 +104,8 @@ def test_compiled_matches_direct_legacy_call(tmp_path, motion, port_count):
         if api.__name__ == "hornlab_metal_bem":
             runtime = compiled.native_results[i].native_runtime
             assert runtime["helper"]["sha256"]
+            assert len(runtime["source"]["source_sha256"]) == 64
+            assert compiled.diagnostics["engine_provenance"]["engine"] == runtime["source"]
             assert compiled.diagnostics["engine_provenance"]["runtime"]["helper"] == runtime["helper"]
 
 

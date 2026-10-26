@@ -29,12 +29,14 @@ from .field_traces import evaluate_exterior_from_traces
 from .mesh import LoadedMesh, MeshError, load_mesh
 from .observation import ObservationFrame, infer_frame
 from .result import MeshInfo, SolveResult
+from .source_identity import solver_source_identity
 
 __all__ = [
     "capabilities",
     "CAPABILITY_SCHEMA_VERSION",
     "REQUEST_SCHEMA_VERSION",
     "native_config",
+    "solver_source_identity",
     "solve",
     "solve_frequencies",
     "solve_multi_source",
