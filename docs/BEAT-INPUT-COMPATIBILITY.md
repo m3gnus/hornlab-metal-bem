@@ -186,10 +186,13 @@ Git commit only when the installed distribution owns the imported package and
 pip recorded a Git revision. A source checkout shadowing an installed wheel
 does not inherit that wheel's version or revision. The helper hash identifies
 the executable actually used; the Python source hash distinguishes installed
-edits from the recorded commit. Dirty status and the helper's device identity
-remain unknown. Dependency environment/library hashes and thread counts are
-not collected. Local paths are omitted. Inputs must remain unchanged during a
-solve.
+edits from the recorded commit. The completed native batch also reports whether
+Metal used an external shader library or source compiled at runtime; an
+external library is hashed from the reported file. A runtime-compiled GPU build
+has no separately observable build hash. Dirty status and the helper's device
+identity remain unknown. Other dependency environment/library hashes and
+thread counts are not collected. Local paths are omitted. Inputs must remain
+unchanged during a solve.
 
 ### Worker events
 

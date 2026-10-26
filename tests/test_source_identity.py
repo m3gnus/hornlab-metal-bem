@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 
 from hornlab_metal_bem import source_identity
 
@@ -75,3 +76,21 @@ def test_unreadable_source_never_yields_a_partial_digest(monkeypatch, tmp_path):
     (tmp_path / "one.py").write_text("x = 1\n")
     monkeypatch.setattr(source_identity.Path, "read_bytes", lambda _: (_ for _ in ()).throw(OSError()))
     assert source_identity._source_sha256(tmp_path) is None
+
+
+def test_shader_identity_uses_the_reported_library_without_exposing_its_path(tmp_path):
+    from hornlab_metal_bem.metal.native import _metal_library_identity
+
+    library = tmp_path / "solver.metallib"
+    library.write_bytes(b"shader build")
+    diagnostics = {"resident_context_metal_library_source": "metallib",
+                   "resident_context_metal_library_path": str(library)}
+    assert _metal_library_identity(diagnostics) == {
+        "source": "metallib", "sha256": hashlib.sha256(b"shader build").hexdigest(),
+    }
+    library.unlink()
+    assert _metal_library_identity(diagnostics) == {"source": "metallib", "sha256": None}
+    assert _metal_library_identity({"resident_context_metal_library_source": "source"}) == {
+        "source": "source", "sha256": None,
+    }
+    assert _metal_library_identity({}) == {"source": None, "sha256": None}

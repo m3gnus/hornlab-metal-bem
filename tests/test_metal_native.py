@@ -3880,6 +3880,7 @@ def test_native_executable_streams_per_case_results(monkeypatch, tmp_path):
             impedance_source_tag=2,
             on_case_result=lambda i, solved: streamed_calls.append((i, solved)),
         )
+        streamed_batch = dict(session.last_batch_diagnostics)
         oneshot = session.assemble_solve_evaluate_standard_neumann_batch(
             frequency_hz,
             k_real,
@@ -3891,6 +3892,10 @@ def test_native_executable_streams_per_case_results(monkeypatch, tmp_path):
         )
 
         assert [index for index, _ in streamed_calls] == [0, 1, 2]
+        assert streamed_batch.get("resident_context_metal_library_source") in {"source", "metallib"}
+        assert session.last_batch_diagnostics.get("resident_context_metal_library_source") == (
+            streamed_batch["resident_context_metal_library_source"]
+        )
         assert [solved for _, solved in streamed_calls] == streamed
         assert len(streamed) == len(oneshot) == 3
         case_dir = (

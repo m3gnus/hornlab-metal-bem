@@ -1326,6 +1326,9 @@ def run_sweep_native_metal(
                 chief_weight=config.chief_weight,
             )
 
+    from .metal.native import _metal_library_identity
+
+    runtime_identity["metal_library"] = _metal_library_identity(getattr(session, "last_batch_diagnostics", {}))
     sp_avg: dict[int, np.ndarray] = {}
     for tag in source_tags:
         sp_avg[tag] = np.array(surface_pavg[tag], dtype=np.complex128)
@@ -1807,6 +1810,9 @@ def run_sweep_native_metal_multi_source(
             if config.progress_callback is not None:
                 config.progress_callback(i, len(freq_values), frequency_hz)
 
+    from .metal.native import _metal_library_identity
+
+    runtime_identity["metal_library"] = _metal_library_identity(getattr(session, "last_batch_diagnostics", {}))
     total_s = time.time() - t_total
     results: list[SolveResult] = []
     for source_index in range(n_sources):

@@ -124,6 +124,15 @@ def _native_runtime_identity(status: MetalNativeRuntimeStatus) -> dict[str, Any]
     }
 
 
+def _metal_library_identity(batch: dict[str, Any]) -> dict[str, str | None]:
+    """Identify the shader actually reported by the completed native batch."""
+    source = batch.get("resident_context_metal_library_source")
+    if not isinstance(source, str) or source not in {"source", "metallib"}:
+        source = None
+    path = batch.get("resident_context_metal_library_path") if source == "metallib" else None
+    return {"source": source, "sha256": _file_sha256(path) if isinstance(path, str) else None}
+
+
 def discover_native_runtime(
     config: MetalNativeRuntimeConfig | None = None,
     *,
@@ -280,6 +289,7 @@ class MetalNativeStandardSession:
         self._runtime_config = runtime_config
         self._extra_env = dict(extra_env) if extra_env else None
         self._closed = False
+        self.last_batch_diagnostics: dict[str, Any] = {}
 
     @classmethod
     def create_session(
@@ -863,6 +873,7 @@ class MetalNativeStandardSession:
         )
 
         self._ensure_open()
+        self.last_batch_diagnostics = {}
         if on_case_result is not None and write_batched_field:
             raise ValueError(
                 "on_case_result streaming requires per-case field outputs; "
@@ -1208,6 +1219,7 @@ class MetalNativeStandardSession:
             op="assemble_solve_evaluate_standard_neumann_batch",
         )
         batch_diagnostics = _native_batch_diagnostics(result)
+        self.last_batch_diagnostics = batch_diagnostics
         return [
             self._dense_solve_field_result(
                 case_result,
@@ -1449,6 +1461,7 @@ class MetalNativeStandardSession:
             op=op,
         )
         batch_diagnostics = _native_batch_diagnostics(result)
+        self.last_batch_diagnostics = batch_diagnostics
         # One-shot fallback: a helper without streamed case results writes
         # only the final manifest, so fire the remaining callbacks from it.
         for index in range(len(solved_fields), expected_count):
