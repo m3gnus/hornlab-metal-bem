@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 
 from hornlab_metal_bem import source_identity
 
